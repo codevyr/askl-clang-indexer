@@ -42,9 +42,13 @@ std::string Indexer::computeCommonAncestor(const std::vector<CompileCommand>& cm
         while (j < common.size() && j < dir.size() && common[j] == dir[j]) {
             j++;
         }
-        // Back up to last '/'
-        while (j > 0 && common[j - 1] != '/') j--;
-        if (j > 0) j--; // remove trailing slash
+        // Only back up if we're not at a directory boundary
+        bool at_boundary = (j == common.size() || common[j] == '/') &&
+                           (j == dir.size() || dir[j] == '/');
+        if (!at_boundary) {
+            while (j > 0 && common[j - 1] != '/') j--;
+            if (j > 0) j--; // remove trailing slash
+        }
         common = common.substr(0, j);
     }
 
@@ -87,7 +91,7 @@ void Indexer::processTU(const CompileCommand& cmd) {
     }
 
     // Stage 1: Extract symbols and direct references
-    Stage1 stage1(symbol_table_, root_path_);
+    Stage1 stage1(symbol_table_, root_path_, next_object_id_);
     stage1.process(tu, cmd.filename);
 
     // Stage 2: Function pointer assignment analysis

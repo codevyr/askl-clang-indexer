@@ -4,6 +4,7 @@
 #include "symbol_table.h"
 #include "stage1.h"
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -27,6 +28,7 @@ private:
     CompilationDB compile_db_;
     SymbolTable symbol_table_;
 
+    std::atomic<int64_t> next_object_id_{1};
     std::mutex files_mutex_;
     std::vector<FileData> all_files_;
 

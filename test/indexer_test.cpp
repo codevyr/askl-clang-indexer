@@ -62,6 +62,23 @@ void PrintTo(const ExpectedRef& r, std::ostream* os) {
     *os << "{from=" << r.from_file << ", to=" << r.to_name << "}";
 }
 
+struct ExpectedInstance {
+    std::string file;    // module_path of the file containing the instance
+    std::string symbol;  // name of the symbol
+
+    bool operator==(const ExpectedInstance& o) const {
+        return file == o.file && symbol == o.symbol;
+    }
+    bool operator<(const ExpectedInstance& o) const {
+        if (file != o.file) return file < o.file;
+        return symbol < o.symbol;
+    }
+};
+
+void PrintTo(const ExpectedInstance& i, std::ostream* os) {
+    *os << "{file=" << i.file << ", sym=" << i.symbol << "}";
+}
+
 // --- Helpers ---
 
 void generateCompileCommands(const std::string& fixture_dir,
@@ -84,6 +101,7 @@ void generateCompileCommands(const std::string& fixture_dir,
 struct RunResult {
     std::vector<ExpectedSymbol> symbols;
     std::vector<ExpectedRef> refs;
+    std::vector<ExpectedInstance> instances;
 };
 
 struct TempDir {
@@ -117,12 +135,15 @@ RunResult runFixture(const std::string& fixture_name,
         id_to_name[sym.local_id] = sym.name;
     }
 
-    // Extract refs and validate offset ranges
+    // Extract instances, refs, and validate offset ranges
     for (auto& file : indexer.allFiles()) {
         for (auto& inst : file.instances) {
             EXPECT_LE(inst.start_offset, inst.end_offset)
                 << "Bad instance range in " << file.module_path
                 << ": start=" << inst.start_offset << " > end=" << inst.end_offset;
+            auto it = id_to_name.find(inst.symbol_local_id);
+            std::string sym_name = (it != id_to_name.end()) ? it->second : "UNKNOWN";
+            result.instances.push_back({file.module_path, sym_name});
         }
         for (auto& ref : file.refs) {
             EXPECT_LE(ref.from_offset_start, ref.from_offset_end)
@@ -136,6 +157,7 @@ RunResult runFixture(const std::string& fixture_name,
 
     std::sort(result.symbols.begin(), result.symbols.end());
     std::sort(result.refs.begin(), result.refs.end());
+    std::sort(result.instances.begin(), result.instances.end());
 
     return result;
 }
@@ -147,6 +169,7 @@ struct FixtureSpec {
     std::vector<std::string> sources;
     std::vector<ExpectedSymbol> symbols;
     std::vector<ExpectedRef> refs;
+    std::vector<ExpectedInstance> instances; // empty = skip instance validation
 };
 
 void PrintTo(const FixtureSpec& spec, std::ostream* os) {
@@ -165,6 +188,14 @@ TEST_P(IndexerFixtureTest, SymbolsAndRefs) {
 
     EXPECT_EQ(result.symbols, expected_symbols);
     EXPECT_EQ(result.refs, expected_refs);
+
+    // Validate instances when expected values are provided
+    auto expected_instances = GetParam().instances;
+    if (!expected_instances.empty()) {
+        std::sort(expected_instances.begin(), expected_instances.end());
+        EXPECT_EQ(result.instances, expected_instances);
+    }
+
 }
 
 // Scope constants
@@ -366,6 +397,43 @@ INSTANTIATE_TEST_SUITE_P(
             }
         },
         FixtureSpec{
+            "macro_struct_in_union",
+            {"main.c"},
+            {
+                {"any_type", GLOBAL, TYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"type_a", GLOBAL, TYPE},
+                {"type_b", GLOBAL, TYPE},
+                {"type_c", GLOBAL, TYPE},
+                {"types.h", GLOBAL, FILETYPE},
+                {"use_any", GLOBAL, FUNCTION},
+            },
+            {
+                {"main.c", "any_type"},
+                {"types.h", "type_a"},
+                {"types.h", "type_a"},
+                {"types.h", "type_b"},
+                {"types.h", "type_b"},
+                {"types.h", "type_c"},
+                {"types.h", "type_c"},
+            },
+            // instances — validates macro-expanded struct instances have valid ranges
+            {
+                {"main.c", "main.c"},
+                {"main.c", "use_any"},
+                {"types.h", "any_type"},
+                {"types.h", "any_type"},
+                {"types.h", "any_type"},
+                {"types.h", "type_a"},
+                {"types.h", "type_a"},
+                {"types.h", "type_b"},
+                {"types.h", "type_b"},
+                {"types.h", "type_c"},
+                {"types.h", "type_c"},
+                {"types.h", "types.h"},
+            }
+        },
+        FixtureSpec{
             "shared_header_typedef",
             {"a.c", "b.c"},
             {
@@ -383,6 +451,20 @@ INSTANTIATE_TEST_SUITE_P(
                 {"a.c", "result_t"},
                 {"b.c", "pair_t"},
                 {"b.c", "pair_t"},
+            },
+            // instances — validates dedup across 2 TUs sharing types.h
+            {
+                {"a.c", "a.c"},
+                {"a.c", "compute_a"},
+                {"b.c", "b.c"},
+                {"b.c", "make_pair"},
+                {"types.h", "pair"},
+                {"types.h", "pair"},
+                {"types.h", "pair_t"},
+                {"types.h", "result_t"},
+                {"types.h", "result_t"},
+                {"types.h", "result_t"},
+                {"types.h", "types.h"},
             }
         }
     ),

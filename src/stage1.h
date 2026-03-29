@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <clang-c/Index.h>
 #include <cstdint>
 #include <string>
@@ -36,7 +37,8 @@ struct Stage1Result {
 
 class Stage1 {
 public:
-    Stage1(SymbolTable& symbols, const std::string& root_path);
+    Stage1(SymbolTable& symbols, const std::string& root_path,
+           std::atomic<int64_t>& next_object_id);
 
     void process(CXTranslationUnit tu, const std::string& tu_filename);
     Stage1Result takeResults();
@@ -44,6 +46,7 @@ public:
 private:
     SymbolTable& symbols_;
     std::string root_path_;
+    std::atomic<int64_t>& next_object_id_;
     Stage1Result result_;
 
     // Per-TU state
@@ -52,7 +55,6 @@ private:
     size_t getOrCreateFile(CXFile file);
     std::string computeModulePath(const std::string& abs_path);
     std::string computeFiletype(const std::string& path);
-    bool isLocalVariable(CXCursor cursor);
 
     static CXChildVisitResult visitor(CXCursor cursor, CXCursor parent, CXClientData data);
     void visitCursor(CXCursor cursor, CXCursor parent);
