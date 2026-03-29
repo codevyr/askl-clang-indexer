@@ -21,6 +21,15 @@ make -j$(nproc)
 - protobuf (with abseil)
 - C++17 compiler
 
+## Testing
+
+```bash
+cmake --build build -j$(nproc)
+ctest --test-dir build --verbose
+```
+
+Tests use Google Test (fetched automatically via CMake FetchContent). Fixture directories under `test/` contain plain C source files — `compile_commands.json` is generated at runtime by the test harness.
+
 ## Usage
 
 ```bash

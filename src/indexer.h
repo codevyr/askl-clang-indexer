@@ -17,6 +17,9 @@ public:
     void run();
     void write(const std::string& output_path);
 
+    const SymbolTable& symbolTable() const { return symbol_table_; }
+    const std::vector<FileData>& allFiles() const { return all_files_; }
+
 private:
     std::string project_name_;
     std::string root_path_;

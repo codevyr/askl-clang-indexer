@@ -33,9 +33,17 @@ include(FetchContent)
 FetchContent_Declare(
   CLI11
   GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
-  GIT_TAG v2.4.2
+  GIT_TAG v2.6.2
 )
 FetchContent_MakeAvailable(CLI11)
+
+# Google Test
+FetchContent_Declare(
+  googletest
+  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_TAG v1.14.0
+)
+FetchContent_MakeAvailable(googletest)
 
 # Generate protobuf C++ files
 set(PROTO_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
@@ -55,8 +63,8 @@ add_custom_command(
   COMMENT "Generating protobuf C++ files"
 )
 
-add_executable(askl-clang-indexer
-  src/main.cpp
+# Static library with all source files except main.cpp
+add_library(askl-clang-indexer-lib STATIC
   src/compilation_db.cpp
   src/indexer.cpp
   src/stage1.cpp
@@ -66,14 +74,39 @@ add_executable(askl-clang-indexer
   ${PROTO_SRCS}
 )
 
-target_include_directories(askl-clang-indexer PRIVATE
+target_include_directories(askl-clang-indexer-lib PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_BINARY_DIR}
   ${LIBCLANG_INCLUDE_DIRS}
 )
 
-target_link_libraries(askl-clang-indexer PRIVATE
+target_link_libraries(askl-clang-indexer-lib PUBLIC
   ${LIBCLANG_LIB}
   protobuf::libprotobuf
   Threads::Threads
+)
+
+# Main executable
+add_executable(askl-clang-indexer src/main.cpp)
+
+target_link_libraries(askl-clang-indexer PRIVATE
+  askl-clang-indexer-lib
   CLI11::CLI11
 )
+
+# Test executable
+enable_testing()
+
+add_executable(askl-clang-indexer-test test/indexer_test.cpp)
+
+target_compile_definitions(askl-clang-indexer-test PRIVATE
+  FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test"
+)
+
+target_link_libraries(askl-clang-indexer-test PRIVATE
+  askl-clang-indexer-lib
+  GTest::gtest_main
+)
+
+include(GoogleTest)
+gtest_discover_tests(askl-clang-indexer-test)
