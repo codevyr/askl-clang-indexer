@@ -53,6 +53,9 @@ private:
 
     size_t getOrCreateFile(CXFile file);
 
+    void collectMacros(CXTranslationUnit tu);
+    static CXChildVisitResult macroVisitor(CXCursor cursor, CXCursor parent, CXClientData data);
+
     static CXChildVisitResult visitor(CXCursor cursor, CXCursor parent, CXClientData data);
     static void inclusionCallback(CXFile included_file, CXSourceLocation* stack,
                                   unsigned len, CXClientData data);

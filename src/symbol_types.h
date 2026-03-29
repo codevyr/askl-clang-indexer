@@ -10,3 +10,4 @@ constexpr int SYMTYPE_FILE = 2;
 constexpr int SYMTYPE_DIRECTORY = 4;
 constexpr int SYMTYPE_TYPE = 5;
 constexpr int SYMTYPE_DATA = 6;
+constexpr int SYMTYPE_MACRO = 7;

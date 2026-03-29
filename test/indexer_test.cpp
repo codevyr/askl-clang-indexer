@@ -38,7 +38,7 @@ void PrintTo(const ExpectedSymbol& s, std::ostream* os) {
     auto type_str = [](int t) {
         switch (t) {
             case 1: return "FUNCTION"; case 2: return "FILE"; case 4: return "DIRECTORY";
-            case 5: return "TYPE"; case 6: return "DATA"; default: return "?";
+            case 5: return "TYPE"; case 6: return "DATA"; case 7: return "MACRO"; default: return "?";
         }
     };
     *os << "{name=" << s.name << ", scope=" << scope_str(s.scope)
@@ -241,6 +241,7 @@ constexpr int FILETYPE = 2;
 constexpr int DIRECTORY = 4;
 constexpr int TYPE = 5;
 constexpr int DATA = 6;
+constexpr int MACRO = 7;
 
 INSTANTIATE_TEST_SUITE_P(
     Fixtures,
@@ -251,6 +252,7 @@ INSTANTIATE_TEST_SUITE_P(
             {"ops.c", "main.c"},
             // symbols
             {
+                {"OPS_H", GLOBAL, MACRO},
                 {"container", GLOBAL, TYPE},
                 {"default_ops", LOCAL, DATA},
                 {"file_ops", GLOBAL, TYPE},
@@ -284,6 +286,7 @@ INSTANTIATE_TEST_SUITE_P(
             "enum_basic",
             {"main.c"},
             {
+                {"COLORS_H", GLOBAL, MACRO},
                 {"GREEN", GLOBAL, DATA},
                 {"RED", GLOBAL, DATA},
                 {"color", GLOBAL, TYPE},
@@ -301,6 +304,7 @@ INSTANTIATE_TEST_SUITE_P(
             "typedef_basic",
             {"main.c"},
             {
+                {"TYPES_H", GLOBAL, MACRO},
                 {"handle", GLOBAL, TYPE},
                 {"main.c", GLOBAL, FILETYPE},
                 {"make_point", GLOBAL, FUNCTION},
@@ -331,6 +335,7 @@ INSTANTIATE_TEST_SUITE_P(
             "cross_file_variable",
             {"config.c", "main.c"},
             {
+                {"CONFIG_H", GLOBAL, MACRO},
                 {"app_name", GLOBAL, DATA},
                 {"check", GLOBAL, FUNCTION},
                 {"config.c", GLOBAL, FILETYPE},
@@ -367,6 +372,7 @@ INSTANTIATE_TEST_SUITE_P(
             "type_ref_chain",
             {"main.c"},
             {
+                {"TYPES_H", GLOBAL, MACRO},
                 {"list", GLOBAL, TYPE},
                 {"main.c", GLOBAL, FILETYPE},
                 {"node", GLOBAL, TYPE},
@@ -391,6 +397,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"ERR_IO", GLOBAL, DATA},
                 {"ERR_MEM", GLOBAL, DATA},
                 {"OK", GLOBAL, DATA},
+                {"STATUS_H", GLOBAL, MACRO},
                 {"handle_status", GLOBAL, FUNCTION},
                 {"handler.c", GLOBAL, FILETYPE},
                 {"last_error", GLOBAL, DATA},
@@ -414,6 +421,10 @@ INSTANTIATE_TEST_SUITE_P(
             "cross_file_macro",
             {"main.c"},
             {
+                {"DEFAULT_STATUS", GLOBAL, MACRO},
+                {"DEFINE_HANDLER", GLOBAL, MACRO},
+                {"MACROS_H", GLOBAL, MACRO},
+                {"RESULT", GLOBAL, MACRO},
                 {"S_OK", GLOBAL, DATA},
                 {"get_result", GLOBAL, FUNCTION},
                 {"handle_close", GLOBAL, FUNCTION},
@@ -424,15 +435,23 @@ INSTANTIATE_TEST_SUITE_P(
                 {"status", GLOBAL, TYPE},
             },
             {
-                {"main.c", "result", 272, 278},
-                {"main.c", "result", 302, 308},
-                {"main.c", "S_OK", 325, 339},
+                {"macros.h", "S_OK", 411, 415},
+                {"macros.h", "result", 321, 327},
+                {"macros.h", "result", 321, 327},
+                {"main.c", "DEFAULT_STATUS", 325, 339},
+                {"main.c", "DEFINE_HANDLER", 102, 129},
+                {"main.c", "DEFINE_HANDLER", 156, 184},
+                {"main.c", "RESULT", 272, 278},
+                {"main.c", "RESULT", 302, 308},
             }
         },
         FixtureSpec{
             "macro_struct_in_union",
             {"main.c"},
             {
+                {"ALL_TYPES", GLOBAL, MACRO},
+                {"ONE_TYPE", GLOBAL, MACRO},
+                {"TYPES_H", GLOBAL, MACRO},
                 {"any_type", GLOBAL, TYPE},
                 {"main.c", GLOBAL, FILETYPE},
                 {"type_a", GLOBAL, TYPE},
@@ -441,22 +460,26 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", GLOBAL, FILETYPE},
                 {"use_any", GLOBAL, FUNCTION},
             },
-            // refs — macro-expanded type_a/b/c refs clamped to [start, start+1)
+            // refs — with spelling location, type_a/b/c refs now resolve inside ONE_TYPE body
             // Clang visits each TypeRef twice (through TypedefDecl + anonymous UnionDecl);
             // ProtoBuilder deduplicates via hash-set at serialization time.
             {
                 {"main.c", "any_type", 33, 41},
-                {"types.h", "type_a", 398, 399},
-                {"types.h", "type_a", 398, 399},
-                {"types.h", "type_b", 398, 399},
-                {"types.h", "type_b", 398, 399},
-                {"types.h", "type_c", 398, 399},
-                {"types.h", "type_c", 398, 399},
+                {"types.h", "ALL_TYPES", 398, 407},
+                {"types.h", "type_a", 286, 292},
+                {"types.h", "type_a", 286, 292},
+                {"types.h", "type_b", 309, 315},
+                {"types.h", "type_b", 309, 315},
+                {"types.h", "type_c", 332, 338},
+                {"types.h", "type_c", 332, 338},
             },
-            // instances — macro-expanded struct instances have zero-width ranges, filtered out
+            // instances — macro symbols now have instances too
             {
                 {"main.c", "main.c"},
                 {"main.c", "use_any"},
+                {"types.h", "ALL_TYPES"},
+                {"types.h", "ONE_TYPE"},
+                {"types.h", "TYPES_H"},
                 {"types.h", "any_type"},
                 {"types.h", "any_type"},
                 {"types.h", "any_type"},
@@ -473,6 +496,9 @@ INSTANTIATE_TEST_SUITE_P(
             "macro_zero_width",
             {"main.c"},
             {
+                {"ALL_STRUCTS", GLOBAL, MACRO},
+                {"ONE_STRUCT", GLOBAL, MACRO},
+                {"TYPES_H", GLOBAL, MACRO},
                 {"alpha", GLOBAL, TYPE},
                 {"beta", GLOBAL, TYPE},
                 {"main.c", GLOBAL, FILETYPE},
@@ -488,31 +514,33 @@ INSTANTIATE_TEST_SUITE_P(
                 // Single-char ref: proves clang returns half-open [start, start+len),
                 // so 1-char token gives [289, 290) not [289, 289)
                 {"main.c", "x", 289, 290},
-                // Macro-expanded TypeRef: zero-width clamped to [start, start+1)
-                // Points to ALL_STRUCTS expansion site — preserves the reference.
+                // Macro-expanded TypeRef: spelling location resolves inside ONE_STRUCT body
                 // Clang visits this TypeRef twice (through TypedefDecl + anonymous UnionDecl);
                 // ProtoBuilder deduplicates at serialization time.
-                {"types.h", "alpha", 477, 478},
-                {"types.h", "alpha", 477, 478},
+                {"types.h", "ALL_STRUCTS", 477, 488},
+                {"types.h", "alpha", 403, 408},
+                {"types.h", "alpha", 403, 408},
             },
             {
                 {"main.c", "main.c"},
                 {"main.c", "use_types"},
                 {"main.c", "x"},
                 // beta instance present — source-level struct, proper range
+                {"types.h", "ALL_STRUCTS"},
+                {"types.h", "ONE_STRUCT"},
+                {"types.h", "TYPES_H"},
                 {"types.h", "beta"},
                 {"types.h", "types.h"},
                 {"types.h", "wrapper"},
                 {"types.h", "wrapper"},
                 {"types.h", "wrapper"},
-                // NOTE: alpha instance ABSENT — nested macro expansion
-                // produces zero-width range (start == end), correctly filtered
             }
         },
         FixtureSpec{
             "shared_header_typedef",
             {"a.c", "b.c"},
             {
+                {"TYPES_H", GLOBAL, MACRO},
                 {"a.c", GLOBAL, FILETYPE},
                 {"b.c", GLOBAL, FILETYPE},
                 {"compute_a", GLOBAL, FUNCTION},
@@ -534,6 +562,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"a.c", "compute_a"},
                 {"b.c", "b.c"},
                 {"b.c", "make_pair"},
+                {"types.h", "TYPES_H"},
                 {"types.h", "pair"},
                 {"types.h", "pair"},
                 {"types.h", "pair_t"},
@@ -545,17 +574,67 @@ INSTANTIATE_TEST_SUITE_P(
         },
         // Proves that files with only macros (no declarations/refs) still appear
         // in the index via clang_getInclusions callback.
+        // Basic macro-through-function chain: greet calls LOG macro, LOG calls puts.
+        // LOG expansion ref in main.c; puts call's spelling lands in log.h (#define body).
+        FixtureSpec{
+            "macro_function_call",
+            {"main.c"},
+            {
+                {"LOG", GLOBAL, MACRO},
+                {"greet", GLOBAL, FUNCTION},
+                {"log.h", GLOBAL, FILETYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"puts", GLOBAL, FUNCTION},
+            },
+            {
+                {"log.h", "puts", 49, 53},
+                {"main.c", "LOG", 36, 48},
+            }
+        },
+        // Nested macro chain: handler calls FATAL, which expands through ERR→MSG→output.
+        // Only outermost MacroExpansion (FATAL) appears as TU-level child; nested
+        // expansions (ERR, MSG) are not exposed by libclang. However, the output()
+        // CallExpr's spelling location resolves into MSG's #define body in macros.h,
+        // making it a child of MSG by offset containment.
+        FixtureSpec{
+            "macro_nested",
+            {"main.c"},
+            {
+                {"ERR", GLOBAL, MACRO},
+                {"FATAL", GLOBAL, MACRO},
+                {"MSG", GLOBAL, MACRO},
+                {"handler", GLOBAL, FUNCTION},
+                {"macros.h", GLOBAL, FILETYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"output", GLOBAL, FUNCTION},
+            },
+            {
+                {"macros.h", "output", 71, 77},
+                {"main.c", "FATAL", 41, 54},
+            }
+        },
+        // Proves that files with only macros (no declarations/refs) still appear
+        // in the index via clang_getInclusions callback.
         FixtureSpec{
             "macro_only_header",
             {"main.c"},
             {
+                {"MACROS_H", GLOBAL, MACRO},
+                {"MAX_SIZE", GLOBAL, MACRO},
+                {"MIN", GLOBAL, MACRO},
                 {"buf", GLOBAL, DATA},
                 {"macros.h", GLOBAL, FILETYPE},
                 {"main.c", GLOBAL, FILETYPE},
                 {"smallest", GLOBAL, FUNCTION},
             },
-            {},
             {
+                {"main.c", "MAX_SIZE", 29, 37},
+                {"main.c", "MIN", 76, 85},
+            },
+            {
+                {"macros.h", "MACROS_H"},
+                {"macros.h", "MAX_SIZE"},
+                {"macros.h", "MIN"},
                 {"macros.h", "macros.h"},
                 {"main.c", "buf"},
                 {"main.c", "main.c"},

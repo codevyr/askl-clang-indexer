@@ -44,6 +44,26 @@ inline bool getExpansionRange(CXCursor cursor, CXFile& out_file,
     return true;
 }
 
+// Get spelling range for a cursor. Returns false if the file is null.
+// Always clamps zero-width ranges to [start, start+1) to preserve refs inside macro bodies.
+// When the extent spans multiple files (e.g., CallExpr with macro-parameter arguments),
+// falls back to cursor location spelling + name_len for the range.
+inline bool getSpellingRange(CXCursor cursor, CXFile& out_file,
+                             unsigned& out_start, unsigned& out_end,
+                             unsigned name_len = 0) {
+    CXSourceRange range = clang_getCursorExtent(cursor);
+    CXFile start_file = nullptr, end_file = nullptr;
+    clang_getSpellingLocation(clang_getRangeStart(range), &start_file, nullptr, nullptr, &out_start);
+    clang_getSpellingLocation(clang_getRangeEnd(range), &end_file, nullptr, nullptr, &out_end);
+    if (!start_file) return false;
+    if (!end_file || !clang_File_isEqual(start_file, end_file) || out_start >= out_end) {
+        // Extent spans multiple files or is zero-width; use start + name_len
+        out_end = out_start + (name_len > 0 ? name_len : 1);
+    }
+    out_file = start_file;
+    return true;
+}
+
 // Resolve a cursor's linkage to a scope-aware symbol ID.
 // Uses expansion location to get the canonical file path for LOCAL scope dedup.
 inline int64_t resolveSymbol(SymbolTable& symbols, CXCursor cursor,

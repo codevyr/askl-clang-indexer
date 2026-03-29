@@ -43,6 +43,58 @@ size_t Stage1::getOrCreateFile(CXFile file) {
     return idx;
 }
 
+CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClientData data) {
+    auto* self = static_cast<Stage1*>(data);
+    CXCursorKind kind = clang_getCursorKind(cursor);
+
+    if (kind == CXCursor_MacroDefinition) {
+        ClangString name(clang_getCursorSpelling(cursor));
+        std::string sname = name.to_string();
+        if (sname.empty()) return CXChildVisit_Continue;
+
+        // Get the file where the macro is defined
+        CXSourceLocation loc = clang_getCursorLocation(cursor);
+        CXFile file = nullptr;
+        clang_getSpellingLocation(loc, &file, nullptr, nullptr, nullptr);
+        if (!file) return CXChildVisit_Continue;
+
+        // Create MACRO symbol
+        auto [sym_id, _] = self->symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_MACRO);
+
+        // Create instance at the #define body range
+        CXFile range_file;
+        unsigned start_off, end_off;
+        if (getSpellingRange(cursor, range_file, start_off, end_off)) {
+            size_t fi = self->getOrCreateFile(range_file);
+            self->result_.files[fi].instances.push_back(
+                {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+        }
+    } else if (kind == CXCursor_MacroExpansion) {
+        ClangString name(clang_getCursorSpelling(cursor));
+        std::string sname = name.to_string();
+        if (sname.empty()) return CXChildVisit_Continue;
+
+        // Look up the MACRO symbol (should have been created by MacroDefinition)
+        auto [sym_id, _] = self->symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_MACRO);
+
+        // Create ref at spelling location
+        CXFile range_file;
+        unsigned start_off, end_off;
+        if (getSpellingRange(cursor, range_file, start_off, end_off, sname.size())) {
+            size_t fi = self->getOrCreateFile(range_file);
+            self->result_.files[fi].refs.push_back(
+                {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+        }
+    }
+
+    return CXChildVisit_Continue;
+}
+
+void Stage1::collectMacros(CXTranslationUnit tu) {
+    CXCursor root = clang_getTranslationUnitCursor(tu);
+    clang_visitChildren(root, macroVisitor, this);
+}
+
 CXChildVisitResult Stage1::visitor(CXCursor cursor, CXCursor parent, CXClientData data) {
     auto* self = static_cast<Stage1*>(data);
     self->visitCursor(cursor, parent);
@@ -123,7 +175,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         CXFile range_file;
         unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
+        if (getSpellingRange(cursor, range_file, start_off, end_off, sname.size())) {
             size_t fi = getOrCreateFile(range_file);
             result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
@@ -152,7 +204,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         CXFile range_file;
         unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
+        if (getSpellingRange(cursor, range_file, start_off, end_off, sname.size())) {
             size_t fi = getOrCreateFile(range_file);
             result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
@@ -170,7 +222,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         CXFile range_file;
         unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
+        if (getSpellingRange(cursor, range_file, start_off, end_off, sname.size())) {
             size_t fi = getOrCreateFile(range_file);
             // Note: clang visits TypeRef children of anonymous types through both
             // the TypedefDecl and the underlying type (UnionDecl/StructDecl),
@@ -198,6 +250,9 @@ void Stage1::process(CXTranslationUnit tu, const std::string& tu_filename) {
     // Then also ensure the TU's own source file is indexed.
     CXFile tu_file = clang_getFile(tu, tu_filename.c_str());
     if (tu_file) getOrCreateFile(tu_file);
+
+    // Collect macro definitions and expansions (requires DetailedPreprocessingRecord)
+    collectMacros(tu);
 
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, visitor, this);

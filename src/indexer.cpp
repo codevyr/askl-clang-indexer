@@ -76,7 +76,7 @@ void Indexer::processTU(const CompileCommand& cmd) {
     ClangTU tu;
     CXErrorCode err = clang_parseTranslationUnit2(
         index, cmd.filename.c_str(), c_args.data(), c_args.size(),
-        nullptr, 0, CXTranslationUnit_None, &tu.tu);
+        nullptr, 0, CXTranslationUnit_DetailedPreprocessingRecord, &tu.tu);
 
     if (err != CXError_Success || !tu) {
         fprintf(stderr, "Failed to parse: %s (error code: %d)\n", cmd.filename.c_str(), err);
