@@ -58,5 +58,7 @@ private:
     std::string computeFiletype(const std::string& path);
 
     static CXChildVisitResult visitor(CXCursor cursor, CXCursor parent, CXClientData data);
+    static void inclusionCallback(CXFile included_file, CXSourceLocation* stack,
+                                  unsigned len, CXClientData data);
     void visitCursor(CXCursor cursor, CXCursor parent);
 };

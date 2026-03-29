@@ -203,7 +203,21 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
     }
 }
 
+void Stage1::inclusionCallback(CXFile included_file, CXSourceLocation*,
+                               unsigned, CXClientData data) {
+    auto* self = static_cast<Stage1*>(data);
+    self->getOrCreateFile(included_file);
+}
+
 void Stage1::process(CXTranslationUnit tu, const std::string& tu_filename) {
+    // First, ensure all included files get FileData entries (with content + FILE symbol),
+    // even if they contain no handled cursor kinds (e.g., macro-only headers).
+    clang_getInclusions(tu, inclusionCallback, this);
+
+    // Then also ensure the TU's own source file is indexed.
+    CXFile tu_file = clang_getFile(tu, tu_filename.c_str());
+    if (tu_file) getOrCreateFile(tu_file);
+
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, visitor, this);
 }

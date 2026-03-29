@@ -515,6 +515,25 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "result_t"},
                 {"types.h", "types.h"},
             }
+        },
+        // Proves that files with only macros (no declarations/refs) still appear
+        // in the index via clang_getInclusions callback.
+        FixtureSpec{
+            "macro_only_header",
+            {"main.c"},
+            {
+                {"buf", GLOBAL, DATA},
+                {"macros.h", GLOBAL, FILETYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"smallest", GLOBAL, FUNCTION},
+            },
+            {},
+            {
+                {"macros.h", "macros.h"},
+                {"main.c", "buf"},
+                {"main.c", "main.c"},
+                {"main.c", "smallest"},
+            }
         }
     ),
     [](const testing::TestParamInfo<FixtureSpec>& info) {
