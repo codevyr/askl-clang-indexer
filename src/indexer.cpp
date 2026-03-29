@@ -3,11 +3,13 @@
 #include "proto_builder.h"
 #include "stage1.h"
 #include "stage2.h"
+#include "symbol_types.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <fstream>
+#include <stdexcept>
 #include <thread>
 #include <set>
 
@@ -21,17 +23,23 @@ Indexer::Indexer(const std::string& project_name, const std::string& compile_com
 std::string Indexer::computeCommonAncestor(const std::vector<CompileCommand>& cmds) {
     if (cmds.empty()) return ".";
 
+    // Extract directory part of first path
     std::string common = cmds[0].filename;
-    // Find the directory part
     auto last_slash = common.rfind('/');
     if (last_slash != std::string::npos) {
         common = common.substr(0, last_slash);
     }
 
     for (size_t i = 1; i < cmds.size(); i++) {
-        const std::string& path = cmds[i].filename;
+        // Extract directory part of this path too
+        std::string dir = cmds[i].filename;
+        auto slash = dir.rfind('/');
+        if (slash != std::string::npos) {
+            dir = dir.substr(0, slash);
+        }
+
         size_t j = 0;
-        while (j < common.size() && j < path.size() && common[j] == path[j]) {
+        while (j < common.size() && j < dir.size() && common[j] == dir[j]) {
             j++;
         }
         // Back up to last '/'
@@ -79,7 +87,7 @@ void Indexer::processTU(const CompileCommand& cmd) {
     }
 
     // Stage 1: Extract symbols and direct references
-    Stage1 stage1(symbol_table_, root_path_, processed_files_, files_mutex_);
+    Stage1 stage1(symbol_table_, root_path_);
     stage1.process(tu, cmd.filename);
 
     // Stage 2: Function pointer assignment analysis
@@ -135,7 +143,7 @@ void Indexer::createDirectorySymbols() {
     }
 
     for (auto& dir : dirs) {
-        symbol_table_.getOrCreate(dir, /*scope=*/2 /*GLOBAL*/, /*type=*/4 /*DIRECTORY*/);
+        symbol_table_.getOrCreate(dir, SCOPE_GLOBAL, SYMTYPE_DIRECTORY);
     }
 }
 
@@ -179,8 +187,14 @@ void Indexer::write(const std::string& output_path) {
         project_name_, root_path_, symbol_table_, all_files_);
 
     std::ofstream out(output_path, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("Failed to open output file: " + output_path);
+    }
     out.write(data.data(), data.size());
     out.close();
+    if (!out) {
+        throw std::runtime_error("Failed to write output file: " + output_path);
+    }
 
     fprintf(stderr, "Wrote %zu bytes to %s\n", data.size(), output_path.c_str());
 }

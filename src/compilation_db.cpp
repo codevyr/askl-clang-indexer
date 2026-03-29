@@ -8,7 +8,8 @@
 #include <unistd.h>
 #include <unordered_set>
 
-static const std::unordered_set<std::string> gcc_only_flags = {
+static const std::unordered_set<std::string> filtered_flags = {
+    // GCC-only flags that clang doesn't understand
     "-mno-sse-fp-math", "-fno-var-tracking-assignments",
     "-fconserve-stack", "-fno-allow-store-data-races",
     "-fno-code-hoisting", "-fno-delete-null-pointer-checks",
@@ -18,9 +19,11 @@ static const std::unordered_set<std::string> gcc_only_flags = {
     "-fno-reorder-blocks-and-partition",
     "-fno-partial-inlining",
     "-fno-tree-loop-distribute-patterns",
+    // Warnings-as-errors is noise for indexing
+    "-Werror",
 };
 
-static const std::vector<std::string> gcc_only_prefixes = {
+static const std::vector<std::string> filtered_prefixes = {
     "-mabi=", "-mpreferred-stack-boundary=",
     "-mindirect-branch-cs-prefix",
 };
@@ -119,8 +122,8 @@ CompilationDB::~CompilationDB() {
 void CompilationDB::filterGccFlags(std::vector<std::string>& args) {
     args.erase(
         std::remove_if(args.begin(), args.end(), [](const std::string& arg) {
-            if (gcc_only_flags.count(arg)) return true;
-            for (auto& prefix : gcc_only_prefixes) {
+            if (filtered_flags.count(arg)) return true;
+            for (auto& prefix : filtered_prefixes) {
                 if (arg.substr(0, prefix.size()) == prefix) return true;
             }
             return false;

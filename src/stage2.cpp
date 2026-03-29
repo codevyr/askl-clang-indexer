@@ -1,6 +1,7 @@
 #include "stage2.h"
 #include "clang_raii.h"
 #include "symbol_table.h"
+#include "symbol_types.h"
 
 Stage2::Stage2(SymbolTable& symbols) : symbols_(symbols) {}
 
@@ -43,10 +44,10 @@ void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start
     if (sname.empty()) return;
 
     CXLinkageKind linkage = clang_getCursorLinkage(referenced);
-    int scope = (linkage == CXLinkage_Internal) ? 1 : 2;
+    int scope = (linkage == CXLinkage_Internal) ? SCOPE_LOCAL : SCOPE_GLOBAL;
 
     std::string ref_file_path;
-    if (scope == 1) {
+    if (scope == SCOPE_LOCAL) {
         CXSourceLocation ref_loc = clang_getCursorLocation(referenced);
         CXFile rf;
         clang_getSpellingLocation(ref_loc, &rf, nullptr, nullptr, nullptr);
@@ -57,8 +58,8 @@ void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start
     }
 
     auto [sym_id, _] = symbols_.getOrCreate(
-        sname, scope, /*type=*/1 /*FUNCTION*/,
-        (scope == 1) ? ref_file_path : "");
+        sname, scope, SYMTYPE_FUNCTION,
+        (scope == SCOPE_LOCAL) ? ref_file_path : "");
 
     ClangString sf_name(clang_getFileName(source_file));
     Stage2Ref ref;
@@ -103,12 +104,12 @@ void Stage2::handleDesignatedInit(CXCursor cursor) {
 
     if (data.has_member && data.has_func) {
         CXSourceRange range = clang_getCursorExtent(cursor);
-        CXFile source_file;
+        CXFile source_file, end_file;
         unsigned start_off, end_off;
         clang_getExpansionLocation(clang_getRangeStart(range), &source_file, nullptr, nullptr, &start_off);
-        clang_getExpansionLocation(clang_getRangeEnd(range), nullptr, nullptr, nullptr, &end_off);
+        clang_getExpansionLocation(clang_getRangeEnd(range), &end_file, nullptr, nullptr, &end_off);
 
-        if (source_file) {
+        if (source_file && clang_File_isEqual(source_file, end_file)) {
             addFuncPtrRef(data.func_ref, source_file, start_off, end_off);
         }
     }
@@ -188,12 +189,12 @@ void Stage2::handleBinaryAssignment(CXCursor cursor) {
     if (!rhs_data.found) return;
 
     CXSourceRange range = clang_getCursorExtent(cursor);
-    CXFile source_file;
+    CXFile source_file, end_file;
     unsigned start_off, end_off;
     clang_getExpansionLocation(clang_getRangeStart(range), &source_file, nullptr, nullptr, &start_off);
-    clang_getExpansionLocation(clang_getRangeEnd(range), nullptr, nullptr, nullptr, &end_off);
+    clang_getExpansionLocation(clang_getRangeEnd(range), &end_file, nullptr, nullptr, &end_off);
 
-    if (source_file) {
+    if (source_file && clang_File_isEqual(source_file, end_file)) {
         addFuncPtrRef(rhs_data.func_ref, source_file, start_off, end_off);
     }
 }

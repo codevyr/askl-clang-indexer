@@ -117,9 +117,17 @@ RunResult runFixture(const std::string& fixture_name,
         id_to_name[sym.local_id] = sym.name;
     }
 
-    // Extract refs
+    // Extract refs and validate offset ranges
     for (auto& file : indexer.allFiles()) {
+        for (auto& inst : file.instances) {
+            EXPECT_LE(inst.start_offset, inst.end_offset)
+                << "Bad instance range in " << file.module_path
+                << ": start=" << inst.start_offset << " > end=" << inst.end_offset;
+        }
         for (auto& ref : file.refs) {
+            EXPECT_LE(ref.from_offset_start, ref.from_offset_end)
+                << "Bad ref range in " << file.module_path
+                << ": start=" << ref.from_offset_start << " > end=" << ref.from_offset_end;
             auto it = id_to_name.find(ref.to_symbol_local_id);
             std::string to_name = (it != id_to_name.end()) ? it->second : "UNKNOWN";
             result.refs.push_back({file.module_path, to_name});
@@ -336,6 +344,25 @@ INSTANTIATE_TEST_SUITE_P(
                 {"handler.c", "status"},
                 {"handler.c", "status"},
                 {"status.h", "status"},
+            }
+        },
+        FixtureSpec{
+            "cross_file_macro",
+            {"main.c"},
+            {
+                {"S_OK", GLOBAL, DATA},
+                {"get_result", GLOBAL, FUNCTION},
+                {"handle_close", GLOBAL, FUNCTION},
+                {"handle_open", GLOBAL, FUNCTION},
+                {"macros.h", GLOBAL, FILETYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"result", GLOBAL, TYPE},
+                {"status", GLOBAL, TYPE},
+            },
+            {
+                {"main.c", "S_OK"},
+                {"main.c", "result"},
+                {"main.c", "result"},
             }
         }
     ),

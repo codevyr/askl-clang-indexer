@@ -2,10 +2,8 @@
 
 #include <clang-c/Index.h>
 #include <cstdint>
-#include <mutex>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 class SymbolTable;
@@ -38,8 +36,7 @@ struct Stage1Result {
 
 class Stage1 {
 public:
-    Stage1(SymbolTable& symbols, const std::string& root_path,
-           std::unordered_set<std::string>& processed_files, std::mutex& files_mutex);
+    Stage1(SymbolTable& symbols, const std::string& root_path);
 
     void process(CXTranslationUnit tu, const std::string& tu_filename);
     Stage1Result takeResults();
@@ -47,15 +44,12 @@ public:
 private:
     SymbolTable& symbols_;
     std::string root_path_;
-    std::unordered_set<std::string>& processed_files_;
-    std::mutex& files_mutex_;
     Stage1Result result_;
-    int64_t next_object_id_;
 
     // Per-TU state
     std::unordered_map<std::string, size_t> file_index_; // filepath -> index in result_.files
 
-    FileData& getOrCreateFile(CXFile file);
+    size_t getOrCreateFile(CXFile file);
     std::string computeModulePath(const std::string& abs_path);
     std::string computeFiletype(const std::string& path);
     bool isLocalVariable(CXCursor cursor);

@@ -1,26 +1,26 @@
 #include "stage1.h"
 #include "clang_raii.h"
 #include "symbol_table.h"
+#include "symbol_types.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 
 static std::atomic<int64_t> global_object_id{1};
 
-Stage1::Stage1(SymbolTable& symbols, const std::string& root_path,
-               std::unordered_set<std::string>& processed_files, std::mutex& files_mutex)
-    : symbols_(symbols), root_path_(root_path),
-      processed_files_(processed_files), files_mutex_(files_mutex),
-      next_object_id_(0) {}
+Stage1::Stage1(SymbolTable& symbols, const std::string& root_path)
+    : symbols_(symbols), root_path_(root_path) {}
 
 std::string Stage1::computeModulePath(const std::string& abs_path) {
-    if (abs_path.substr(0, root_path_.size()) == root_path_) {
-        std::string rel = abs_path.substr(root_path_.size());
-        if (!rel.empty() && rel[0] == '/') rel = rel.substr(1);
-        return rel;
+    if (abs_path.size() > root_path_.size() &&
+        abs_path.substr(0, root_path_.size()) == root_path_ &&
+        abs_path[root_path_.size()] == '/') {
+        return abs_path.substr(root_path_.size() + 1);
     }
+    if (abs_path == root_path_) return "";
     return abs_path;
 }
 
@@ -32,20 +32,21 @@ std::string Stage1::computeFiletype(const std::string& path) {
     return "text/plain";
 }
 
-FileData& Stage1::getOrCreateFile(CXFile file) {
+size_t Stage1::getOrCreateFile(CXFile file) {
     ClangString filename(clang_getFileName(file));
     std::string path = filename.to_string();
 
-    auto it = file_index_.find(path);
-    if (it != file_index_.end()) {
-        return result_.files[it->second];
+    // clang_getFileName may return relative paths for headers included
+    // via relative -I/-iquote paths. Resolve to absolute.
+    if (!path.empty() && path[0] != '/') {
+        std::error_code ec;
+        auto abs = std::filesystem::canonical(path, ec);
+        if (!ec) path = abs.string();
     }
 
-    // Check if already processed by another TU
-    bool new_file;
-    {
-        std::lock_guard<std::mutex> lock(files_mutex_);
-        new_file = processed_files_.insert(path).second;
+    auto it = file_index_.find(path);
+    if (it != file_index_.end()) {
+        return it->second;
     }
 
     FileData fd;
@@ -54,25 +55,23 @@ FileData& Stage1::getOrCreateFile(CXFile file) {
     fd.module_path = computeModulePath(path);
     fd.filetype = computeFiletype(path);
 
-    if (new_file) {
-        // Read file content
-        std::ifstream in(path, std::ios::binary);
-        if (in) {
-            fd.content = std::vector<uint8_t>(
-                (std::istreambuf_iterator<char>(in)),
-                std::istreambuf_iterator<char>());
-        }
-
-        // Create FILE symbol
-        auto [file_sym_id, _] = symbols_.getOrCreate(
-            fd.module_path, /*scope=*/2 /*GLOBAL*/, /*type=*/2 /*FILE*/);
-        fd.instances.push_back({file_sym_id, 0, static_cast<int32_t>(fd.content.size())});
+    // Always read content — merging in indexer.cpp will pick whichever entry has it
+    std::ifstream in(path, std::ios::binary);
+    if (in) {
+        fd.content = std::vector<uint8_t>(
+            (std::istreambuf_iterator<char>(in)),
+            std::istreambuf_iterator<char>());
     }
+
+    // Create FILE symbol
+    auto [file_sym_id, _] = symbols_.getOrCreate(
+        fd.module_path, SCOPE_GLOBAL, SYMTYPE_FILE);
+    fd.instances.push_back({file_sym_id, 0, static_cast<int32_t>(fd.content.size())});
 
     size_t idx = result_.files.size();
     result_.files.push_back(std::move(fd));
     file_index_[path] = idx;
-    return result_.files[idx];
+    return idx;
 }
 
 bool Stage1::isLocalVariable(CXCursor cursor) {
@@ -114,27 +113,27 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         CXLinkageKind linkage = clang_getCursorLinkage(cursor);
-        int scope = (linkage == CXLinkage_Internal) ? 1 : 2;
+        int scope = (linkage == CXLinkage_Internal) ? SCOPE_LOCAL : SCOPE_GLOBAL;
 
         ClangString file_name(clang_getFileName(file));
         std::string file_path = file_name.to_string();
 
         auto [sym_id, was_new] = symbols_.getOrCreate(
-            sname, scope, /*type=*/1 /*FUNCTION*/,
-            (scope == 1) ? file_path : "");
+            sname, scope, SYMTYPE_FUNCTION,
+            (scope == SCOPE_LOCAL) ? file_path : "");
 
         // Get extent for instance
         CXSourceRange range = clang_getCursorExtent(cursor);
         CXSourceLocation start_loc = clang_getRangeStart(range);
         CXSourceLocation end_loc = clang_getRangeEnd(range);
         unsigned start_off, end_off;
-        CXFile start_file;
+        CXFile start_file, end_file;
         clang_getSpellingLocation(start_loc, &start_file, nullptr, nullptr, &start_off);
-        clang_getSpellingLocation(end_loc, nullptr, nullptr, nullptr, &end_off);
+        clang_getSpellingLocation(end_loc, &end_file, nullptr, nullptr, &end_off);
 
-        if (start_file) {
-            FileData& fd = getOrCreateFile(start_file);
-            fd.instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+        if (start_file && clang_File_isEqual(start_file, end_file)) {
+            size_t fi = getOrCreateFile(start_file);
+            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
         break;
     }
@@ -145,17 +144,17 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         std::string sname = name.to_string();
         if (sname.empty()) break; // skip anonymous
 
-        auto [sym_id, was_new] = symbols_.getOrCreate(sname, /*scope=*/2, /*type=*/5 /*TYPE*/);
+        auto [sym_id, was_new] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
 
         CXSourceRange range = clang_getCursorExtent(cursor);
         unsigned start_off, end_off;
-        CXFile start_file;
+        CXFile start_file, end_file;
         clang_getSpellingLocation(clang_getRangeStart(range), &start_file, nullptr, nullptr, &start_off);
-        clang_getSpellingLocation(clang_getRangeEnd(range), nullptr, nullptr, nullptr, &end_off);
+        clang_getSpellingLocation(clang_getRangeEnd(range), &end_file, nullptr, nullptr, &end_off);
 
-        if (start_file) {
-            FileData& fd = getOrCreateFile(start_file);
-            fd.instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+        if (start_file && clang_File_isEqual(start_file, end_file)) {
+            size_t fi = getOrCreateFile(start_file);
+            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
         break;
     }
@@ -164,17 +163,17 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         std::string sname = name.to_string();
         if (sname.empty()) break;
 
-        auto [sym_id, was_new] = symbols_.getOrCreate(sname, /*scope=*/2, /*type=*/5 /*TYPE*/);
+        auto [sym_id, was_new] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
 
         CXSourceRange range = clang_getCursorExtent(cursor);
         unsigned start_off, end_off;
-        CXFile start_file;
+        CXFile start_file, end_file;
         clang_getSpellingLocation(clang_getRangeStart(range), &start_file, nullptr, nullptr, &start_off);
-        clang_getSpellingLocation(clang_getRangeEnd(range), nullptr, nullptr, nullptr, &end_off);
+        clang_getSpellingLocation(clang_getRangeEnd(range), &end_file, nullptr, nullptr, &end_off);
 
-        if (start_file) {
-            FileData& fd = getOrCreateFile(start_file);
-            fd.instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+        if (start_file && clang_File_isEqual(start_file, end_file)) {
+            size_t fi = getOrCreateFile(start_file);
+            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
         break;
     }
@@ -188,24 +187,24 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         CXLinkageKind linkage = clang_getCursorLinkage(cursor);
-        int scope = (linkage == CXLinkage_Internal) ? 1 : 2;
+        int scope = (linkage == CXLinkage_Internal) ? SCOPE_LOCAL : SCOPE_GLOBAL;
 
         ClangString file_name(clang_getFileName(file));
         std::string file_path = file_name.to_string();
 
         auto [sym_id, was_new] = symbols_.getOrCreate(
-            sname, scope, /*type=*/6 /*DATA*/,
-            (scope == 1) ? file_path : "");
+            sname, scope, SYMTYPE_DATA,
+            (scope == SCOPE_LOCAL) ? file_path : "");
 
         CXSourceRange range = clang_getCursorExtent(cursor);
         unsigned start_off, end_off;
-        CXFile start_file;
+        CXFile start_file, end_file;
         clang_getSpellingLocation(clang_getRangeStart(range), &start_file, nullptr, nullptr, &start_off);
-        clang_getSpellingLocation(clang_getRangeEnd(range), nullptr, nullptr, nullptr, &end_off);
+        clang_getSpellingLocation(clang_getRangeEnd(range), &end_file, nullptr, nullptr, &end_off);
 
-        if (start_file) {
-            FileData& fd = getOrCreateFile(start_file);
-            fd.instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+        if (start_file && clang_File_isEqual(start_file, end_file)) {
+            size_t fi = getOrCreateFile(start_file);
+            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
         break;
     }
@@ -219,11 +218,11 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         CXLinkageKind linkage = clang_getCursorLinkage(referenced);
-        int scope = (linkage == CXLinkage_Internal) ? 1 : 2;
+        int scope = (linkage == CXLinkage_Internal) ? SCOPE_LOCAL : SCOPE_GLOBAL;
 
         // Get file path of the referenced function for LOCAL dedup
         std::string ref_file_path;
-        if (scope == 1) {
+        if (scope == SCOPE_LOCAL) {
             CXSourceLocation ref_loc = clang_getCursorLocation(referenced);
             CXFile ref_file;
             clang_getSpellingLocation(ref_loc, &ref_file, nullptr, nullptr, nullptr);
@@ -234,21 +233,21 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         }
 
         auto [sym_id, _] = symbols_.getOrCreate(
-            sname, scope, /*type=*/1 /*FUNCTION*/,
-            (scope == 1) ? ref_file_path : "");
+            sname, scope, SYMTYPE_FUNCTION,
+            (scope == SCOPE_LOCAL) ? ref_file_path : "");
 
         // Use expansion location for where the call occurs
         CXSourceRange range = clang_getCursorExtent(cursor);
         CXSourceLocation start_loc = clang_getRangeStart(range);
         CXSourceLocation end_loc = clang_getRangeEnd(range);
-        CXFile call_file;
+        CXFile call_file, call_end_file;
         unsigned start_off, end_off;
         clang_getExpansionLocation(start_loc, &call_file, nullptr, nullptr, &start_off);
-        clang_getExpansionLocation(end_loc, nullptr, nullptr, nullptr, &end_off);
+        clang_getExpansionLocation(end_loc, &call_end_file, nullptr, nullptr, &end_off);
 
-        if (call_file) {
-            FileData& fd = getOrCreateFile(call_file);
-            fd.refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+        if (call_file && clang_File_isEqual(call_file, call_end_file)) {
+            size_t fi = getOrCreateFile(call_file);
+            result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
         break;
     }
@@ -279,15 +278,15 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         CXLinkageKind linkage = clang_getCursorLinkage(referenced);
-        int scope = (linkage == CXLinkage_Internal) ? 1 : 2;
+        int scope = (linkage == CXLinkage_Internal) ? SCOPE_LOCAL : SCOPE_GLOBAL;
 
         int sym_type;
-        if (ref_kind == CXCursor_FunctionDecl) sym_type = 1; // FUNCTION
-        else if (ref_kind == CXCursor_EnumConstantDecl) sym_type = 6; // DATA
-        else sym_type = 6; // DATA (file-scope VarDecl)
+        if (ref_kind == CXCursor_FunctionDecl) sym_type = SYMTYPE_FUNCTION;
+        else if (ref_kind == CXCursor_EnumConstantDecl) sym_type = SYMTYPE_DATA;
+        else sym_type = SYMTYPE_DATA; // file-scope VarDecl
 
         std::string ref_file_path;
-        if (scope == 1) {
+        if (scope == SCOPE_LOCAL) {
             CXSourceLocation ref_loc = clang_getCursorLocation(referenced);
             CXFile ref_file;
             clang_getSpellingLocation(ref_loc, &ref_file, nullptr, nullptr, nullptr);
@@ -299,19 +298,19 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         auto [sym_id, _] = symbols_.getOrCreate(
             sname, scope, sym_type,
-            (scope == 1) ? ref_file_path : "");
+            (scope == SCOPE_LOCAL) ? ref_file_path : "");
 
         CXSourceRange range = clang_getCursorExtent(cursor);
         CXSourceLocation start_loc = clang_getRangeStart(range);
         CXSourceLocation end_loc = clang_getRangeEnd(range);
-        CXFile expr_file;
+        CXFile expr_file, expr_end_file;
         unsigned start_off, end_off;
         clang_getExpansionLocation(start_loc, &expr_file, nullptr, nullptr, &start_off);
-        clang_getExpansionLocation(end_loc, nullptr, nullptr, nullptr, &end_off);
+        clang_getExpansionLocation(end_loc, &expr_end_file, nullptr, nullptr, &end_off);
 
-        if (expr_file) {
-            FileData& fd = getOrCreateFile(expr_file);
-            fd.refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+        if (expr_file && clang_File_isEqual(expr_file, expr_end_file)) {
+            size_t fi = getOrCreateFile(expr_file);
+            result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
         break;
     }
@@ -323,19 +322,19 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         std::string sname = ref_name.to_string();
         if (sname.empty()) break;
 
-        auto [sym_id, _] = symbols_.getOrCreate(sname, /*scope=*/2, /*type=*/5 /*TYPE*/);
+        auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
 
         CXSourceRange range = clang_getCursorExtent(cursor);
         CXSourceLocation start_loc = clang_getRangeStart(range);
         CXSourceLocation end_loc = clang_getRangeEnd(range);
-        CXFile ref_file;
+        CXFile ref_file, ref_end_file;
         unsigned start_off, end_off;
         clang_getExpansionLocation(start_loc, &ref_file, nullptr, nullptr, &start_off);
-        clang_getExpansionLocation(end_loc, nullptr, nullptr, nullptr, &end_off);
+        clang_getExpansionLocation(end_loc, &ref_end_file, nullptr, nullptr, &end_off);
 
-        if (ref_file) {
-            FileData& fd = getOrCreateFile(ref_file);
-            fd.refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+        if (ref_file && clang_File_isEqual(ref_file, ref_end_file)) {
+            size_t fi = getOrCreateFile(ref_file);
+            result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
         break;
     }

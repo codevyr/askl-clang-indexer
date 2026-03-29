@@ -10,7 +10,7 @@ int main(int argc, char* argv[]) {
     std::string output_path = "index.pb";
     std::string project_name = "main";
     std::string root_path;
-    int threads = std::thread::hardware_concurrency();
+    int threads = std::max(1u, std::thread::hardware_concurrency());
 
     app.add_option("--compile-commands", compile_commands_dir,
         "Directory containing compile_commands.json");

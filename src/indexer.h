@@ -6,7 +6,6 @@
 
 #include <mutex>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 class Indexer {
@@ -30,7 +29,6 @@ private:
 
     std::mutex files_mutex_;
     std::vector<FileData> all_files_;
-    std::unordered_set<std::string> processed_files_;
 
     void processTU(const CompileCommand& cmd);
     void createDirectorySymbols();
