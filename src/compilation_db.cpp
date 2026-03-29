@@ -1,7 +1,11 @@
 #include "compilation_db.h"
 #include <algorithm>
+#include <array>
 #include <clang-c/Index.h>
 #include <cstdio>
+#include <sstream>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <unordered_set>
 
 static const std::unordered_set<std::string> gcc_only_flags = {
@@ -45,14 +49,15 @@ CompilationDB::CompilationDB(const std::string& dir) {
         clang_disposeString(cx_filename);
         clang_disposeString(cx_directory);
 
+        std::string compiler;
         unsigned num_args = clang_CompileCommand_getNumArgs(cmd);
         for (unsigned j = 0; j < num_args; j++) {
             CXString cx_arg = clang_CompileCommand_getArg(cmd, j);
             std::string arg = clang_getCString(cx_arg);
             clang_disposeString(cx_arg);
 
-            // Skip arg 0 (compiler path)
-            if (j == 0) continue;
+            // Capture and skip arg 0 (compiler path)
+            if (j == 0) { compiler = arg; continue; }
             // Skip -c (implied by clang_parseTranslationUnit)
             if (arg == "-c") continue;
             // Skip -o and its argument
@@ -88,6 +93,7 @@ CompilationDB::CompilationDB(const std::string& dir) {
         }
 
         filterGccFlags(entry.args);
+        addSystemIncludes(compiler, entry.args);
         commands_.push_back(std::move(entry));
     }
 
@@ -108,4 +114,84 @@ void CompilationDB::filterGccFlags(std::vector<std::string>& args) {
             return false;
         }),
         args.end());
+}
+
+std::vector<std::string> CompilationDB::querySystemIncludes(const std::string& compiler) {
+    std::vector<std::string> includes;
+
+    // Use pipe+fork+exec instead of popen to avoid shell interpretation
+    // of the compiler path (which may contain special characters).
+    int pipefd[2];
+    if (pipe(pipefd) == -1) return includes;
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return includes;
+    }
+
+    if (pid == 0) {
+        // Child: redirect stdout+stderr to pipe, exec compiler
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        execlp(compiler.c_str(), compiler.c_str(),
+               "-E", "-x", "c", "-v", "/dev/null", nullptr);
+        _exit(127);
+    }
+
+    // Parent: read from pipe
+    close(pipefd[1]);
+    std::array<char, 512> buf;
+    std::string output;
+    ssize_t n;
+    while ((n = read(pipefd[0], buf.data(), buf.size())) > 0) {
+        output.append(buf.data(), n);
+    }
+    close(pipefd[0]);
+    waitpid(pid, nullptr, 0);
+
+    // Parse the output between "#include <...> search starts here:" and "End of search list."
+    auto start = output.find("#include <...> search starts here:");
+    auto end = output.find("End of search list.");
+    if (start == std::string::npos || end == std::string::npos) return includes;
+
+    std::istringstream stream(output.substr(start, end - start));
+    std::string line;
+    std::getline(stream, line); // skip the header line
+    while (std::getline(stream, line)) {
+        // Each line is " /path/to/include" (with leading space)
+        size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos) continue;
+        std::string path = line.substr(first);
+        // Remove " (framework directory)" suffix if present
+        auto paren = path.find(" (");
+        if (paren != std::string::npos) path = path.substr(0, paren);
+        if (!path.empty()) includes.push_back(path);
+    }
+
+    return includes;
+}
+
+void CompilationDB::addSystemIncludes(const std::string& compiler, std::vector<std::string>& args) {
+    if (compiler.empty()) return;
+
+    // Projects like the Linux kernel use -nostdinc to avoid system headers.
+    // Respect that: don't inject system includes if the command already opts out.
+    for (auto& arg : args) {
+        if (arg == "-nostdinc") return;
+    }
+
+    auto it = system_includes_cache_.find(compiler);
+    if (it == system_includes_cache_.end()) {
+        auto includes = querySystemIncludes(compiler);
+        it = system_includes_cache_.emplace(compiler, std::move(includes)).first;
+    }
+
+    for (auto& path : it->second) {
+        args.push_back("-isystem");
+        args.push_back(path);
+    }
 }

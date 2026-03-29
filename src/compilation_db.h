@@ -2,6 +2,7 @@
 
 #include <clang-c/CXCompilationDatabase.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct CompileCommand {
@@ -23,6 +24,9 @@ public:
 private:
     CXCompilationDatabase db_ = nullptr;
     std::vector<CompileCommand> commands_;
+    std::unordered_map<std::string, std::vector<std::string>> system_includes_cache_;
 
     void filterGccFlags(std::vector<std::string>& args);
+    std::vector<std::string> querySystemIncludes(const std::string& compiler);
+    void addSystemIncludes(const std::string& compiler, std::vector<std::string>& args);
 };
