@@ -25,6 +25,24 @@ std::string ProtoBuilder::build(
         pb_sym->set_type(static_cast<askl::index::SymbolType>(sym.type));
     }
 
+    // Dedup key: (symbol_id, start_offset, end_offset)
+    struct EntryKey {
+        int64_t sym_id;
+        int32_t start;
+        int32_t end;
+        bool operator==(const EntryKey& o) const {
+            return sym_id == o.sym_id && start == o.start && end == o.end;
+        }
+    };
+    struct EntryKeyHash {
+        size_t operator()(const EntryKey& k) const {
+            size_t h = std::hash<int64_t>{}(k.sym_id);
+            h ^= std::hash<int32_t>{}(k.start) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int32_t>{}(k.end) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
     // Add all files as Objects
     for (auto& file : files) {
         auto* obj = project.add_objects();
@@ -34,34 +52,22 @@ std::string ProtoBuilder::build(
         obj->set_filetype(file.filetype);
         obj->set_content(file.content.data(), file.content.size());
 
+        // Deduplicate instances by (symbol_local_id, start_offset, end_offset)
+        std::unordered_set<EntryKey, EntryKeyHash> seen_instances;
         for (auto& inst : file.instances) {
-            auto* pb_inst = obj->add_symbol_instances();
-            pb_inst->set_symbol_local_id(inst.symbol_local_id);
-            pb_inst->set_start_offset(inst.start_offset);
-            pb_inst->set_end_offset(inst.end_offset);
+            EntryKey key{inst.symbol_local_id, inst.start_offset, inst.end_offset};
+            if (seen_instances.insert(key).second) {
+                auto* pb_inst = obj->add_symbol_instances();
+                pb_inst->set_symbol_local_id(inst.symbol_local_id);
+                pb_inst->set_start_offset(inst.start_offset);
+                pb_inst->set_end_offset(inst.end_offset);
+            }
         }
 
         // Deduplicate refs by (to_symbol_local_id, from_offset_start, from_offset_end)
-        struct RefKey {
-            int64_t sym_id;
-            int32_t start;
-            int32_t end;
-            bool operator==(const RefKey& o) const {
-                return sym_id == o.sym_id && start == o.start && end == o.end;
-            }
-        };
-        struct RefKeyHash {
-            size_t operator()(const RefKey& k) const {
-                size_t h = std::hash<int64_t>{}(k.sym_id);
-                h ^= std::hash<int32_t>{}(k.start) + 0x9e3779b9 + (h << 6) + (h >> 2);
-                h ^= std::hash<int32_t>{}(k.end) + 0x9e3779b9 + (h << 6) + (h >> 2);
-                return h;
-            }
-        };
-
-        std::unordered_set<RefKey, RefKeyHash> seen_refs;
+        std::unordered_set<EntryKey, EntryKeyHash> seen_refs;
         for (auto& ref : file.refs) {
-            RefKey key{ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end};
+            EntryKey key{ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end};
             if (seen_refs.insert(key).second) {
                 auto* pb_ref = obj->add_refs();
                 pb_ref->set_to_symbol_local_id(ref.to_symbol_local_id);

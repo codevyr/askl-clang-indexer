@@ -364,6 +364,26 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "result"},
                 {"main.c", "result"},
             }
+        },
+        FixtureSpec{
+            "shared_header_typedef",
+            {"a.c", "b.c"},
+            {
+                {"a.c", GLOBAL, FILETYPE},
+                {"b.c", GLOBAL, FILETYPE},
+                {"compute_a", GLOBAL, FUNCTION},
+                {"make_pair", GLOBAL, FUNCTION},
+                {"pair", GLOBAL, TYPE},
+                {"pair_t", GLOBAL, TYPE},
+                {"result_t", GLOBAL, TYPE},
+                {"types.h", GLOBAL, FILETYPE},
+            },
+            {
+                {"a.c", "result_t"},
+                {"a.c", "result_t"},
+                {"b.c", "pair_t"},
+                {"b.c", "pair_t"},
+            }
         }
     ),
     [](const testing::TestParamInfo<FixtureSpec>& info) {
