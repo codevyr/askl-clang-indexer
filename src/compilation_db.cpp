@@ -25,6 +25,15 @@ static const std::vector<std::string> gcc_only_prefixes = {
     "-mindirect-branch-cs-prefix",
 };
 
+static bool hasExtension(const std::string& path, const std::string& ext) {
+    return path.size() >= ext.size() &&
+           path.compare(path.size() - ext.size(), ext.size(), ext) == 0;
+}
+
+static bool isAssemblyFile(const std::string& path) {
+    return hasExtension(path, ".S") || hasExtension(path, ".s");
+}
+
 CompilationDB::CompilationDB(const std::string& dir) {
     CXCompilationDatabase_Error error;
     db_ = clang_CompilationDatabase_fromDirectory(dir.c_str(), &error);
@@ -48,6 +57,9 @@ CompilationDB::CompilationDB(const std::string& dir) {
 
         clang_disposeString(cx_filename);
         clang_disposeString(cx_directory);
+
+        // Skip assembly files — libclang can't parse them
+        if (isAssemblyFile(entry.filename)) continue;
 
         std::string compiler;
         unsigned num_args = clang_CompileCommand_getNumArgs(cmd);
