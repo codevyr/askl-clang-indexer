@@ -13,7 +13,7 @@
 class Indexer {
 public:
     Indexer(const std::string& project_name, const std::string& compile_commands_dir,
-            const std::string& root_path, int threads);
+            const std::string& root_path, int threads, bool include_git_files = false);
 
     void run();
     void write(const std::string& output_path);
@@ -25,6 +25,7 @@ private:
     std::string project_name_;
     std::string root_path_;
     int threads_;
+    bool include_git_files_;
 
     CompilationDB compile_db_;
     SymbolTable symbol_table_;
@@ -35,6 +36,8 @@ private:
     std::unordered_map<std::string, size_t> file_index_; // guarded by files_mutex_
 
     void processTU(const CompileCommand& cmd);
+    void addGitTrackedFiles();
+    void addFile(const std::string& abs_path);
     void createDirectorySymbols();
     std::string computeCommonAncestor(const std::vector<CompileCommand>& cmds);
 };

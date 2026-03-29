@@ -132,24 +132,51 @@ RunResult runFixture(const std::string& fixture_name,
     Indexer indexer("test", temp_dir.path, fixture_dir, 1);
     indexer.run();
 
+    // Helper to strip the fixture_dir prefix from absolute paths for comparison.
+    // Directory symbols for the fixture_dir ancestors are also filtered out.
+    std::string root_prefix = fixture_dir + "/";
+    auto strip_root = [&](const std::string& path) -> std::string {
+        if (path.size() > root_prefix.size() &&
+            path.substr(0, root_prefix.size()) == root_prefix) {
+            return path.substr(root_prefix.size());
+        }
+        return path;
+    };
+
     RunResult result;
 
-    // Extract symbols and build id -> name map in one pass
+    // Extract symbols and build id -> name map in one pass.
+    // Directory symbols are skipped when they represent the fixture_dir itself
+    // or any ancestor (e.g., /home, /home/user, ..., /path/to/fixture_dir).
+    // A directory is an ancestor if fixture_dir starts with "name/".
+    // A directory is the fixture_dir itself if name == fixture_dir.
+    auto is_fixture_ancestor_dir = [&](const std::string& name) {
+        return name == fixture_dir ||
+               (fixture_dir.size() > name.size() &&
+                fixture_dir[name.size()] == '/' &&
+                fixture_dir.compare(0, name.size(), name) == 0);
+    };
+
     std::unordered_map<int64_t, std::string> id_to_name;
     for (auto& sym : indexer.symbolTable().allSymbols()) {
-        result.symbols.push_back({sym.name, sym.scope, sym.type});
+        if (sym.type == 4 && is_fixture_ancestor_dir(sym.name)) {
+            id_to_name[sym.local_id] = sym.name;
+            continue;
+        }
+        result.symbols.push_back({strip_root(sym.name), sym.scope, sym.type});
         id_to_name[sym.local_id] = sym.name;
     }
 
     // Extract instances, refs, and validate offset ranges
     for (auto& file : indexer.allFiles()) {
+        std::string rel_path = strip_root(file.module_path);
         for (auto& inst : file.instances) {
             EXPECT_LE(inst.start_offset, inst.end_offset)
                 << "Bad instance range in " << file.module_path
                 << ": start=" << inst.start_offset << " > end=" << inst.end_offset;
             auto it = id_to_name.find(inst.symbol_local_id);
-            std::string sym_name = (it != id_to_name.end()) ? it->second : "UNKNOWN";
-            result.instances.push_back({file.module_path, sym_name});
+            std::string sym_name = (it != id_to_name.end()) ? strip_root(it->second) : "UNKNOWN";
+            result.instances.push_back({rel_path, sym_name});
         }
         for (auto& ref : file.refs) {
             EXPECT_LE(ref.from_offset_start, ref.from_offset_end)
@@ -157,7 +184,7 @@ RunResult runFixture(const std::string& fixture_name,
                 << ": start=" << ref.from_offset_start << " > end=" << ref.from_offset_end;
             auto it = id_to_name.find(ref.to_symbol_local_id);
             std::string to_name = (it != id_to_name.end()) ? it->second : "UNKNOWN";
-            result.refs.push_back({file.module_path, to_name, ref.from_offset_start, ref.from_offset_end});
+            result.refs.push_back({rel_path, to_name, ref.from_offset_start, ref.from_offset_end});
         }
     }
 

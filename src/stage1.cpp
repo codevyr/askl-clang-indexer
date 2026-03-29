@@ -1,34 +1,15 @@
 #include "stage1.h"
 #include "clang_raii.h"
 #include "clang_utils.h"
+#include "file_utils.h"
 #include "symbol_table.h"
 #include "symbol_types.h"
 
 #include <cstdio>
 #include <fstream>
 
-Stage1::Stage1(SymbolTable& symbols, const std::string& root_path,
-               std::atomic<int64_t>& next_object_id)
-    : symbols_(symbols), root_path_(root_path), next_object_id_(next_object_id) {}
-
-std::string Stage1::computeModulePath(const std::string& abs_path) {
-    if (abs_path.size() > root_path_.size() &&
-        abs_path.substr(0, root_path_.size()) == root_path_ &&
-        abs_path[root_path_.size()] == '/') {
-        return abs_path.substr(root_path_.size() + 1);
-    }
-    if (abs_path == root_path_) return "";
-    return abs_path;
-}
-
-std::string Stage1::computeFiletype(const std::string& path) {
-    auto dot = path.rfind('.');
-    if (dot == std::string::npos) return "text/plain";
-    auto ext = path.substr(dot);
-    if (ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".cxx") return "text/x-c";
-    if (ext == ".h" || ext == ".hpp" || ext == ".hh" || ext == ".hxx") return "text/x-c-header";
-    return "text/plain";
-}
+Stage1::Stage1(SymbolTable& symbols, std::atomic<int64_t>& next_object_id)
+    : symbols_(symbols), next_object_id_(next_object_id) {}
 
 size_t Stage1::getOrCreateFile(CXFile file) {
     std::string path = getCanonicalPath(file);
@@ -41,7 +22,7 @@ size_t Stage1::getOrCreateFile(CXFile file) {
     FileData fd;
     fd.object_local_id = next_object_id_.fetch_add(1);
     fd.filesystem_path = path;
-    fd.module_path = computeModulePath(path);
+    fd.module_path = path;
     fd.filetype = computeFiletype(path);
 
     std::ifstream in(path, std::ios::binary);

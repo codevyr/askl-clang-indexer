@@ -38,15 +38,13 @@ struct Stage1Result {
 
 class Stage1 {
 public:
-    Stage1(SymbolTable& symbols, const std::string& root_path,
-           std::atomic<int64_t>& next_object_id);
+    Stage1(SymbolTable& symbols, std::atomic<int64_t>& next_object_id);
 
     void process(CXTranslationUnit tu, const std::string& tu_filename);
     Stage1Result takeResults();
 
 private:
     SymbolTable& symbols_;
-    std::string root_path_;
     std::atomic<int64_t>& next_object_id_;
     Stage1Result result_;
 
@@ -54,8 +52,6 @@ private:
     std::unordered_map<std::string, size_t> file_index_; // filepath -> index in result_.files
 
     size_t getOrCreateFile(CXFile file);
-    std::string computeModulePath(const std::string& abs_path);
-    std::string computeFiletype(const std::string& path);
 
     static CXChildVisitResult visitor(CXCursor cursor, CXCursor parent, CXClientData data);
     static void inclusionCallback(CXFile included_file, CXSourceLocation* stack,

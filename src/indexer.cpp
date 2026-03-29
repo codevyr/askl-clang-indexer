@@ -1,5 +1,6 @@
 #include "indexer.h"
 #include "clang_raii.h"
+#include "file_utils.h"
 #include "proto_builder.h"
 #include "stage1.h"
 #include "stage2.h"
@@ -7,16 +8,21 @@
 
 #include <atomic>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <set>
 #include <stdexcept>
 #include <thread>
-#include <set>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 Indexer::Indexer(const std::string& project_name, const std::string& compile_commands_dir,
-                const std::string& root_path, int threads)
+                const std::string& root_path, int threads, bool include_git_files)
     : project_name_(project_name),
       root_path_(root_path),
       threads_(threads),
+      include_git_files_(include_git_files),
       compile_db_(compile_commands_dir) {}
 
 std::string Indexer::computeCommonAncestor(const std::vector<CompileCommand>& cmds) {
@@ -90,7 +96,7 @@ void Indexer::processTU(const CompileCommand& cmd) {
     }
 
     // Stage 1: Extract symbols and direct references
-    Stage1 stage1(symbol_table_, root_path_, next_object_id_);
+    Stage1 stage1(symbol_table_, next_object_id_);
     stage1.process(tu, cmd.filename);
 
     // Stage 2: Function pointer assignment analysis
@@ -123,6 +129,96 @@ void Indexer::processTU(const CompileCommand& cmd) {
             }
         }
     }
+}
+
+void Indexer::addGitTrackedFiles() {
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        fprintf(stderr, "Warning: failed to create pipe for git ls-files\n");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        fprintf(stderr, "Warning: failed to fork for git ls-files\n");
+        return;
+    }
+
+    if (pid == 0) {
+        // Child: redirect stdout to pipe, exec git
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        execlp("git", "git", "-C", root_path_.c_str(), "ls-files", "-z", nullptr);
+        _exit(127);
+    }
+
+    // Parent: read from pipe
+    close(pipefd[1]);
+    std::vector<char> buf(4096);
+    std::string accum;
+    while (true) {
+        ssize_t n = read(pipefd[0], buf.data(), buf.size());
+        if (n <= 0) break;
+        accum.append(buf.data(), n);
+    }
+    close(pipefd[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "Warning: git ls-files failed (exit %d)\n",
+                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return;
+    }
+
+    size_t before = all_files_.size();
+    size_t pos = 0;
+    while (pos < accum.size()) {
+        size_t nul = accum.find('\0', pos);
+        if (nul == std::string::npos) nul = accum.size();
+        std::string rel_path = accum.substr(pos, nul - pos);
+        pos = nul + 1;
+
+        if (rel_path.empty()) continue;
+
+        addFile(root_path_ + "/" + rel_path);
+    }
+
+    fprintf(stderr, "Git-tracked files added: %zu\n", all_files_.size() - before);
+}
+
+void Indexer::addFile(const std::string& abs_path) {
+    // Skip if already indexed
+    if (file_index_.count(abs_path)) return;
+
+    // Skip non-regular files (directories, submodules, symlinks to dirs, etc.)
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(abs_path, ec)) return;
+
+    // Read file content
+    std::ifstream in(abs_path, std::ios::binary);
+    if (!in) return;
+    std::vector<uint8_t> content(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    FileData fd;
+    fd.object_local_id = next_object_id_.fetch_add(1);
+    fd.filesystem_path = abs_path;
+    fd.module_path = abs_path;
+    fd.filetype = computeFiletype(abs_path);
+    fd.content = std::move(content);
+
+    // Create FILE symbol and instance
+    auto [file_sym_id, _] = symbol_table_.getOrCreate(
+        fd.module_path, SCOPE_GLOBAL, SYMTYPE_FILE);
+    fd.instances.push_back({file_sym_id, 0, static_cast<int32_t>(fd.content.size())});
+
+    file_index_[abs_path] = all_files_.size();
+    all_files_.push_back(std::move(fd));
 }
 
 void Indexer::createDirectorySymbols() {
@@ -172,6 +268,10 @@ void Indexer::run() {
         });
     }
     for (auto& w : workers) w.join();
+
+    if (include_git_files_) {
+        addGitTrackedFiles();
+    }
 
     createDirectorySymbols();
 
