@@ -265,8 +265,9 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         } else if (ref_kind == CXCursor_ParmDecl) {
             break;
         } else if (ref_kind == CXCursor_FunctionDecl) {
-            // Function refs via DeclRefExpr that are NOT call expressions
-            // (function pointers, etc.) — these are handled here
+            // Skip — direct calls are handled by CallExpr, function pointer
+            // assignments are handled by Stage 2.
+            break;
         } else if (ref_kind == CXCursor_EnumConstantDecl) {
             // Enum constant references — treat as DATA refs
         } else {
