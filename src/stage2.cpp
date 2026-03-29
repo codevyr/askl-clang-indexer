@@ -1,0 +1,209 @@
+#include "stage2.h"
+#include "clang_raii.h"
+#include "symbol_table.h"
+
+Stage2::Stage2(SymbolTable& symbols) : symbols_(symbols) {}
+
+CXChildVisitResult Stage2::visitor(CXCursor cursor, CXCursor parent, CXClientData data) {
+    auto* self = static_cast<Stage2*>(data);
+    self->visitCursor(cursor, parent);
+    return CXChildVisit_Recurse;
+}
+
+void Stage2::visitCursor(CXCursor cursor, CXCursor parent) {
+    CXCursorKind kind = clang_getCursorKind(cursor);
+
+    switch (kind) {
+    case CXCursor_InitListExpr:
+        clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
+            auto* self = static_cast<Stage2*>(data);
+            if (clang_getCursorKind(child) == CXCursor_UnexposedExpr) {
+                self->handleDesignatedInit(child);
+            }
+            return CXChildVisit_Continue;
+        }, this);
+        break;
+
+    case CXCursor_BinaryOperator:
+        handleBinaryAssignment(cursor);
+        break;
+
+    default:
+        break;
+    }
+}
+
+void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start_off, unsigned end_off) {
+    CXCursor referenced = clang_getCursorReferenced(func_ref);
+    if (clang_Cursor_isNull(referenced)) return;
+    if (clang_getCursorKind(referenced) != CXCursor_FunctionDecl) return;
+
+    ClangString ref_name(clang_getCursorSpelling(referenced));
+    std::string sname = ref_name.to_string();
+    if (sname.empty()) return;
+
+    CXLinkageKind linkage = clang_getCursorLinkage(referenced);
+    int scope = (linkage == CXLinkage_Internal) ? 1 : 2;
+
+    std::string ref_file_path;
+    if (scope == 1) {
+        CXSourceLocation ref_loc = clang_getCursorLocation(referenced);
+        CXFile rf;
+        clang_getSpellingLocation(ref_loc, &rf, nullptr, nullptr, nullptr);
+        if (rf) {
+            ClangString rfn(clang_getFileName(rf));
+            ref_file_path = rfn.to_string();
+        }
+    }
+
+    auto [sym_id, _] = symbols_.getOrCreate(
+        sname, scope, /*type=*/1 /*FUNCTION*/,
+        (scope == 1) ? ref_file_path : "");
+
+    ClangString sf_name(clang_getFileName(source_file));
+    Stage2Ref ref;
+    ref.source_file = sf_name.to_string();
+    ref.data.to_symbol_local_id = sym_id;
+    ref.data.from_offset_start = static_cast<int32_t>(start_off);
+    ref.data.from_offset_end = static_cast<int32_t>(end_off);
+    result_.refs.push_back(std::move(ref));
+}
+
+struct DesignatedInitData {
+    Stage2* self;
+    CXCursor member_ref;
+    CXCursor func_ref;
+    bool has_member;
+    bool has_func;
+};
+
+static CXChildVisitResult designatedInitVisitor(CXCursor child, CXCursor, CXClientData data) {
+    auto* d = static_cast<DesignatedInitData*>(data);
+    CXCursorKind kind = clang_getCursorKind(child);
+
+    if (kind == CXCursor_MemberRef) {
+        d->member_ref = child;
+        d->has_member = true;
+    } else if (kind == CXCursor_DeclRefExpr) {
+        CXCursor referenced = clang_getCursorReferenced(child);
+        if (!clang_Cursor_isNull(referenced) &&
+            clang_getCursorKind(referenced) == CXCursor_FunctionDecl) {
+            d->func_ref = child;
+            d->has_func = true;
+        }
+    } else if (kind == CXCursor_UnexposedExpr) {
+        clang_visitChildren(child, designatedInitVisitor, data);
+    }
+    return CXChildVisit_Continue;
+}
+
+void Stage2::handleDesignatedInit(CXCursor cursor) {
+    DesignatedInitData data{this, {}, {}, false, false};
+    clang_visitChildren(cursor, designatedInitVisitor, &data);
+
+    if (data.has_member && data.has_func) {
+        CXSourceRange range = clang_getCursorExtent(cursor);
+        CXFile source_file;
+        unsigned start_off, end_off;
+        clang_getExpansionLocation(clang_getRangeStart(range), &source_file, nullptr, nullptr, &start_off);
+        clang_getExpansionLocation(clang_getRangeEnd(range), nullptr, nullptr, nullptr, &end_off);
+
+        if (source_file) {
+            addFuncPtrRef(data.func_ref, source_file, start_off, end_off);
+        }
+    }
+}
+
+// Helper to find a DeclRefExpr to a FunctionDecl in the AST subtree
+struct RhsFuncFinder {
+    CXCursor func_ref;
+    bool found = false;
+};
+
+static CXChildVisitResult findFuncInRhs(CXCursor child, CXCursor, CXClientData data) {
+    auto* rd = static_cast<RhsFuncFinder*>(data);
+    if (rd->found) return CXChildVisit_Break;
+
+    CXCursorKind k = clang_getCursorKind(child);
+    if (k == CXCursor_DeclRefExpr) {
+        CXCursor ref = clang_getCursorReferenced(child);
+        if (!clang_Cursor_isNull(ref) &&
+            clang_getCursorKind(ref) == CXCursor_FunctionDecl) {
+            rd->func_ref = child;
+            rd->found = true;
+            return CXChildVisit_Break;
+        }
+    } else if (k == CXCursor_UnexposedExpr) {
+        clang_visitChildren(child, findFuncInRhs, data);
+        if (rd->found) return CXChildVisit_Break;
+    }
+    return CXChildVisit_Continue;
+}
+
+void Stage2::handleBinaryAssignment(CXCursor cursor) {
+    struct BinOpData {
+        CXCursor children[2];
+        int idx = 0;
+    } binop;
+
+    clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
+        auto* d = static_cast<BinOpData*>(data);
+        if (d->idx < 2) {
+            d->children[d->idx++] = child;
+        }
+        return CXChildVisit_Continue;
+    }, &binop);
+
+    if (binop.idx != 2) return;
+
+    CXCursor lhs = binop.children[0];
+    CXCursor rhs = binop.children[1];
+
+    if (clang_getCursorKind(lhs) != CXCursor_MemberRefExpr) return;
+
+    CXType lhs_type = clang_getCursorType(lhs);
+    bool is_func_ptr = false;
+    if (lhs_type.kind == CXType_Pointer) {
+        CXType pointee = clang_getPointeeType(lhs_type);
+        if (pointee.kind == CXType_FunctionProto || pointee.kind == CXType_FunctionNoProto) {
+            is_func_ptr = true;
+        }
+    }
+    if (!is_func_ptr) return;
+
+    RhsFuncFinder rhs_data;
+    // Check if rhs itself is a DeclRefExpr
+    if (clang_getCursorKind(rhs) == CXCursor_DeclRefExpr) {
+        CXCursor ref = clang_getCursorReferenced(rhs);
+        if (!clang_Cursor_isNull(ref) &&
+            clang_getCursorKind(ref) == CXCursor_FunctionDecl) {
+            rhs_data.func_ref = rhs;
+            rhs_data.found = true;
+        }
+    }
+    if (!rhs_data.found) {
+        clang_visitChildren(rhs, findFuncInRhs, &rhs_data);
+    }
+
+    if (!rhs_data.found) return;
+
+    CXSourceRange range = clang_getCursorExtent(cursor);
+    CXFile source_file;
+    unsigned start_off, end_off;
+    clang_getExpansionLocation(clang_getRangeStart(range), &source_file, nullptr, nullptr, &start_off);
+    clang_getExpansionLocation(clang_getRangeEnd(range), nullptr, nullptr, nullptr, &end_off);
+
+    if (source_file) {
+        addFuncPtrRef(rhs_data.func_ref, source_file, start_off, end_off);
+    }
+}
+
+void Stage2::process(CXTranslationUnit tu, const std::string& tu_filename) {
+    tu_filename_ = tu_filename;
+    CXCursor root = clang_getTranslationUnitCursor(tu);
+    clang_visitChildren(root, visitor, this);
+}
+
+Stage2Result Stage2::takeResults() {
+    return std::move(result_);
+}

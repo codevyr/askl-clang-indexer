@@ -1,0 +1,12 @@
+[
+  {
+    "directory": "/home/mplaneta/research/projects/ask/askl-clang-indexer/test/small_project",
+    "command": "cc -c -I. ops.c -o ops.o",
+    "file": "/home/mplaneta/research/projects/ask/askl-clang-indexer/test/small_project/ops.c"
+  },
+  {
+    "directory": "/home/mplaneta/research/projects/ask/askl-clang-indexer/test/small_project",
+    "command": "cc -c -I. main.c -o main.o",
+    "file": "/home/mplaneta/research/projects/ask/askl-clang-indexer/test/small_project/main.c"
+  }
+]

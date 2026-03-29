@@ -1,0 +1,28 @@
+#include <CLI/CLI.hpp>
+#include "indexer.h"
+
+#include <thread>
+
+int main(int argc, char* argv[]) {
+    CLI::App app{"askl-clang-indexer — C language indexer for askl"};
+
+    std::string compile_commands_dir = ".";
+    std::string output_path = "index.pb";
+    std::string project_name = "main";
+    std::string root_path;
+    int threads = std::thread::hardware_concurrency();
+
+    app.add_option("--compile-commands", compile_commands_dir,
+        "Directory containing compile_commands.json");
+    app.add_option("--output,-o", output_path, "Output protobuf file path");
+    app.add_option("--project", project_name, "Project name");
+    app.add_option("--root", root_path, "Project root directory (default: auto-detect)");
+    app.add_option("--threads,-j", threads, "Number of parallel threads");
+
+    CLI11_PARSE(app, argc, argv);
+
+    Indexer indexer(project_name, compile_commands_dir, root_path, threads);
+    indexer.run();
+    indexer.write(output_path);
+    return 0;
+}
