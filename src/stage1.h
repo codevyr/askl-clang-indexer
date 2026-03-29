@@ -33,6 +33,7 @@ struct FileData {
 
 struct Stage1Result {
     std::vector<FileData> files;
+    std::unordered_map<std::string, size_t> file_index; // filesystem_path -> index in files
 };
 
 class Stage1 {

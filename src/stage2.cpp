@@ -48,9 +48,7 @@ void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start
 
     Stage2Ref ref;
     ref.source_file = getCanonicalPath(source_file);
-    ref.data.to_symbol_local_id = sym_id;
-    ref.data.from_offset_start = static_cast<int32_t>(start_off);
-    ref.data.from_offset_end = static_cast<int32_t>(end_off);
+    ref.data = {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)};
     result_.refs.push_back(std::move(ref));
 }
 
@@ -89,7 +87,7 @@ void Stage2::handleDesignatedInit(CXCursor cursor) {
     if (data.has_member && data.has_func) {
         CXFile range_file;
         unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off)) {
+        if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
             addFuncPtrRef(data.func_ref, range_file, start_off, end_off);
         }
     }
@@ -170,7 +168,7 @@ void Stage2::handleBinaryAssignment(CXCursor cursor) {
 
     CXFile range_file;
     unsigned start_off, end_off;
-    if (getExpansionRange(cursor, range_file, start_off, end_off)) {
+    if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
         addFuncPtrRef(rhs_data.func_ref, range_file, start_off, end_off);
     }
 }

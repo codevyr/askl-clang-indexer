@@ -1,21 +1,16 @@
 #pragma once
 
+#include "stage1.h" // for RefData
+
 #include <clang-c/Index.h>
-#include <cstdint>
 #include <string>
 #include <vector>
 
 class SymbolTable;
 
-struct Stage2RefData {
-    int64_t to_symbol_local_id;
-    int32_t from_offset_start;
-    int32_t from_offset_end;
-};
-
 struct Stage2Ref {
     std::string source_file;
-    Stage2RefData data;
+    RefData data;
 };
 
 struct Stage2Result {

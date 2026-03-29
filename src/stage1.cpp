@@ -22,10 +22,11 @@ std::string Stage1::computeModulePath(const std::string& abs_path) {
 }
 
 std::string Stage1::computeFiletype(const std::string& path) {
-    if (path.size() >= 2 && path.substr(path.size() - 2) == ".c") return "text/x-c";
-    if (path.size() >= 2 && path.substr(path.size() - 2) == ".h") return "text/x-c-header";
-    if (path.size() >= 4 && path.substr(path.size() - 4) == ".cpp") return "text/x-c";
-    if (path.size() >= 4 && path.substr(path.size() - 4) == ".hpp") return "text/x-c-header";
+    auto dot = path.rfind('.');
+    if (dot == std::string::npos) return "text/plain";
+    auto ext = path.substr(dot);
+    if (ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".cxx") return "text/x-c";
+    if (ext == ".h" || ext == ".hpp" || ext == ".hh" || ext == ".hxx") return "text/x-c-header";
     return "text/plain";
 }
 
@@ -94,21 +95,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
     }
     case CXCursor_StructDecl:
     case CXCursor_UnionDecl:
-    case CXCursor_EnumDecl: {
-        ClangString name(clang_getCursorSpelling(cursor));
-        std::string sname = name.to_string();
-        if (sname.empty()) break;
-
-        auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
-
-        CXFile range_file;
-        unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off)) {
-            size_t fi = getOrCreateFile(range_file);
-            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
-        }
-        break;
-    }
+    case CXCursor_EnumDecl:
     case CXCursor_TypedefDecl: {
         ClangString name(clang_getCursorSpelling(cursor));
         std::string sname = name.to_string();
@@ -155,7 +142,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         CXFile range_file;
         unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off)) {
+        if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
             size_t fi = getOrCreateFile(range_file);
             result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
@@ -184,7 +171,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         CXFile range_file;
         unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off)) {
+        if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
             size_t fi = getOrCreateFile(range_file);
             result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
@@ -202,8 +189,11 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         CXFile range_file;
         unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off)) {
+        if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
             size_t fi = getOrCreateFile(range_file);
+            // Note: clang visits TypeRef children of anonymous types through both
+            // the TypedefDecl and the underlying type (UnionDecl/StructDecl),
+            // producing duplicate refs. ProtoBuilder deduplicates via hash-set.
             result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
         break;
@@ -219,5 +209,6 @@ void Stage1::process(CXTranslationUnit tu, const std::string& tu_filename) {
 }
 
 Stage1Result Stage1::takeResults() {
+    result_.file_index = std::move(file_index_);
     return std::move(result_);
 }

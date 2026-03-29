@@ -5,7 +5,6 @@
 #include "stage2.h"
 #include "symbol_types.h"
 
-#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <fstream>
@@ -102,30 +101,24 @@ void Indexer::processTU(const CompileCommand& cmd) {
     auto results = stage1.takeResults();
     auto stage2_result = stage2.takeResults();
 
-    // Merge stage2 refs into the appropriate FileData
+    // Merge stage2 refs into the appropriate FileData using stage1's file index
     for (auto& ref : stage2_result.refs) {
-        for (auto& file : results.files) {
-            if (file.filesystem_path == ref.source_file) {
-                RefData rd;
-                rd.to_symbol_local_id = ref.data.to_symbol_local_id;
-                rd.from_offset_start = ref.data.from_offset_start;
-                rd.from_offset_end = ref.data.from_offset_end;
-                file.refs.push_back(rd);
-                break;
-            }
+        auto it = results.file_index.find(ref.source_file);
+        if (it != results.file_index.end()) {
+            results.files[it->second].refs.push_back(ref.data);
         }
     }
 
     {
         std::lock_guard<std::mutex> lock(files_mutex_);
         for (auto& file : results.files) {
-            // Check if this file already exists in all_files_
-            auto it = std::find_if(all_files_.begin(), all_files_.end(),
-                [&](const FileData& f) { return f.filesystem_path == file.filesystem_path; });
-            if (it != all_files_.end()) {
+            auto it = file_index_.find(file.filesystem_path);
+            if (it != file_index_.end()) {
                 // Merge refs into existing FileData (instances are identical across TUs)
-                for (auto& ref : file.refs) it->refs.push_back(ref);
+                auto& existing = all_files_[it->second];
+                for (auto& ref : file.refs) existing.refs.push_back(ref);
             } else {
+                file_index_[file.filesystem_path] = all_files_.size();
                 all_files_.push_back(std::move(file));
             }
         }

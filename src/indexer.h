@@ -7,6 +7,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 class Indexer {
@@ -31,6 +32,7 @@ private:
     std::atomic<int64_t> next_object_id_{1};
     std::mutex files_mutex_;
     std::vector<FileData> all_files_;
+    std::unordered_map<std::string, size_t> file_index_; // guarded by files_mutex_
 
     void processTU(const CompileCommand& cmd);
     void createDirectorySymbols();

@@ -46,20 +46,26 @@ void PrintTo(const ExpectedSymbol& s, std::ostream* os) {
 }
 
 struct ExpectedRef {
-    std::string from_file;  // module_path of the file containing the reference
-    std::string to_name;    // name of the referenced symbol
+    std::string from_file;      // module_path of the file containing the reference
+    std::string to_name;        // name of the referenced symbol
+    int32_t from_start;         // byte offset of reference start
+    int32_t from_end;           // byte offset of reference end
 
     bool operator==(const ExpectedRef& o) const {
-        return from_file == o.from_file && to_name == o.to_name;
+        return from_file == o.from_file && to_name == o.to_name
+            && from_start == o.from_start && from_end == o.from_end;
     }
     bool operator<(const ExpectedRef& o) const {
         if (from_file != o.from_file) return from_file < o.from_file;
+        if (from_start != o.from_start) return from_start < o.from_start;
+        if (from_end != o.from_end) return from_end < o.from_end;
         return to_name < o.to_name;
     }
 };
 
 void PrintTo(const ExpectedRef& r, std::ostream* os) {
-    *os << "{from=" << r.from_file << ", to=" << r.to_name << "}";
+    *os << "{\"" << r.from_file << "\", \"" << r.to_name
+        << "\", " << r.from_start << ", " << r.from_end << "}";
 }
 
 struct ExpectedInstance {
@@ -151,7 +157,7 @@ RunResult runFixture(const std::string& fixture_name,
                 << ": start=" << ref.from_offset_start << " > end=" << ref.from_offset_end;
             auto it = id_to_name.find(ref.to_symbol_local_id);
             std::string to_name = (it != id_to_name.end()) ? it->second : "UNKNOWN";
-            result.refs.push_back({file.module_path, to_name});
+            result.refs.push_back({file.module_path, to_name, ref.from_offset_start, ref.from_offset_end});
         }
     }
 
@@ -230,21 +236,21 @@ INSTANTIATE_TEST_SUITE_P(
                 {"ops.h", GLOBAL, FILETYPE},
                 {"setup", GLOBAL, FUNCTION},
             },
-            // refs
+            // refs (file, symbol, start_offset, end_offset)
             {
-                {"main.c", "file_ops"},
-                {"main.c", "file_ops"},
-                {"main.c", "setup"},
-                {"ops.c", "container"},
-                {"ops.c", "file_ops"},
-                {"ops.c", "file_ops"},
-                {"ops.c", "my_read"},
-                {"ops.c", "my_read"},
-                {"ops.c", "my_read"},
-                {"ops.c", "my_write"},
-                {"ops.c", "my_write"},
-                {"ops.h", "file_ops"},
-                {"ops.h", "file_ops"},
+                {"main.c", "file_ops", 43, 51},
+                {"main.c", "file_ops", 88, 96},
+                {"main.c", "setup", 106, 117},
+                {"ops.c", "container", 442, 451},
+                {"ops.c", "file_ops", 207, 215},
+                {"ops.c", "file_ops", 330, 338},
+                {"ops.c", "my_read", 236, 251},
+                {"ops.c", "my_read", 351, 370},
+                {"ops.c", "my_read", 482, 497},
+                {"ops.c", "my_write", 257, 274},
+                {"ops.c", "my_write", 376, 397},
+                {"ops.h", "file_ops", 180, 188},
+                {"ops.h", "file_ops", 180, 188},
             }
         },
         FixtureSpec{
@@ -259,9 +265,9 @@ INSTANTIATE_TEST_SUITE_P(
                 {"pick_color", GLOBAL, FUNCTION},
             },
             {
-                {"main.c", "GREEN"},
-                {"main.c", "RED"},
-                {"main.c", "color"},
+                {"main.c", "color", 52, 57},
+                {"main.c", "RED", 62, 65},
+                {"main.c", "GREEN", 80, 85},
             }
         },
         FixtureSpec{
@@ -276,10 +282,10 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", GLOBAL, FILETYPE},
             },
             {
-                {"main.c", "handle"},
-                {"main.c", "point_t"},
-                {"main.c", "point_t"},
-                {"types.h", "point"},
+                {"main.c", "point_t", 19, 26},
+                {"main.c", "handle", 38, 44},
+                {"main.c", "point_t", 54, 61},
+                {"types.h", "point", 79, 84},
             }
         },
         FixtureSpec{
@@ -291,7 +297,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"value", GLOBAL, TYPE},
             },
             {
-                {"main.c", "value"},
+                {"main.c", "value", 52, 57},
             }
         },
         FixtureSpec{
@@ -306,8 +312,8 @@ INSTANTIATE_TEST_SUITE_P(
                 {"verbose", GLOBAL, DATA},
             },
             {
-                {"main.c", "app_name"},
-                {"main.c", "verbose"},
+                {"main.c", "verbose", 47, 54},
+                {"main.c", "app_name", 82, 90},
             }
         },
         FixtureSpec{
@@ -324,10 +330,10 @@ INSTANTIATE_TEST_SUITE_P(
                 {"helper", LOCAL, FUNCTION},
             },
             {
-                {"a.c", "count"},
-                {"a.c", "helper"},
-                {"b.c", "count"},
-                {"b.c", "helper"},
+                {"a.c", "count", 56, 61},
+                {"a.c", "helper", 90, 98},
+                {"b.c", "count", 56, 61},
+                {"b.c", "helper", 90, 98},
             }
         },
         FixtureSpec{
@@ -343,12 +349,12 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", GLOBAL, FILETYPE},
             },
             {
-                {"main.c", "list"},
-                {"main.c", "node_t"},
-                {"types.h", "node"},
-                {"types.h", "node"},
-                {"types.h", "node_ptr"},
-                {"types.h", "node_t"},
+                {"main.c", "list", 36, 40},
+                {"main.c", "node_t", 45, 51},
+                {"types.h", "node", 64, 68},
+                {"types.h", "node", 94, 98},
+                {"types.h", "node_t", 115, 121},
+                {"types.h", "node_ptr", 147, 155},
             }
         },
         FixtureSpec{
@@ -365,16 +371,16 @@ INSTANTIATE_TEST_SUITE_P(
                 {"status.h", GLOBAL, FILETYPE},
             },
             {
-                {"handler.c", "ERR_IO"},
-                {"handler.c", "ERR_IO"},
-                {"handler.c", "ERR_IO"},
-                {"handler.c", "ERR_MEM"},
-                {"handler.c", "ERR_MEM"},
-                {"handler.c", "OK"},
-                {"handler.c", "OK"},
-                {"handler.c", "status"},
-                {"handler.c", "status"},
-                {"status.h", "status"},
+                {"handler.c", "status", 43, 49},
+                {"handler.c", "OK", 81, 83},
+                {"handler.c", "OK", 81, 83},
+                {"handler.c", "ERR_IO", 109, 115},
+                {"handler.c", "ERR_IO", 109, 115},
+                {"handler.c", "ERR_MEM", 137, 144},
+                {"handler.c", "ERR_MEM", 137, 144},
+                {"handler.c", "status", 198, 204},
+                {"handler.c", "ERR_IO", 218, 224},
+                {"status.h", "status", 94, 100},
             }
         },
         FixtureSpec{
@@ -391,9 +397,9 @@ INSTANTIATE_TEST_SUITE_P(
                 {"status", GLOBAL, TYPE},
             },
             {
-                {"main.c", "S_OK"},
-                {"main.c", "result"},
-                {"main.c", "result"},
+                {"main.c", "result", 272, 278},
+                {"main.c", "result", 302, 308},
+                {"main.c", "S_OK", 325, 339},
             }
         },
         FixtureSpec{
@@ -408,29 +414,72 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", GLOBAL, FILETYPE},
                 {"use_any", GLOBAL, FUNCTION},
             },
+            // refs — macro-expanded type_a/b/c refs clamped to [start, start+1)
+            // Clang visits each TypeRef twice (through TypedefDecl + anonymous UnionDecl);
+            // ProtoBuilder deduplicates via hash-set at serialization time.
             {
-                {"main.c", "any_type"},
-                {"types.h", "type_a"},
-                {"types.h", "type_a"},
-                {"types.h", "type_b"},
-                {"types.h", "type_b"},
-                {"types.h", "type_c"},
-                {"types.h", "type_c"},
+                {"main.c", "any_type", 33, 41},
+                {"types.h", "type_a", 398, 399},
+                {"types.h", "type_a", 398, 399},
+                {"types.h", "type_b", 398, 399},
+                {"types.h", "type_b", 398, 399},
+                {"types.h", "type_c", 398, 399},
+                {"types.h", "type_c", 398, 399},
             },
-            // instances — validates macro-expanded struct instances have valid ranges
+            // instances — macro-expanded struct instances have zero-width ranges, filtered out
             {
                 {"main.c", "main.c"},
                 {"main.c", "use_any"},
                 {"types.h", "any_type"},
                 {"types.h", "any_type"},
                 {"types.h", "any_type"},
-                {"types.h", "type_a"},
-                {"types.h", "type_a"},
-                {"types.h", "type_b"},
-                {"types.h", "type_b"},
-                {"types.h", "type_c"},
-                {"types.h", "type_c"},
                 {"types.h", "types.h"},
+            }
+        },
+        // Proves zero-width filtering is correct:
+        // - alpha (macro-generated StructDecl) has zero-width range → no instance
+        // - beta (source-level StructDecl) has proper range → has instance
+        // - TypeRefs to BOTH from real source code have proper ranges → both kept
+        // This shows the filter only drops macro-generated declarations,
+        // not references to macro-defined types.
+        FixtureSpec{
+            "macro_zero_width",
+            {"main.c"},
+            {
+                {"alpha", GLOBAL, TYPE},
+                {"beta", GLOBAL, TYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"types.h", GLOBAL, FILETYPE},
+                {"use_types", GLOBAL, FUNCTION},
+                {"wrapper", GLOBAL, TYPE},
+                {"x", GLOBAL, DATA},
+            },
+            {
+                // TypeRefs from real source have proper ranges (start < end)
+                {"main.c", "alpha", 249, 254},
+                {"main.c", "beta", 266, 270},
+                // Single-char ref: proves clang returns half-open [start, start+len),
+                // so 1-char token gives [289, 290) not [289, 289)
+                {"main.c", "x", 289, 290},
+                // Macro-expanded TypeRef: zero-width clamped to [start, start+1)
+                // Points to ALL_STRUCTS expansion site — preserves the reference.
+                // Clang visits this TypeRef twice (through TypedefDecl + anonymous UnionDecl);
+                // ProtoBuilder deduplicates at serialization time.
+                {"types.h", "alpha", 477, 478},
+                {"types.h", "alpha", 477, 478},
+            },
+            {
+                {"main.c", "main.c"},
+                {"main.c", "use_types"},
+                {"main.c", "x"},
+                // beta instance present — source-level struct, proper range
+                {"types.h", "beta"},
+                {"types.h", "types.h"},
+                {"types.h", "wrapper"},
+                {"types.h", "wrapper"},
+                {"types.h", "wrapper"},
+                // NOTE: alpha instance ABSENT — nested macro expansion
+                // produces zero-width range (start == end), correctly filtered
             }
         },
         FixtureSpec{
@@ -447,10 +496,10 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", GLOBAL, FILETYPE},
             },
             {
-                {"a.c", "result_t"},
-                {"a.c", "result_t"},
-                {"b.c", "pair_t"},
-                {"b.c", "pair_t"},
+                {"a.c", "result_t", 20, 28},
+                {"a.c", "result_t", 52, 60},
+                {"b.c", "pair_t", 20, 26},
+                {"b.c", "pair_t", 57, 63},
             },
             // instances — validates dedup across 2 TUs sharing types.h
             {
