@@ -207,6 +207,136 @@ INSTANTIATE_TEST_SUITE_P(
                 {"ops.h", "file_ops"},
                 {"ops.h", "file_ops"},
             }
+        },
+        FixtureSpec{
+            "enum_basic",
+            {"main.c"},
+            {
+                {"GREEN", GLOBAL, DATA},
+                {"RED", GLOBAL, DATA},
+                {"color", GLOBAL, TYPE},
+                {"colors.h", GLOBAL, FILETYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"pick_color", GLOBAL, FUNCTION},
+            },
+            {
+                {"main.c", "GREEN"},
+                {"main.c", "RED"},
+                {"main.c", "color"},
+            }
+        },
+        FixtureSpec{
+            "typedef_basic",
+            {"main.c"},
+            {
+                {"handle", GLOBAL, TYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"make_point", GLOBAL, FUNCTION},
+                {"point", GLOBAL, TYPE},
+                {"point_t", GLOBAL, TYPE},
+                {"types.h", GLOBAL, FILETYPE},
+            },
+            {
+                {"main.c", "handle"},
+                {"main.c", "point_t"},
+                {"main.c", "point_t"},
+                {"types.h", "point"},
+            }
+        },
+        FixtureSpec{
+            "union_basic",
+            {"main.c"},
+            {
+                {"main.c", GLOBAL, FILETYPE},
+                {"set_int", GLOBAL, FUNCTION},
+                {"value", GLOBAL, TYPE},
+            },
+            {
+                {"main.c", "value"},
+            }
+        },
+        FixtureSpec{
+            "cross_file_variable",
+            {"config.c", "main.c"},
+            {
+                {"app_name", GLOBAL, DATA},
+                {"check", GLOBAL, FUNCTION},
+                {"config.c", GLOBAL, FILETYPE},
+                {"config.h", GLOBAL, FILETYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"verbose", GLOBAL, DATA},
+            },
+            {
+                {"main.c", "app_name"},
+                {"main.c", "verbose"},
+            }
+        },
+        FixtureSpec{
+            "static_same_name",
+            {"a.c", "b.c"},
+            {
+                {"a.c", GLOBAL, FILETYPE},
+                {"b.c", GLOBAL, FILETYPE},
+                {"count", LOCAL, DATA},
+                {"count", LOCAL, DATA},
+                {"get_a", GLOBAL, FUNCTION},
+                {"get_b", GLOBAL, FUNCTION},
+                {"helper", LOCAL, FUNCTION},
+                {"helper", LOCAL, FUNCTION},
+            },
+            {
+                {"a.c", "count"},
+                {"a.c", "helper"},
+                {"b.c", "count"},
+                {"b.c", "helper"},
+            }
+        },
+        FixtureSpec{
+            "type_ref_chain",
+            {"main.c"},
+            {
+                {"list", GLOBAL, TYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"node", GLOBAL, TYPE},
+                {"node_ptr", GLOBAL, TYPE},
+                {"node_t", GLOBAL, TYPE},
+                {"push", GLOBAL, FUNCTION},
+                {"types.h", GLOBAL, FILETYPE},
+            },
+            {
+                {"main.c", "list"},
+                {"main.c", "node_t"},
+                {"types.h", "node"},
+                {"types.h", "node"},
+                {"types.h", "node_ptr"},
+                {"types.h", "node_t"},
+            }
+        },
+        FixtureSpec{
+            "enum_in_switch",
+            {"handler.c"},
+            {
+                {"ERR_IO", GLOBAL, DATA},
+                {"ERR_MEM", GLOBAL, DATA},
+                {"OK", GLOBAL, DATA},
+                {"handle_status", GLOBAL, FUNCTION},
+                {"handler.c", GLOBAL, FILETYPE},
+                {"last_error", GLOBAL, DATA},
+                {"status", GLOBAL, TYPE},
+                {"status.h", GLOBAL, FILETYPE},
+            },
+            {
+                {"handler.c", "ERR_IO"},
+                {"handler.c", "ERR_IO"},
+                {"handler.c", "ERR_IO"},
+                {"handler.c", "ERR_MEM"},
+                {"handler.c", "ERR_MEM"},
+                {"handler.c", "OK"},
+                {"handler.c", "OK"},
+                {"handler.c", "status"},
+                {"handler.c", "status"},
+                {"status.h", "status"},
+            }
         }
     ),
     [](const testing::TestParamInfo<FixtureSpec>& info) {
