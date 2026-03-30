@@ -12,5 +12,6 @@ public:
         const std::string& project_name,
         const std::string& root_path,
         const SymbolTable& symbols,
-        const std::vector<FileData>& files);
+        const std::vector<FileData>& files,
+        int64_t next_object_id);
 };

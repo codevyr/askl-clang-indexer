@@ -281,7 +281,8 @@ void Indexer::run() {
 
 void Indexer::write(const std::string& output_path) {
     std::string data = ProtoBuilder::build(
-        project_name_, root_path_, symbol_table_, all_files_);
+        project_name_, root_path_, symbol_table_, all_files_,
+        next_object_id_.load());
 
     std::ofstream out(output_path, std::ios::binary);
     if (!out) {
