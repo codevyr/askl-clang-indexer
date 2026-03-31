@@ -3,6 +3,7 @@
 #include <array>
 #include <clang-c/Index.h>
 #include <cstdio>
+#include <filesystem>
 #include <sstream>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -14,18 +15,19 @@ static const std::unordered_set<std::string> filtered_flags = {
     "-fconserve-stack", "-fno-allow-store-data-races",
     "-fno-code-hoisting", "-fno-delete-null-pointer-checks",
     "-fno-schedule-insns", "-fno-tree-loop-im",
-    "-mindirect-branch=thunk-extern", "-mindirect-branch-register",
+    "-mindirect-branch-register",
     "-mrecord-mcount", "-mfentry",
     "-fno-reorder-blocks-and-partition",
     "-fno-partial-inlining",
     "-fno-tree-loop-distribute-patterns",
-    // Warnings-as-errors is noise for indexing
-    "-Werror",
+    // Note: all -W flags are stripped in filterGccFlags() since warnings
+    // are irrelevant for indexing.
 };
 
 static const std::vector<std::string> filtered_prefixes = {
     "-mabi=", "-mpreferred-stack-boundary=",
-    "-mindirect-branch-cs-prefix",
+    "-mindirect-branch-cs-prefix", "-mindirect-branch=",
+    "-fzero-init-padding-bits=", "-fmin-function-alignment=",
 };
 
 static bool hasExtension(const std::string& path, const std::string& ext) {
@@ -64,6 +66,12 @@ CompilationDB::CompilationDB(const std::string& dir) {
         // Skip assembly files — libclang can't parse them
         if (isAssemblyFile(entry.filename)) continue;
 
+        // Pre-canonicalize the filename so relative source paths can be matched
+        std::error_code fn_ec;
+        std::string canonical_filename =
+            std::filesystem::weakly_canonical(entry.filename, fn_ec).string();
+        if (fn_ec) canonical_filename = entry.filename;
+
         std::string compiler;
         unsigned num_args = clang_CompileCommand_getNumArgs(cmd);
         for (unsigned j = 0; j < num_args; j++) {
@@ -87,21 +95,13 @@ CompilationDB::CompilationDB(const std::string& dir) {
             }
             // Skip the source file itself (may be relative or absolute)
             if (arg == entry.filename) continue;
-            // Check if relative path matches
+            // Check if relative/non-flag path resolves to the source file
             if (!arg.empty() && arg[0] != '-') {
-                std::string abs_arg = arg;
-                if (arg[0] != '/') {
-                    abs_arg = entry.directory + "/" + arg;
-                }
-                // Normalize: check if it matches the filename
-                if (abs_arg == entry.filename) continue;
-                // Also check if the arg is just the basename matching the end of filename
-                if (entry.filename.size() >= arg.size() &&
-                    entry.filename.substr(entry.filename.size() - arg.size()) == arg &&
-                    (entry.filename.size() == arg.size() ||
-                     entry.filename[entry.filename.size() - arg.size() - 1] == '/')) {
-                    continue;
-                }
+                std::filesystem::path p(arg);
+                if (!p.is_absolute()) p = std::filesystem::path(entry.directory) / p;
+                std::error_code ec;
+                auto canonical = std::filesystem::weakly_canonical(p, ec);
+                if (!ec && canonical.string() == canonical_filename) continue;
             }
 
             entry.args.push_back(std::move(arg));
@@ -122,9 +122,11 @@ CompilationDB::~CompilationDB() {
 void CompilationDB::filterGccFlags(std::vector<std::string>& args) {
     args.erase(
         std::remove_if(args.begin(), args.end(), [](const std::string& arg) {
+            // Warning flags are irrelevant for indexing
+            if (arg.size() >= 2 && arg[0] == '-' && arg[1] == 'W') return true;
             if (filtered_flags.count(arg)) return true;
             for (auto& prefix : filtered_prefixes) {
-                if (arg.substr(0, prefix.size()) == prefix) return true;
+                if (arg.compare(0, prefix.size(), prefix) == 0) return true;
             }
             return false;
         }),
