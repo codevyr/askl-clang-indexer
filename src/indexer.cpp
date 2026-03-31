@@ -18,11 +18,13 @@
 #include <unistd.h>
 
 Indexer::Indexer(const std::string& project_name, const std::string& compile_commands_dir,
-                const std::string& root_path, int threads, bool include_git_files)
+                const std::string& root_path, int threads, bool include_git_files,
+                bool show_progress)
     : project_name_(project_name),
       root_path_(root_path),
       threads_(threads),
       include_git_files_(include_git_files),
+      show_progress_(show_progress),
       compile_db_(compile_commands_dir) {}
 
 std::string Indexer::computeCommonAncestor(const std::vector<CompileCommand>& cmds) {
@@ -258,16 +260,22 @@ void Indexer::run() {
     std::atomic<size_t> next_cmd{0};
     std::vector<std::thread> workers;
 
+    size_t total = compile_db_.commands().size();
     for (int t = 0; t < threads_; t++) {
-        workers.emplace_back([this, &next_cmd]() {
+        workers.emplace_back([this, &next_cmd, total]() {
             while (true) {
                 size_t idx = next_cmd.fetch_add(1);
                 if (idx >= compile_db_.commands().size()) break;
                 processTU(compile_db_.commands()[idx]);
+                if (show_progress_) {
+                    size_t done = processed_tus_.fetch_add(1) + 1;
+                    fprintf(stderr, "\rProcessed: %zu/%zu", done, total);
+                }
             }
         });
     }
     for (auto& w : workers) w.join();
+    if (show_progress_) fprintf(stderr, "\n");
 
     if (include_git_files_) {
         addGitTrackedFiles();

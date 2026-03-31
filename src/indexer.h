@@ -13,7 +13,8 @@
 class Indexer {
 public:
     Indexer(const std::string& project_name, const std::string& compile_commands_dir,
-            const std::string& root_path, int threads, bool include_git_files = false);
+            const std::string& root_path, int threads, bool include_git_files = false,
+            bool show_progress = false);
 
     void run();
     void write(const std::string& output_path);
@@ -26,6 +27,8 @@ private:
     std::string root_path_;
     int threads_;
     bool include_git_files_;
+    bool show_progress_;
+    std::atomic<size_t> processed_tus_{0};
 
     CompilationDB compile_db_;
     SymbolTable symbol_table_;

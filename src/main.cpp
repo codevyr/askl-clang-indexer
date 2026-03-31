@@ -12,6 +12,7 @@ int main(int argc, char* argv[]) {
     std::string root_path;
     int threads = std::max(1u, std::thread::hardware_concurrency());
     bool include_git_files = false;
+    bool show_progress = false;
 
     app.add_option("--compile-commands", compile_commands_dir,
         "Directory containing compile_commands.json");
@@ -21,10 +22,11 @@ int main(int argc, char* argv[]) {
     app.add_option("--threads,-j", threads, "Number of parallel threads");
     app.add_flag("--include-git-files", include_git_files,
         "Include all git-tracked files at HEAD in the project files list");
+    app.add_flag("--progress", show_progress, "Show progress during indexing");
 
     CLI11_PARSE(app, argc, argv);
 
-    Indexer indexer(project_name, compile_commands_dir, root_path, threads, include_git_files);
+    Indexer indexer(project_name, compile_commands_dir, root_path, threads, include_git_files, show_progress);
     indexer.run();
     indexer.write(output_path);
     return 0;
