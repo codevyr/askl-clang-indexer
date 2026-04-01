@@ -438,11 +438,10 @@ INSTANTIATE_TEST_SUITE_P(
                 {"macros.h", "S_OK", 411, 415},
                 {"macros.h", "result", 321, 327},
                 {"macros.h", "result", 321, 327},
-                {"main.c", "DEFAULT_STATUS", 325, 339},
-                {"main.c", "DEFINE_HANDLER", 102, 129},
-                {"main.c", "DEFINE_HANDLER", 156, 184},
-                {"main.c", "RESULT", 272, 278},
-                {"main.c", "RESULT", 302, 308},
+                // Expansion-site refs: macro body symbols also appear at call site
+                {"main.c", "S_OK", 325, 339},
+                {"main.c", "result", 272, 278},
+                {"main.c", "result", 302, 308},
             }
         },
         FixtureSpec{
@@ -465,7 +464,6 @@ INSTANTIATE_TEST_SUITE_P(
             // ProtoBuilder deduplicates via hash-set at serialization time.
             {
                 {"main.c", "any_type", 33, 41},
-                {"types.h", "ALL_TYPES", 398, 407},
                 {"types.h", "type_a", 286, 292},
                 {"types.h", "type_a", 286, 292},
                 {"types.h", "type_b", 309, 315},
@@ -474,9 +472,11 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "type_c", 332, 338},
             },
             // instances — macro symbols now have instances too
+            // ALL_TYPES appears twice: once for #define, once for expansion site
             {
                 {"main.c", "main.c"},
                 {"main.c", "use_any"},
+                {"types.h", "ALL_TYPES"},
                 {"types.h", "ALL_TYPES"},
                 {"types.h", "ONE_TYPE"},
                 {"types.h", "TYPES_H"},
@@ -517,7 +517,6 @@ INSTANTIATE_TEST_SUITE_P(
                 // Macro-expanded TypeRef: spelling location resolves inside ONE_STRUCT body
                 // Clang visits this TypeRef twice (through TypedefDecl + anonymous UnionDecl);
                 // ProtoBuilder deduplicates at serialization time.
-                {"types.h", "ALL_STRUCTS", 477, 488},
                 {"types.h", "alpha", 403, 408},
                 {"types.h", "alpha", 403, 408},
             },
@@ -526,6 +525,8 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "use_types"},
                 {"main.c", "x"},
                 // beta instance present — source-level struct, proper range
+                // ALL_STRUCTS appears twice: #define + expansion site
+                {"types.h", "ALL_STRUCTS"},
                 {"types.h", "ALL_STRUCTS"},
                 {"types.h", "ONE_STRUCT"},
                 {"types.h", "TYPES_H"},
@@ -588,7 +589,8 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"log.h", "puts", 49, 53},
-                {"main.c", "LOG", 36, 48},
+                // Expansion-site ref: puts call from LOG body also at call site
+                {"main.c", "puts", 36, 48},
             }
         },
         // Nested macro chain: handler calls FATAL, which expands through ERR→MSG→output.
@@ -610,7 +612,8 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"macros.h", "output", 71, 77},
-                {"main.c", "FATAL", 41, 54},
+                // Expansion-site ref: output call from FATAL chain also at call site
+                {"main.c", "output", 41, 54},
             }
         },
         // Proves that files with only macros (no declarations/refs) still appear
@@ -627,18 +630,55 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", GLOBAL, FILETYPE},
                 {"smallest", GLOBAL, FUNCTION},
             },
-            {
-                {"main.c", "MAX_SIZE", 29, 37},
-                {"main.c", "MIN", 76, 85},
-            },
+            {},
             {
                 {"macros.h", "MACROS_H"},
                 {"macros.h", "MAX_SIZE"},
                 {"macros.h", "MIN"},
                 {"macros.h", "macros.h"},
+                // MAX_SIZE and MIN also get instances at expansion sites
+                {"main.c", "MAX_SIZE"},
+                {"main.c", "MIN"},
                 {"main.c", "buf"},
                 {"main.c", "main.c"},
                 {"main.c", "smallest"},
+            }
+        },
+        // Macro invocation with a data argument: register_driver(my_drv).
+        // The macro expansion site gets an instance so that the data ref
+        // (my_drv) is contained within it, enabling containment queries
+        // like: macro "register_driver" {data "my_drv"}
+        FixtureSpec{
+            "macro_expansion_arg",
+            {"main.c"},
+            {
+                {"REGISTER_H", GLOBAL, MACRO},
+                {"__exit", LOCAL, FUNCTION},
+                {"__init", LOCAL, FUNCTION},
+                {"driver_info", GLOBAL, TYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"my_drv", LOCAL, DATA},
+                {"register.h", GLOBAL, FILETYPE},
+                {"register_driver", GLOBAL, MACRO},
+            },
+            {
+                {"main.c", "driver_info", 37, 48},
+                // my_drv referenced twice (once per macro body usage)
+                // — both refs are contained within the register_driver instance
+                {"main.c", "my_drv", 89, 95},
+                {"main.c", "my_drv", 89, 95},
+            },
+            {
+                {"main.c", "__exit"},
+                {"main.c", "__init"},
+                {"main.c", "main.c"},
+                {"main.c", "my_drv"},
+                // register_driver: #define instance + expansion site instance
+                {"main.c", "register_driver"},
+                {"register.h", "REGISTER_H"},
+                {"register.h", "driver_info"},
+                {"register.h", "register.h"},
+                {"register.h", "register_driver"},
             }
         }
     ),

@@ -77,12 +77,16 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         // Look up the MACRO symbol (should have been created by MacroDefinition)
         auto [sym_id, _] = self->symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_MACRO);
 
-        // Create ref at spelling location
+        // Create an instance at the expansion site.  A macro invocation is
+        // the macro being instantiated, not a reference to it.  The instance
+        // enables containment queries: symbols referenced within the macro
+        // arguments (e.g. module_pci_driver(mhi_pci_driver)) become children
+        // of the macro instance.
         CXFile range_file;
         unsigned start_off, end_off;
         if (getSpellingRange(cursor, range_file, start_off, end_off, sname.size())) {
             size_t fi = self->getOrCreateFile(range_file);
-            self->result_.files[fi].refs.push_back(
+            self->result_.files[fi].instances.push_back(
                 {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
     }
@@ -93,6 +97,33 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
 void Stage1::collectMacros(CXTranslationUnit tu) {
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, macroVisitor, this);
+}
+
+// Create a ref at the spelling location.  When the cursor is inside a macro
+// expansion and the spelling location is in a different file than the
+// expansion location, also create a ref at the expansion site.  This ensures
+// that symbols referenced in a macro body (e.g. a TypeRef to the variable's
+// type) appear within the expanded declaration's instance range, enabling
+// containment queries like `data @i {...} / #i {type}`.
+void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
+    CXFile spelling_file;
+    unsigned spelling_start, spelling_end;
+    if (getSpellingRange(cursor, spelling_file, spelling_start, spelling_end, name_len)) {
+        size_t fi = getOrCreateFile(spelling_file);
+        result_.files[fi].refs.push_back(
+            {sym_id, static_cast<int32_t>(spelling_start), static_cast<int32_t>(spelling_end)});
+    }
+
+    // If the expansion is in a different file, add a ref there too.
+    CXFile expansion_file;
+    unsigned exp_start, exp_end;
+    if (getExpansionRange(cursor, expansion_file, exp_start, exp_end, true)) {
+        if (!spelling_file || !clang_File_isEqual(spelling_file, expansion_file)) {
+            size_t fi = getOrCreateFile(expansion_file);
+            result_.files[fi].refs.push_back(
+                {sym_id, static_cast<int32_t>(exp_start), static_cast<int32_t>(exp_end)});
+        }
+    }
 }
 
 CXChildVisitResult Stage1::visitor(CXCursor cursor, CXCursor parent, CXClientData data) {
@@ -172,13 +203,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_FUNCTION);
-
-        CXFile range_file;
-        unsigned start_off, end_off;
-        if (getSpellingRange(cursor, range_file, start_off, end_off, sname.size())) {
-            size_t fi = getOrCreateFile(range_file);
-            result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
-        }
+        addRef(cursor, sym_id, sname.size());
         break;
     }
     case CXCursor_DeclRefExpr: {
@@ -201,13 +226,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_DATA);
-
-        CXFile range_file;
-        unsigned start_off, end_off;
-        if (getSpellingRange(cursor, range_file, start_off, end_off, sname.size())) {
-            size_t fi = getOrCreateFile(range_file);
-            result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
-        }
+        addRef(cursor, sym_id, sname.size());
         break;
     }
     case CXCursor_TypeRef: {
@@ -219,16 +238,10 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
-
-        CXFile range_file;
-        unsigned start_off, end_off;
-        if (getSpellingRange(cursor, range_file, start_off, end_off, sname.size())) {
-            size_t fi = getOrCreateFile(range_file);
-            // Note: clang visits TypeRef children of anonymous types through both
-            // the TypedefDecl and the underlying type (UnionDecl/StructDecl),
-            // producing duplicate refs. ProtoBuilder deduplicates via hash-set.
-            result_.files[fi].refs.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
-        }
+        // Note: clang visits TypeRef children of anonymous types through both
+        // the TypedefDecl and the underlying type (UnionDecl/StructDecl),
+        // producing duplicate refs. ProtoBuilder deduplicates via hash-set.
+        addRef(cursor, sym_id, sname.size());
         break;
     }
     default:

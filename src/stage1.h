@@ -60,4 +60,5 @@ private:
     static void inclusionCallback(CXFile included_file, CXSourceLocation* stack,
                                   unsigned len, CXClientData data);
     void visitCursor(CXCursor cursor, CXCursor parent);
+    void addRef(CXCursor cursor, int64_t sym_id, unsigned name_len);
 };
