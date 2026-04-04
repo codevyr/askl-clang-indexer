@@ -20,6 +20,16 @@ message Object {
   bytes content = 6;            // Object content (content_hash computed server-side)
   repeated SymbolInstance symbol_instances = 7;  // Symbol instances in this object
   repeated SymbolRef refs = 8;  // References from this object
+  string content_hash = 9;      // SHA256 hex; when set, content (field 6) may be empty
+}
+
+message ObjectContent {
+  string content_hash = 1;      // SHA256 hex (lowercase)
+  bytes content = 2;
+}
+
+message ContentBatch {
+  repeated ObjectContent contents = 1;
 }
 
 message Symbol {

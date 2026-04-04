@@ -3,12 +3,13 @@
 #include "symbol_table.h"
 #include "symbol_types.h"
 #include "proto/index.pb.h"
+#include "../third_party/picosha2.h"
 
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 
-std::string ProtoBuilder::build(
+BuildResult ProtoBuilder::build(
     const std::string& project_name,
     const std::string& root_path,
     const SymbolTable& symbols,
@@ -50,6 +51,9 @@ std::string ProtoBuilder::build(
         }
     };
 
+    // Collect content entries for ContentBatch messages (pointers to avoid copying)
+    std::vector<std::pair<std::string, const std::vector<uint8_t>*>> content_entries; // (hash, content ptr)
+
     // Add all files as Objects
     for (auto& file : files) {
         auto* obj = project.add_objects();
@@ -57,7 +61,13 @@ std::string ProtoBuilder::build(
         obj->set_module_path(file.module_path);
         obj->set_filesystem_path(file.filesystem_path);
         obj->set_filetype(file.filetype);
-        obj->set_content(file.content.data(), file.content.size());
+
+        // Compute SHA256 and set content_hash instead of inline content
+        std::string hash_hex = picosha2::hash256_hex_string(file.content.begin(), file.content.end());
+        obj->set_content_hash(hash_hex);
+        // Do NOT set content on the Object — it goes into ContentBatch
+
+        content_entries.emplace_back(hash_hex, &file.content);
 
         // Deduplicate instances by (symbol_local_id, start_offset, end_offset)
         std::unordered_set<EntryKey, EntryKeyHash> seen_instances;
@@ -98,6 +108,7 @@ std::string ProtoBuilder::build(
         sentinel->set_module_path(dirPath);
         sentinel->set_filesystem_path(dirPath);
         sentinel->set_filetype("directory");
+        // Directory sentinels: no content, no content_hash
 
         auto* inst = sentinel->add_symbol_instances();
         inst->set_symbol_local_id(symID);
@@ -121,7 +132,8 @@ std::string ProtoBuilder::build(
         inst->set_symbol_local_id(it->second);
         inst->set_instance_type(askl::index::InstanceType::CONTAINMENT);
         inst->set_start_offset(0);
-        inst->set_end_offset(static_cast<int32_t>(obj->content().size()));
+        // Use file.content.size() via content_entries instead of obj->content().size()
+        inst->set_end_offset(static_cast<int32_t>(content_entries[i].second->size()));
     }
 
     // Add parent→child refs on directory sentinels
@@ -138,7 +150,35 @@ std::string ProtoBuilder::build(
         ref->set_from_offset_end(0);
     }
 
-    std::string output;
-    project.SerializeToString(&output);
-    return output;
+    // Build result
+    BuildResult result;
+    project.SerializeToString(&result.project_data);
+
+    // Build ContentBatch messages, splitting when batch exceeds threshold
+    askl::index::ContentBatch current_batch;
+    size_t current_batch_size = 0;
+
+    for (auto& [hash, content_ptr] : content_entries) {
+        auto* oc = current_batch.add_contents();
+        oc->set_content_hash(hash);
+        oc->set_content(content_ptr->data(), content_ptr->size());
+        current_batch_size += content_ptr->size();
+
+        if (current_batch_size >= CONTENT_BATCH_MAX_BYTES) {
+            std::string batch_data;
+            current_batch.SerializeToString(&batch_data);
+            result.content_batches.push_back(std::move(batch_data));
+            current_batch.Clear();
+            current_batch_size = 0;
+        }
+    }
+
+    // Flush remaining entries
+    if (current_batch.contents_size() > 0) {
+        std::string batch_data;
+        current_batch.SerializeToString(&batch_data);
+        result.content_batches.push_back(std::move(batch_data));
+    }
+
+    return result;
 }

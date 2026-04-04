@@ -8,7 +8,7 @@ int main(int argc, char* argv[]) {
     CLI::App app{"askl-clang-indexer — C language indexer for askl"};
 
     std::string project_dir = ".";
-    std::string output_path = "index.pb";
+    std::string output_path = "index";
     std::string project_name = "main";
     int threads = std::max(1u, std::thread::hardware_concurrency());
     bool include_git_files = false;
@@ -16,7 +16,7 @@ int main(int argc, char* argv[]) {
 
     app.add_option("project_dir", project_dir,
         "Project directory (contains compile_commands.json, used as root)");
-    app.add_option("--output,-o", output_path, "Output protobuf file path");
+    app.add_option("--output,-o", output_path, "Output directory for index files");
     app.add_option("--project", project_name, "Project name");
     app.add_option("--threads,-j", threads, "Number of parallel threads");
     app.add_flag("--include-git-files", include_git_files,

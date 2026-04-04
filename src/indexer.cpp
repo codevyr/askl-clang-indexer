@@ -287,20 +287,55 @@ void Indexer::run() {
     fprintf(stderr, "Symbols: %zu\n", symbol_table_.allSymbols().size());
 }
 
-void Indexer::write(const std::string& output_path) {
-    std::string data = ProtoBuilder::build(
-        project_name_, root_path_, symbol_table_, all_files_,
-        next_object_id_.load());
-
-    std::ofstream out(output_path, std::ios::binary);
+static void write_file(const std::string& path, const std::string& data) {
+    std::ofstream out(path, std::ios::binary);
     if (!out) {
-        throw std::runtime_error("Failed to open output file: " + output_path);
+        throw std::runtime_error("Failed to open output file: " + path);
     }
     out.write(data.data(), data.size());
     out.close();
     if (!out) {
-        throw std::runtime_error("Failed to write output file: " + output_path);
+        throw std::runtime_error("Failed to write output file: " + path);
     }
+}
 
-    fprintf(stderr, "Wrote %zu bytes to %s\n", data.size(), output_path.c_str());
+static std::string human_size(size_t bytes) {
+    if (bytes >= 1024ULL * 1024 * 1024) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.0f GB", bytes / (1024.0 * 1024 * 1024));
+        return buf;
+    } else if (bytes >= 1024ULL * 1024) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.0f MB", bytes / (1024.0 * 1024));
+        return buf;
+    } else if (bytes >= 1024ULL) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.0f KB", bytes / 1024.0);
+        return buf;
+    }
+    return std::to_string(bytes) + " B";
+}
+
+void Indexer::write(const std::string& output_dir) {
+    auto result = ProtoBuilder::build(
+        project_name_, root_path_, symbol_table_, all_files_,
+        next_object_id_.load());
+
+    std::filesystem::create_directories(output_dir);
+
+    // Write project.pb
+    std::string project_path = output_dir + "/project.pb";
+    write_file(project_path, result.project_data);
+    fprintf(stderr, "Wrote %s (%s)\n", project_path.c_str(),
+            human_size(result.project_data.size()).c_str());
+
+    // Write contents-NNNN.pb
+    for (size_t i = 0; i < result.content_batches.size(); ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "contents-%04zu.pb", i + 1);
+        std::string batch_path = output_dir + "/" + name;
+        write_file(batch_path, result.content_batches[i]);
+        fprintf(stderr, "Wrote %s (%s)\n", batch_path.c_str(),
+                human_size(result.content_batches[i].size()).c_str());
+    }
 }
