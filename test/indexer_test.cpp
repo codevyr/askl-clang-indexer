@@ -71,18 +71,23 @@ void PrintTo(const ExpectedRef& r, std::ostream* os) {
 struct ExpectedInstance {
     std::string file;    // module_path of the file containing the instance
     std::string symbol;  // name of the symbol
+    int instance_type = 0;  // 0 = skip check; 1=DEF, 2=DECL, 3=EXP, 6=SRC, 7=HDR
 
     bool operator==(const ExpectedInstance& o) const {
-        return file == o.file && symbol == o.symbol;
+        if (file != o.file || symbol != o.symbol) return false;
+        if (instance_type != 0 && o.instance_type != 0)
+            return instance_type == o.instance_type;
+        return true;
     }
     bool operator<(const ExpectedInstance& o) const {
         if (file != o.file) return file < o.file;
-        return symbol < o.symbol;
+        if (symbol != o.symbol) return symbol < o.symbol;
+        return instance_type < o.instance_type;
     }
 };
 
 void PrintTo(const ExpectedInstance& i, std::ostream* os) {
-    *os << "{file=" << i.file << ", sym=" << i.symbol << "}";
+    *os << "{file=" << i.file << ", sym=" << i.symbol << ", itype=" << i.instance_type << "}";
 }
 
 // --- Helpers ---
@@ -176,7 +181,7 @@ RunResult runFixture(const std::string& fixture_name,
                 << ": start=" << inst.start_offset << " > end=" << inst.end_offset;
             auto it = id_to_name.find(inst.symbol_local_id);
             std::string sym_name = (it != id_to_name.end()) ? strip_root(it->second) : "UNKNOWN";
-            result.instances.push_back({rel_path, sym_name});
+            result.instances.push_back({rel_path, sym_name, inst.instance_type});
         }
         for (auto& ref : file.refs) {
             EXPECT_LE(ref.from_offset_start, ref.from_offset_end)

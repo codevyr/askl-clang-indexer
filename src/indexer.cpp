@@ -217,7 +217,7 @@ void Indexer::addFile(const std::string& abs_path) {
     // Create FILE symbol and instance
     auto [file_sym_id, _] = symbol_table_.getOrCreate(
         fd.module_path, SCOPE_GLOBAL, SYMTYPE_FILE);
-    fd.instances.push_back({file_sym_id, 0, static_cast<int32_t>(fd.content.size())});
+    fd.instances.push_back({file_sym_id, 0, static_cast<int32_t>(fd.content.size()), filetypeToInstType(fd.filetype)});
 
     file_index_[abs_path] = all_files_.size();
     all_files_.push_back(std::move(fd));

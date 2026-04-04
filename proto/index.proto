@@ -31,7 +31,7 @@ message Symbol {
 
 message SymbolInstance {
   int64 symbol_local_id = 1;    // References Symbol.local_id
-  reserved 2;                   // was symbol_type (now on Symbol)
+  InstanceType instance_type = 2;
   int32 start_offset = 3;
   int32 end_offset = 4;
 }
@@ -58,4 +58,16 @@ enum SymbolType {
   DATA = 6;
   MACRO = 7;
   FIELD = 8;
+}
+
+enum InstanceType {
+  INSTANCE_TYPE_UNSPECIFIED = 0;
+  DEFINITION = 1;
+  DECLARATION = 2;
+  EXPANSION = 3;
+  SENTINEL = 4;
+  CONTAINMENT = 5;
+  SOURCE = 6;
+  HEADER = 7;
+  BUILD = 8;
 }

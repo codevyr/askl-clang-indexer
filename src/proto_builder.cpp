@@ -66,6 +66,7 @@ std::string ProtoBuilder::build(
             if (seen_instances.insert(key).second) {
                 auto* pb_inst = obj->add_symbol_instances();
                 pb_inst->set_symbol_local_id(inst.symbol_local_id);
+                pb_inst->set_instance_type(static_cast<askl::index::InstanceType>(inst.instance_type));
                 pb_inst->set_start_offset(inst.start_offset);
                 pb_inst->set_end_offset(inst.end_offset);
             }
@@ -100,6 +101,7 @@ std::string ProtoBuilder::build(
 
         auto* inst = sentinel->add_symbol_instances();
         inst->set_symbol_local_id(symID);
+        inst->set_instance_type(askl::index::InstanceType::SENTINEL);
         inst->set_start_offset(0);
         inst->set_end_offset(0);
 
@@ -117,6 +119,7 @@ std::string ProtoBuilder::build(
         if (it == dirSymbolID.end()) continue;
         auto* inst = obj->add_symbol_instances();
         inst->set_symbol_local_id(it->second);
+        inst->set_instance_type(askl::index::InstanceType::CONTAINMENT);
         inst->set_start_offset(0);
         inst->set_end_offset(static_cast<int32_t>(obj->content().size()));
     }

@@ -35,7 +35,7 @@ size_t Stage1::getOrCreateFile(CXFile file) {
     // Create FILE symbol
     auto [file_sym_id, _] = symbols_.getOrCreate(
         fd.module_path, SCOPE_GLOBAL, SYMTYPE_FILE);
-    fd.instances.push_back({file_sym_id, 0, static_cast<int32_t>(fd.content.size())});
+    fd.instances.push_back({file_sym_id, 0, static_cast<int32_t>(fd.content.size()), filetypeToInstType(fd.filetype)});
 
     size_t idx = result_.files.size();
     result_.files.push_back(std::move(fd));
@@ -67,7 +67,7 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         if (getSpellingRange(cursor, range_file, start_off, end_off)) {
             size_t fi = self->getOrCreateFile(range_file);
             self->result_.files[fi].instances.push_back(
-                {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+                {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), INSTTYPE_DEFINITION});
         }
     } else if (kind == CXCursor_MacroExpansion) {
         ClangString name(clang_getCursorSpelling(cursor));
@@ -87,7 +87,7 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         if (getSpellingRange(cursor, range_file, start_off, end_off, sname.size())) {
             size_t fi = self->getOrCreateFile(range_file);
             self->result_.files[fi].instances.push_back(
-                {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+                {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), INSTTYPE_EXPANSION});
         }
     }
 
@@ -148,12 +148,13 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         int64_t sym_id = resolveSymbol(symbols_, cursor, sname, SYMTYPE_FUNCTION);
+        int inst_type = clang_isCursorDefinition(cursor) ? INSTTYPE_DEFINITION : INSTTYPE_DECLARATION;
 
         CXFile range_file;
         unsigned start_off, end_off;
         if (getExpansionRange(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
-            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
         }
         break;
     }
@@ -166,12 +167,13 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
+        int inst_type = clang_isCursorDefinition(cursor) ? INSTTYPE_DEFINITION : INSTTYPE_DECLARATION;
 
         CXFile range_file;
         unsigned start_off, end_off;
         if (getExpansionRange(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
-            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
         }
 
         // Index function pointer fields as Field symbols
@@ -194,7 +196,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
                 if (getExpansionRange(child, field_file, field_start, field_end)) {
                     size_t fi = self->getOrCreateFile(field_file);
                     self->result_.files[fi].instances.push_back(
-                        {field_sym_id, static_cast<int32_t>(field_start), static_cast<int32_t>(field_end)});
+                        {field_sym_id, static_cast<int32_t>(field_start), static_cast<int32_t>(field_end), INSTTYPE_DEFINITION});
                 }
                 return CXChildVisit_Continue;
             }, this);
@@ -210,12 +212,13 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         int64_t sym_id = resolveSymbol(symbols_, cursor, sname, SYMTYPE_DATA);
+        int inst_type = clang_isCursorDefinition(cursor) ? INSTTYPE_DEFINITION : INSTTYPE_DECLARATION;
 
         CXFile range_file;
         unsigned start_off, end_off;
         if (getExpansionRange(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
-            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
+            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
         }
         break;
     }

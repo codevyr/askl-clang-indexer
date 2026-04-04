@@ -13,6 +13,7 @@ struct InstanceData {
     int64_t symbol_local_id;
     int32_t start_offset;
     int32_t end_offset;
+    int32_t instance_type;
 };
 
 struct RefData {
