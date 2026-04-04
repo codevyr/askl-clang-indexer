@@ -34,4 +34,5 @@ private:
     void handleDesignatedInit(CXCursor cursor);
     void handleBinaryAssignment(CXCursor cursor);
     void addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start_off, unsigned end_off);
+    void addFieldImplRef(CXCursor member_ref, CXCursor func_ref);
 };

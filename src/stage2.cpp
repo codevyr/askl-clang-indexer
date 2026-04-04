@@ -52,6 +52,36 @@ void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start
     result_.refs.push_back(std::move(ref));
 }
 
+void Stage2::addFieldImplRef(CXCursor member_ref, CXCursor func_ref) {
+    // Resolve the function being assigned
+    CXCursor func_referenced = clang_getCursorReferenced(func_ref);
+    if (clang_Cursor_isNull(func_referenced)) return;
+    if (clang_getCursorKind(func_referenced) != CXCursor_FunctionDecl) return;
+
+    ClangString func_name(clang_getCursorSpelling(func_referenced));
+    std::string fname = func_name.to_string();
+    if (fname.empty()) return;
+
+    int64_t func_sym_id = resolveSymbol(symbols_, func_referenced, fname, SYMTYPE_FUNCTION);
+
+    // Resolve the field declaration from the member ref
+    CXCursor field_decl = clang_getCursorReferenced(member_ref);
+    if (clang_Cursor_isNull(field_decl)) return;
+    if (clang_getCursorKind(field_decl) != CXCursor_FieldDecl) return;
+    if (resolveFieldCompoundName(field_decl).empty()) return;
+
+    // Get the field declaration's location (in the header)
+    CXFile field_file;
+    unsigned field_start, field_end;
+    if (!getExpansionRange(field_decl, field_file, field_start, field_end)) return;
+
+    // Create synthetic ref: func implementation attributed to the field's declaration site
+    Stage2Ref ref;
+    ref.source_file = getCanonicalPath(field_file);
+    ref.data = {func_sym_id, static_cast<int32_t>(field_start), static_cast<int32_t>(field_end)};
+    result_.refs.push_back(std::move(ref));
+}
+
 struct DesignatedInitData {
     Stage2* self;
     CXCursor member_ref;
@@ -90,6 +120,8 @@ void Stage2::handleDesignatedInit(CXCursor cursor) {
         if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
             addFuncPtrRef(data.func_ref, range_file, start_off, end_off);
         }
+        // Create synthetic ref from field declaration to implementing function
+        addFieldImplRef(data.member_ref, data.func_ref);
     }
 }
 
@@ -140,15 +172,7 @@ void Stage2::handleBinaryAssignment(CXCursor cursor) {
 
     if (clang_getCursorKind(lhs) != CXCursor_MemberRefExpr) return;
 
-    CXType lhs_type = clang_getCursorType(lhs);
-    bool is_func_ptr = false;
-    if (lhs_type.kind == CXType_Pointer) {
-        CXType pointee = clang_getPointeeType(lhs_type);
-        if (pointee.kind == CXType_FunctionProto || pointee.kind == CXType_FunctionNoProto) {
-            is_func_ptr = true;
-        }
-    }
-    if (!is_func_ptr) return;
+    if (!isFunctionPointerType(clang_getCursorType(lhs))) return;
 
     RhsFuncFinder rhs_data;
     // Check if rhs itself is a DeclRefExpr
@@ -171,6 +195,8 @@ void Stage2::handleBinaryAssignment(CXCursor cursor) {
     if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
         addFuncPtrRef(rhs_data.func_ref, range_file, start_off, end_off);
     }
+    // Create synthetic ref from field declaration to implementing function
+    addFieldImplRef(lhs, rhs_data.func_ref);
 }
 
 void Stage2::process(CXTranslationUnit tu, const std::string& tu_filename) {

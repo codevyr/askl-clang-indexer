@@ -11,3 +11,4 @@ constexpr int SYMTYPE_DIRECTORY = 4;
 constexpr int SYMTYPE_TYPE = 5;
 constexpr int SYMTYPE_DATA = 6;
 constexpr int SYMTYPE_MACRO = 7;
+constexpr int SYMTYPE_FIELD = 8;

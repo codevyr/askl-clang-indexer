@@ -38,7 +38,7 @@ void PrintTo(const ExpectedSymbol& s, std::ostream* os) {
     auto type_str = [](int t) {
         switch (t) {
             case 1: return "FUNCTION"; case 2: return "FILE"; case 4: return "DIRECTORY";
-            case 5: return "TYPE"; case 6: return "DATA"; case 7: return "MACRO"; default: return "?";
+            case 5: return "TYPE"; case 6: return "DATA"; case 7: return "MACRO"; case 8: return "FIELD"; default: return "?";
         }
     };
     *os << "{name=" << s.name << ", scope=" << scope_str(s.scope)
@@ -242,6 +242,7 @@ constexpr int DIRECTORY = 4;
 constexpr int TYPE = 5;
 constexpr int DATA = 6;
 constexpr int MACRO = 7;
+constexpr int FIELD = 8;
 
 INSTANTIATE_TEST_SUITE_P(
     Fixtures,
@@ -256,6 +257,8 @@ INSTANTIATE_TEST_SUITE_P(
                 {"container", GLOBAL, TYPE},
                 {"default_ops", LOCAL, DATA},
                 {"file_ops", GLOBAL, TYPE},
+                {"file_ops.read", GLOBAL, FIELD},
+                {"file_ops.write", GLOBAL, FIELD},
                 {"main", GLOBAL, FUNCTION},
                 {"main.c", GLOBAL, FILETYPE},
                 {"my_container", GLOBAL, DATA},
@@ -270,14 +273,22 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "file_ops", 43, 51},
                 {"main.c", "file_ops", 88, 96},
                 {"main.c", "setup", 106, 117},
-                {"ops.c", "container", 442, 451},
+                {"main.c", "file_ops.read", 123, 131},     // MemberRefExpr: ops.read(0,0,0)
                 {"ops.c", "file_ops", 207, 215},
-                {"ops.c", "file_ops", 330, 338},
                 {"ops.c", "my_read", 236, 251},
-                {"ops.c", "my_read", 351, 370},
-                {"ops.c", "my_read", 482, 497},
                 {"ops.c", "my_write", 257, 274},
+                {"ops.c", "file_ops", 330, 338},
+                {"ops.c", "file_ops.read", 351, 360},      // MemberRefExpr: ops->read = ...
+                {"ops.c", "my_read", 351, 370},
+                {"ops.c", "file_ops.write", 376, 386},     // MemberRefExpr: ops->write = ...
                 {"ops.c", "my_write", 376, 397},
+                {"ops.c", "container", 442, 451},
+                {"ops.c", "my_read", 482, 497},
+                {"ops.h", "my_read", 51, 91},              // synthetic: .read = my_read (designated init)
+                {"ops.h", "my_read", 51, 91},              // synthetic: ops->read = my_read (assignment)
+                {"ops.h", "my_read", 51, 91},              // synthetic: nested .read = my_read
+                {"ops.h", "my_write", 97, 144},            // synthetic: .write = my_write (designated init)
+                {"ops.h", "my_write", 97, 144},            // synthetic: ops->write = my_write (assignment)
                 {"ops.h", "file_ops", 180, 188},
                 {"ops.h", "file_ops", 180, 188},
             }

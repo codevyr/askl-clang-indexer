@@ -173,6 +173,32 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             size_t fi = getOrCreateFile(range_file);
             result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)});
         }
+
+        // Index function pointer fields as Field symbols
+        if (kind == CXCursor_StructDecl) {
+            clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
+                auto* self = static_cast<Stage1*>(data);
+                if (clang_getCursorKind(child) != CXCursor_FieldDecl)
+                    return CXChildVisit_Continue;
+                if (!isFunctionPointerType(clang_getCursorType(child)))
+                    return CXChildVisit_Continue;
+
+                std::string compound_name = resolveFieldCompoundName(child);
+                if (compound_name.empty()) return CXChildVisit_Continue;
+
+                auto [field_sym_id, _] = self->symbols_.getOrCreate(
+                    compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
+
+                CXFile field_file;
+                unsigned field_start, field_end;
+                if (getExpansionRange(child, field_file, field_start, field_end)) {
+                    size_t fi = self->getOrCreateFile(field_file);
+                    self->result_.files[fi].instances.push_back(
+                        {field_sym_id, static_cast<int32_t>(field_start), static_cast<int32_t>(field_end)});
+                }
+                return CXChildVisit_Continue;
+            }, this);
+        }
         break;
     }
     case CXCursor_VarDecl: {
@@ -242,6 +268,24 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         // the TypedefDecl and the underlying type (UnionDecl/StructDecl),
         // producing duplicate refs. ProtoBuilder deduplicates via hash-set.
         addRef(cursor, sym_id, sname.size());
+        break;
+    }
+    case CXCursor_MemberRefExpr: {
+        CXCursor referenced = clang_getCursorReferenced(cursor);
+        if (clang_Cursor_isNull(referenced)) break;
+        if (clang_getCursorKind(referenced) != CXCursor_FieldDecl) break;
+        if (!isFunctionPointerType(clang_getCursorType(referenced))) break;
+
+        std::string compound_name = resolveFieldCompoundName(referenced);
+        if (compound_name.empty()) break;
+
+        // Extract just the field name for the ref span length
+        std::string::size_type dot = compound_name.rfind('.');
+        unsigned name_len = (dot != std::string::npos)
+            ? compound_name.size() - dot - 1 : compound_name.size();
+
+        auto [field_sym_id, _] = symbols_.getOrCreate(compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
+        addRef(cursor, field_sym_id, name_len);
         break;
     }
     default:

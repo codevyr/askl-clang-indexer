@@ -57,4 +57,5 @@ enum SymbolType {
   TYPE = 5;
   DATA = 6;
   MACRO = 7;
+  FIELD = 8;
 }

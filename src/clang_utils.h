@@ -8,6 +8,27 @@
 #include <filesystem>
 #include <string>
 
+// Check if a CXType is a pointer to a function (CXType_FunctionProto or CXType_FunctionNoProto)
+inline bool isFunctionPointerType(CXType t) {
+    if (t.kind != CXType_Pointer) return false;
+    CXType pointee = clang_getPointeeType(t);
+    return pointee.kind == CXType_FunctionProto || pointee.kind == CXType_FunctionNoProto;
+}
+
+// Resolve a FieldDecl cursor to its compound name "struct_name.field_name".
+// Returns empty string on failure (null cursor, non-struct parent, or empty names).
+inline std::string resolveFieldCompoundName(CXCursor field_decl) {
+    CXCursor parent = clang_getCursorSemanticParent(field_decl);
+    if (clang_getCursorKind(parent) != CXCursor_StructDecl) return "";
+    ClangString sn(clang_getCursorSpelling(parent));
+    std::string struct_name = sn.to_string();
+    if (struct_name.empty()) return "";
+    ClangString fn(clang_getCursorSpelling(field_decl));
+    std::string field_name = fn.to_string();
+    if (field_name.empty()) return "";
+    return struct_name + "." + field_name;
+}
+
 // Canonicalize a path from clang_getFileName (resolve relative paths to absolute)
 inline std::string canonicalizePath(const std::string& path) {
     if (!path.empty() && path[0] != '/') {
