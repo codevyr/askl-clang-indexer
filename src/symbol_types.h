@@ -23,3 +23,4 @@ constexpr int INSTTYPE_SOURCE = 6;
 constexpr int INSTTYPE_HEADER = 7;
 constexpr int INSTTYPE_BUILD = 8;
 constexpr int INSTTYPE_FILE = 9;
+constexpr int INSTTYPE_DOCUMENTATION = 10;

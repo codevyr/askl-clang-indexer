@@ -126,6 +126,19 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
     }
 }
 
+void Stage1::addDocComment(CXCursor cursor, int64_t sym_id, size_t file_idx) {
+    CXSourceRange comment_range = clang_Cursor_getCommentRange(cursor);
+    if (clang_Range_isNull(comment_range)) return;
+
+    CXFile file;
+    unsigned start_off, end_off;
+    if (!getExpansionRange(comment_range, file, start_off, end_off)) return;
+
+    result_.files[file_idx].instances.push_back(
+        {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off),
+         INSTTYPE_DOCUMENTATION});
+}
+
 CXChildVisitResult Stage1::visitor(CXCursor cursor, CXCursor parent, CXClientData data) {
     auto* self = static_cast<Stage1*>(data);
     self->visitCursor(cursor, parent);
@@ -155,6 +168,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (getExpansionRange(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
             result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
+            addDocComment(cursor, sym_id, fi);
         }
         break;
     }
@@ -174,6 +188,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (getExpansionRange(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
             result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
+            addDocComment(cursor, sym_id, fi);
         }
 
         // Index function pointer fields as Field symbols
@@ -219,6 +234,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (getExpansionRange(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
             result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
+            addDocComment(cursor, sym_id, fi);
         }
         break;
     }

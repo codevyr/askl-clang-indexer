@@ -45,24 +45,30 @@ inline std::string getCanonicalPath(CXFile file) {
     return canonicalizePath(name.to_string());
 }
 
-// Get expansion range for a cursor. Returns false if the range spans multiple files,
-// or if the range is zero-width and clamp_zero_width is false (declaration mode).
-// When clamp_zero_width is true (ref mode), zero-width ranges are clamped to
-// [start, start+1) to preserve the reference to the macro expansion site.
-inline bool getExpansionRange(CXCursor cursor, CXFile& out_file,
+// Get expansion range from a CXSourceRange. Returns false if the range spans
+// multiple files or is invalid. When clamp_zero_width is true, zero-width ranges
+// are clamped to [start, start+1); when false, zero-width ranges return false.
+inline bool getExpansionRange(CXSourceRange range, CXFile& out_file,
                               unsigned& out_start, unsigned& out_end,
                               bool clamp_zero_width = false) {
-    CXSourceRange range = clang_getCursorExtent(cursor);
     CXFile start_file = nullptr, end_file = nullptr;
     clang_getExpansionLocation(clang_getRangeStart(range), &start_file, nullptr, nullptr, &out_start);
     clang_getExpansionLocation(clang_getRangeEnd(range), &end_file, nullptr, nullptr, &out_end);
-    if (!start_file || !clang_File_isEqual(start_file, end_file)) return false;
+    if (!start_file || !end_file || !clang_File_isEqual(start_file, end_file)) return false;
     if (out_start == out_end) {
         if (!clamp_zero_width) return false;
         out_end = out_start + 1;
     }
     out_file = start_file;
     return true;
+}
+
+// Get expansion range for a cursor's extent.
+inline bool getExpansionRange(CXCursor cursor, CXFile& out_file,
+                              unsigned& out_start, unsigned& out_end,
+                              bool clamp_zero_width = false) {
+    return getExpansionRange(clang_getCursorExtent(cursor), out_file,
+                             out_start, out_end, clamp_zero_width);
 }
 
 // Get spelling range for a cursor. Returns false if the file is null.

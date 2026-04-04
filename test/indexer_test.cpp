@@ -696,6 +696,33 @@ INSTANTIATE_TEST_SUITE_P(
                 {"register.h", "register.h"},
                 {"register.h", "register_driver"},
             }
+        },
+        FixtureSpec{
+            "doc_comments",
+            {"main.c"},
+            {
+                {"add", GLOBAL, FUNCTION},
+                {"counter", GLOBAL, DATA},
+                {"main.c", GLOBAL, FILETYPE},
+                {"mul", GLOBAL, FUNCTION},
+                {"no_doc", GLOBAL, FUNCTION},
+                {"point", GLOBAL, TYPE},
+            },
+            {
+                {"main.c", "counter", 305, 312},
+                {"main.c", "add", 315, 324},
+            },
+            {
+                {"main.c", "add", 1},
+                {"main.c", "add", 10},
+                {"main.c", "counter", 1},
+                {"main.c", "counter", 10},
+                {"main.c", "main.c", 6},
+                {"main.c", "mul", 1},
+                {"main.c", "no_doc", 1},
+                {"main.c", "point", 1},
+                {"main.c", "point", 10},
+            }
         }
     ),
     [](const testing::TestParamInfo<FixtureSpec>& info) {
