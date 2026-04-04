@@ -20,6 +20,15 @@ static const std::unordered_set<std::string> filtered_flags = {
     "-fno-reorder-blocks-and-partition",
     "-fno-partial-inlining",
     "-fno-tree-loop-distribute-patterns",
+    "-fno-ipa-cp-clone", "-fsched-pressure", "-mhard-float",
+    "-fno-conserve-stack",
+    "-fsanitize=bounds-strict",
+    // GCC plugin defines — stripping these lets kernel headers use their
+    // fallback (empty) definitions instead of referencing plugin-only attributes.
+    "-DLATENT_ENTROPY_PLUGIN",
+    "-DRANDSTRUCT_PLUGIN",
+    "-DRANDSTRUCT",
+    "-DSTRUCTLEAK_PLUGIN",
     // Note: all -W flags are stripped in filterGccFlags() since warnings
     // are irrelevant for indexing.
 };
@@ -28,6 +37,9 @@ static const std::vector<std::string> filtered_prefixes = {
     "-mabi=", "-mpreferred-stack-boundary=",
     "-mindirect-branch-cs-prefix", "-mindirect-branch=",
     "-fzero-init-padding-bits=", "-fmin-function-alignment=",
+    "-fasan-shadow-offset=",
+    // GCC plugins can't be loaded by libclang
+    "-fplugin=", "-fplugin-arg-",
 };
 
 static bool hasExtension(const std::string& path, const std::string& ext) {
