@@ -126,7 +126,7 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
     }
 }
 
-void Stage1::addDocComment(CXCursor cursor, int64_t sym_id, size_t file_idx) {
+void Stage1::addDocComment(CXCursor cursor, int64_t sym_id, size_t /*file_idx*/) {
     CXSourceRange comment_range = clang_Cursor_getCommentRange(cursor);
     if (clang_Range_isNull(comment_range)) return;
 
@@ -134,7 +134,8 @@ void Stage1::addDocComment(CXCursor cursor, int64_t sym_id, size_t file_idx) {
     unsigned start_off, end_off;
     if (!getExpansionRange(comment_range, file, start_off, end_off)) return;
 
-    result_.files[file_idx].instances.push_back(
+    size_t comment_file_idx = getOrCreateFile(file);
+    result_.files[comment_file_idx].instances.push_back(
         {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off),
          INSTTYPE_DOCUMENTATION});
 }

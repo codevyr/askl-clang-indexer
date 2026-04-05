@@ -723,6 +723,30 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "point", 1},
                 {"main.c", "point", 10},
             }
+        },
+        // Proves that doc comments on header declarations produce documentation
+        // instances in the header file, not in the .c file where the definition
+        // lives.  Reproduces a bug where addDocComment used the definition's
+        // file_idx instead of the comment's actual file.
+        FixtureSpec{
+            "cross_file_doc_comment",
+            {"impl.c"},
+            {
+                {"API_H", GLOBAL, MACRO},
+                {"api.h", GLOBAL, FILETYPE},
+                {"do_work", GLOBAL, FUNCTION},
+                {"impl.c", GLOBAL, FILETYPE},
+            },
+            {},
+            {
+                {"api.h", "API_H", 1},
+                {"api.h", "api.h", 7},
+                {"api.h", "do_work", 2},       // declaration
+                {"api.h", "do_work", 10},      // documentation — from declaration visit
+                {"api.h", "do_work", 10},      // documentation — from definition visit (comment is in header)
+                {"impl.c", "do_work", 1},      // definition — no documentation here
+                {"impl.c", "impl.c", 6},
+            }
         }
     ),
     [](const testing::TestParamInfo<FixtureSpec>& info) {
