@@ -29,14 +29,16 @@ inline std::string resolveFieldCompoundName(CXCursor field_decl) {
     return struct_name + "." + field_name;
 }
 
-// Canonicalize a path from clang_getFileName (resolve relative paths to absolute)
+// Canonicalize a path from clang_getFileName (resolve relative paths to absolute,
+// normalize away . and .. components in absolute paths)
 inline std::string canonicalizePath(const std::string& path) {
-    if (!path.empty() && path[0] != '/') {
+    if (path.empty()) return path;
+    if (path[0] != '/') {
         std::error_code ec;
         auto abs = std::filesystem::canonical(path, ec);
         if (!ec) return abs.string();
     }
-    return path;
+    return std::filesystem::path(path).lexically_normal().string();
 }
 
 // Get the canonical path for a CXFile

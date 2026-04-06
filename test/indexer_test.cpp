@@ -1,3 +1,4 @@
+#include "clang_utils.h"
 #include "indexer.h"
 #include "symbol_table.h"
 #include "stage1.h"
@@ -753,3 +754,28 @@ INSTANTIATE_TEST_SUITE_P(
         return info.param.name;
     }
 );
+
+// --- canonicalizePath tests ---
+
+TEST(CanonicalizePath, ResolvesDotDot) {
+    EXPECT_EQ(canonicalizePath("/a/b/../c"), "/a/c");
+}
+
+TEST(CanonicalizePath, ResolvesDot) {
+    EXPECT_EQ(canonicalizePath("/a/./b"), "/a/b");
+}
+
+TEST(CanonicalizePath, ResolvesMultipleDotDot) {
+    EXPECT_EQ(canonicalizePath("/a/b/../../c"), "/c");
+}
+
+TEST(CanonicalizePath, DotDotAtRoot) {
+    EXPECT_EQ(canonicalizePath("/../a"), "/a");
+}
+
+TEST(CanonicalizePath, RealWorldBugReport) {
+    EXPECT_EQ(
+        canonicalizePath("/home/user/project/common/mmu/../../include/header.h"),
+        "/home/user/project/include/header.h"
+    );
+}
