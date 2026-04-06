@@ -73,22 +73,30 @@ struct ExpectedInstance {
     std::string file;    // module_path of the file containing the instance
     std::string symbol;  // name of the symbol
     int instance_type = 0;  // 0 = skip check; 1=DEF, 2=DECL, 3=EXP, 6=SRC, 7=HDR
+    int32_t start_offset = -1;  // -1 = skip check
+    int32_t end_offset = -1;    // -1 = skip check
 
     bool operator==(const ExpectedInstance& o) const {
         if (file != o.file || symbol != o.symbol) return false;
-        if (instance_type != 0 && o.instance_type != 0)
-            return instance_type == o.instance_type;
+        if (instance_type != 0 && o.instance_type != 0 && instance_type != o.instance_type) return false;
+        if (start_offset >= 0 && o.start_offset >= 0 && start_offset != o.start_offset) return false;
+        if (end_offset >= 0 && o.end_offset >= 0 && end_offset != o.end_offset) return false;
         return true;
     }
     bool operator<(const ExpectedInstance& o) const {
         if (file != o.file) return file < o.file;
         if (symbol != o.symbol) return symbol < o.symbol;
-        return instance_type < o.instance_type;
+        if (instance_type != o.instance_type) return instance_type < o.instance_type;
+        if (start_offset != o.start_offset) return start_offset < o.start_offset;
+        return end_offset < o.end_offset;
     }
 };
 
 void PrintTo(const ExpectedInstance& i, std::ostream* os) {
-    *os << "{file=" << i.file << ", sym=" << i.symbol << ", itype=" << i.instance_type << "}";
+    *os << "{file=" << i.file << ", sym=" << i.symbol << ", itype=" << i.instance_type;
+    if (i.start_offset >= 0 || i.end_offset >= 0)
+        *os << ", range=[" << i.start_offset << ", " << i.end_offset << ")";
+    *os << "}";
 }
 
 // --- Helpers ---
@@ -182,7 +190,7 @@ RunResult runFixture(const std::string& fixture_name,
                 << ": start=" << inst.start_offset << " > end=" << inst.end_offset;
             auto it = id_to_name.find(inst.symbol_local_id);
             std::string sym_name = (it != id_to_name.end()) ? strip_root(it->second) : "UNKNOWN";
-            result.instances.push_back({rel_path, sym_name, inst.instance_type});
+            result.instances.push_back({rel_path, sym_name, inst.instance_type, inst.start_offset, inst.end_offset});
         }
         for (auto& ref : file.refs) {
             EXPECT_LE(ref.from_offset_start, ref.from_offset_end)
@@ -290,11 +298,8 @@ INSTANTIATE_TEST_SUITE_P(
                 {"ops.c", "my_write", 376, 397},
                 {"ops.c", "container", 442, 451},
                 {"ops.c", "my_read", 482, 497},
-                {"ops.h", "my_read", 51, 91},              // synthetic: .read = my_read (designated init)
-                {"ops.h", "my_read", 51, 91},              // synthetic: ops->read = my_read (assignment)
-                {"ops.h", "my_read", 51, 91},              // synthetic: nested .read = my_read
-                {"ops.h", "my_write", 97, 144},            // synthetic: .write = my_write (designated init)
-                {"ops.h", "my_write", 97, 144},            // synthetic: ops->write = my_write (assignment)
+                {"ops.h", "my_read", 51, 91},              // synthetic: field impl ref (deduped across patterns)
+                {"ops.h", "my_write", 97, 144},            // synthetic: field impl ref (deduped across patterns)
                 {"ops.h", "file_ops", 180, 188},
             }
         },
@@ -450,7 +455,7 @@ INSTANTIATE_TEST_SUITE_P(
             {
                 {"macros.h", "S_OK", 411, 415},
                 {"macros.h", "result", 321, 327},
-                // Expansion-site refs: macro body symbols also appear at call site
+                // Expansion-site refs: clamped to macro name width
                 {"main.c", "S_OK", 325, 339},
                 {"main.c", "result", 272, 278},
                 {"main.c", "result", 302, 308},
@@ -471,14 +476,16 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", GLOBAL, FILETYPE},
                 {"use_any", GLOBAL, FUNCTION},
             },
-            // refs — with spelling location, type_a/b/c refs now resolve inside ONE_TYPE body
-            // Clang visits each TypeRef twice (through TypedefDecl + anonymous UnionDecl);
-            // Stage1 deduplicates via per-file ref set.
+            // refs — spelling refs resolve inside ONE_TYPE body;
+            // expansion refs clamped to ALL_TYPES name at call site [398, 407)
             {
                 {"main.c", "any_type", 33, 41},
                 {"types.h", "type_a", 286, 292},
+                {"types.h", "type_a", 398, 407},
                 {"types.h", "type_b", 309, 315},
+                {"types.h", "type_b", 398, 407},
                 {"types.h", "type_c", 332, 338},
+                {"types.h", "type_c", 398, 407},
             },
             // instances — macro symbols now have instances too
             // ALL_TYPES appears twice: once for #define, once for expansion site
@@ -524,9 +531,9 @@ INSTANTIATE_TEST_SUITE_P(
                 // so 1-char token gives [289, 290) not [289, 289)
                 {"main.c", "x", 289, 290},
                 // Macro-expanded TypeRef: spelling location resolves inside ONE_STRUCT body
-                // Clang visits this TypeRef twice (through TypedefDecl + anonymous UnionDecl);
-                // Stage1 deduplicates via per-file ref set.
                 {"types.h", "alpha", 403, 408},
+                // Expansion-site ref: clamped to ALL_STRUCTS name width
+                {"types.h", "alpha", 477, 488},
             },
             {
                 {"main.c", "main.c"},
@@ -597,8 +604,8 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"log.h", "puts", 49, 53},
-                // Expansion-site ref: puts call from LOG body also at call site
-                {"main.c", "puts", 36, 48},
+                // Expansion-site ref: clamped to LOG macro name width
+                {"main.c", "puts", 36, 39},
             }
         },
         // Nested macro chain: handler calls FATAL, which expands through ERR→MSG→output.
@@ -620,8 +627,8 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"macros.h", "output", 71, 77},
-                // Expansion-site ref: output call from FATAL chain also at call site
-                {"main.c", "output", 41, 54},
+                // Expansion-site ref: clamped to FATAL macro name width
+                {"main.c", "output", 41, 46},
             }
         },
         // Proves that files with only macros (no declarations/refs) still appear
@@ -671,8 +678,9 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"main.c", "driver_info", 37, 48},
-                // my_drv expansion-site refs resolve to the same offsets;
-                // Stage1 deduplicates via per-file ref set.
+                // my_drv: expansion-site ref clamped to register_driver name
+                {"main.c", "my_drv", 73, 88},
+                // my_drv: spelling ref in the macro argument
                 {"main.c", "my_drv", 89, 95},
             },
             {
@@ -769,6 +777,52 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "global_opts", 199, 210},
                 {"main.c", "options", 54, 61},
                 {"main.c", "setup", 175, 193},
+            }
+        },
+        // Proves that macro arguments become direct children of the enclosing
+        // scope (via spelling ref outside the clamped macro instance) AND
+        // has-children of the macro expansion (via expansion-site ref inside
+        // the clamped macro instance).
+        // some_macro(bar) inside foo:
+        //   foo [35, ?)
+        //     some_macro [56, 66)          ← expansion instance (name-only)
+        //       bar        [56, 66)        ← expansion ref (inside macro)
+        //       do_something [56, 66)      ← expansion ref (inside macro)
+        //       GLOBAL_VARIABLE [56, 66)   ← expansion ref (inside macro)
+        //     bar [67, 70)                 ← spelling ref (outside macro, child of foo)
+        FixtureSpec{
+            "macro_arg_direct",
+            {"main.c"},
+            {
+                {"GLOBAL_VARIABLE", GLOBAL, DATA},
+                {"bar", GLOBAL, DATA},
+                {"do_something", GLOBAL, FUNCTION},
+                {"foo", GLOBAL, FUNCTION},
+                {"macros.h", GLOBAL, FILETYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"some_macro", GLOBAL, MACRO},
+            },
+            {
+                // Spelling refs in macro body (macros.h)
+                {"macros.h", "do_something", 86, 98},
+                {"macros.h", "GLOBAL_VARIABLE", 105, 120},
+                // Expansion refs clamped to some_macro name [56, 66)
+                {"main.c", "GLOBAL_VARIABLE", 56, 66},
+                {"main.c", "bar", 56, 66},
+                {"main.c", "do_something", 56, 66},
+                // Spelling ref: bar in macro argument (direct child of foo)
+                {"main.c", "bar", 67, 70},
+            },
+            {
+                {"macros.h", "GLOBAL_VARIABLE", 2},
+                {"macros.h", "do_something", 2},
+                {"macros.h", "macros.h", 7},
+                {"macros.h", "some_macro", 1},
+                {"main.c", "bar", 1},
+                {"main.c", "foo", 1},
+                {"main.c", "main.c", 6},
+                // Expansion instance clamped to macro name (not full call)
+                {"main.c", "some_macro", 3, 56, 66},
             }
         }
     ),

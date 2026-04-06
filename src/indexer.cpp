@@ -7,6 +7,7 @@
 #include "stage2.h"
 #include "symbol_types.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -115,11 +116,20 @@ void Indexer::processTU(const CompileCommand& cmd) {
     auto results = stage1.takeResults();
     auto stage2_result = stage2.takeResults();
 
-    // Merge stage2 refs into the appropriate FileData using stage1's file index
+    // Merge stage2 refs into the appropriate FileData using stage1's file index,
+    // deduplicating against existing refs (Stage2 can produce identical synthetic
+    // refs when the same function is assigned to the same field via multiple
+    // patterns, e.g. designated init + direct assignment).
     for (auto& ref : stage2_result.refs) {
         auto it = results.file_index.find(ref.source_file);
         if (it != results.file_index.end()) {
-            results.files[it->second].refs.push_back(ref.data);
+            auto& file_refs = results.files[it->second].refs;
+            bool dup = std::any_of(file_refs.begin(), file_refs.end(), [&](const RefData& r) {
+                return r.to_symbol_local_id == ref.data.to_symbol_local_id &&
+                       r.from_offset_start == ref.data.from_offset_start &&
+                       r.from_offset_end == ref.data.from_offset_end;
+            });
+            if (!dup) file_refs.push_back(ref.data);
         }
     }
 

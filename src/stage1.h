@@ -56,6 +56,11 @@ private:
     // Per-TU state
     std::unordered_map<std::string, size_t> file_index_; // filepath -> index in result_.files
     std::unordered_map<size_t, std::unordered_set<EntryKey, EntryKeyHash>> file_ref_sets_; // per-file ref dedup
+    std::unordered_map<uint64_t, unsigned> macro_name_ends_; // fileOffsetKey(fi, off) -> end_offset
+
+    static uint64_t fileOffsetKey(size_t file_idx, unsigned offset) {
+        return (static_cast<uint64_t>(file_idx) << 32) | offset;
+    }
 
     size_t getOrCreateFile(CXFile file);
 
