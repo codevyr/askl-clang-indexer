@@ -1,5 +1,6 @@
 #include "indexer.h"
 #include "clang_raii.h"
+#include "dedup_keys.h"
 #include "file_utils.h"
 #include "proto_builder.h"
 #include "stage1.h"
@@ -13,6 +14,7 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -134,9 +136,16 @@ void Indexer::processTU(const CompileCommand& cmd) {
         for (auto& file : results.files) {
             auto it = file_index_.find(file.filesystem_path);
             if (it != file_index_.end()) {
-                // Merge refs into existing FileData (instances are identical across TUs)
+                // Merge refs into existing FileData, deduplicating against what's already there
                 auto& existing = all_files_[it->second];
-                for (auto& ref : file.refs) existing.refs.push_back(ref);
+                std::unordered_set<EntryKey, EntryKeyHash> seen;
+                seen.reserve(existing.refs.size());
+                for (auto& ref : existing.refs)
+                    seen.insert({ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end});
+                for (auto& ref : file.refs) {
+                    if (seen.insert({ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end}).second)
+                        existing.refs.push_back(ref);
+                }
             } else {
                 file_index_[file.filesystem_path] = all_files_.size();
                 all_files_.push_back(std::move(file));

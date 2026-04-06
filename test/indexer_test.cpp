@@ -296,7 +296,6 @@ INSTANTIATE_TEST_SUITE_P(
                 {"ops.h", "my_write", 97, 144},            // synthetic: .write = my_write (designated init)
                 {"ops.h", "my_write", 97, 144},            // synthetic: ops->write = my_write (assignment)
                 {"ops.h", "file_ops", 180, 188},
-                {"ops.h", "file_ops", 180, 188},
             }
         },
         FixtureSpec{
@@ -424,10 +423,7 @@ INSTANTIATE_TEST_SUITE_P(
             {
                 {"handler.c", "status", 43, 49},
                 {"handler.c", "OK", 81, 83},
-                {"handler.c", "OK", 81, 83},
                 {"handler.c", "ERR_IO", 109, 115},
-                {"handler.c", "ERR_IO", 109, 115},
-                {"handler.c", "ERR_MEM", 137, 144},
                 {"handler.c", "ERR_MEM", 137, 144},
                 {"handler.c", "status", 198, 204},
                 {"handler.c", "ERR_IO", 218, 224},
@@ -454,7 +450,6 @@ INSTANTIATE_TEST_SUITE_P(
             {
                 {"macros.h", "S_OK", 411, 415},
                 {"macros.h", "result", 321, 327},
-                {"macros.h", "result", 321, 327},
                 // Expansion-site refs: macro body symbols also appear at call site
                 {"main.c", "S_OK", 325, 339},
                 {"main.c", "result", 272, 278},
@@ -478,14 +473,11 @@ INSTANTIATE_TEST_SUITE_P(
             },
             // refs — with spelling location, type_a/b/c refs now resolve inside ONE_TYPE body
             // Clang visits each TypeRef twice (through TypedefDecl + anonymous UnionDecl);
-            // ProtoBuilder deduplicates via hash-set at serialization time.
+            // Stage1 deduplicates via per-file ref set.
             {
                 {"main.c", "any_type", 33, 41},
                 {"types.h", "type_a", 286, 292},
-                {"types.h", "type_a", 286, 292},
                 {"types.h", "type_b", 309, 315},
-                {"types.h", "type_b", 309, 315},
-                {"types.h", "type_c", 332, 338},
                 {"types.h", "type_c", 332, 338},
             },
             // instances — macro symbols now have instances too
@@ -533,8 +525,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "x", 289, 290},
                 // Macro-expanded TypeRef: spelling location resolves inside ONE_STRUCT body
                 // Clang visits this TypeRef twice (through TypedefDecl + anonymous UnionDecl);
-                // ProtoBuilder deduplicates at serialization time.
-                {"types.h", "alpha", 403, 408},
+                // Stage1 deduplicates via per-file ref set.
                 {"types.h", "alpha", 403, 408},
             },
             {
@@ -680,9 +671,8 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"main.c", "driver_info", 37, 48},
-                // my_drv referenced twice (once per macro body usage)
-                // — both refs are contained within the register_driver instance
-                {"main.c", "my_drv", 89, 95},
+                // my_drv expansion-site refs resolve to the same offsets;
+                // Stage1 deduplicates via per-file ref set.
                 {"main.c", "my_drv", 89, 95},
             },
             {

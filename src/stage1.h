@@ -1,10 +1,13 @@
 #pragma once
 
+#include "dedup_keys.h"
+
 #include <atomic>
 #include <clang-c/Index.h>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class SymbolTable;
@@ -52,6 +55,7 @@ private:
 
     // Per-TU state
     std::unordered_map<std::string, size_t> file_index_; // filepath -> index in result_.files
+    std::unordered_map<size_t, std::unordered_set<EntryKey, EntryKeyHash>> file_ref_sets_; // per-file ref dedup
 
     size_t getOrCreateFile(CXFile file);
 
@@ -63,5 +67,6 @@ private:
                                   unsigned len, CXClientData data);
     void visitCursor(CXCursor cursor, CXCursor parent);
     void addRef(CXCursor cursor, int64_t sym_id, unsigned name_len);
+    void insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t end);
     void addDocComment(CXCursor cursor, int64_t sym_id, size_t file_idx);
 };

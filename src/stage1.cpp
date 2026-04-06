@@ -105,13 +105,17 @@ void Stage1::collectMacros(CXTranslationUnit tu) {
 // that symbols referenced in a macro body (e.g. a TypeRef to the variable's
 // type) appear within the expanded declaration's instance range, enabling
 // containment queries like `data @i {...} / #i {type}`.
+void Stage1::insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t end) {
+    if (file_ref_sets_[file_idx].insert({sym_id, start, end}).second)
+        result_.files[file_idx].refs.push_back({sym_id, start, end});
+}
+
 void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
     CXFile spelling_file;
     unsigned spelling_start, spelling_end;
     if (getSpellingRange(cursor, spelling_file, spelling_start, spelling_end, name_len)) {
         size_t fi = getOrCreateFile(spelling_file);
-        result_.files[fi].refs.push_back(
-            {sym_id, static_cast<int32_t>(spelling_start), static_cast<int32_t>(spelling_end)});
+        insertRef(fi, sym_id, static_cast<int32_t>(spelling_start), static_cast<int32_t>(spelling_end));
     }
 
     // If the expansion is in a different file, add a ref there too.
@@ -120,8 +124,7 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
     if (getExpansionRange(cursor, expansion_file, exp_start, exp_end, true)) {
         if (!spelling_file || !clang_File_isEqual(spelling_file, expansion_file)) {
             size_t fi = getOrCreateFile(expansion_file);
-            result_.files[fi].refs.push_back(
-                {sym_id, static_cast<int32_t>(exp_start), static_cast<int32_t>(exp_end)});
+            insertRef(fi, sym_id, static_cast<int32_t>(exp_start), static_cast<int32_t>(exp_end));
         }
     }
 }
@@ -286,7 +289,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
         // Note: clang visits TypeRef children of anonymous types through both
         // the TypedefDecl and the underlying type (UnionDecl/StructDecl),
-        // producing duplicate refs. ProtoBuilder deduplicates via hash-set.
+        // producing duplicate refs. Deduplicated in addRef via file_ref_sets_.
         addRef(cursor, sym_id, sname.size());
         break;
     }
