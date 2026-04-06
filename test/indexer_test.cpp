@@ -748,6 +748,38 @@ INSTANTIATE_TEST_SUITE_P(
                 {"impl.c", "do_work", 1},      // definition — no documentation here
                 {"impl.c", "impl.c", 6},
             }
+        },
+        // Proves that symbols are still indexed when a translation unit
+        // contains clang diagnostic errors.  The header has an undeclared
+        // identifier inside an inline function body — clang emits an error
+        // but still builds the AST.  All symbols (before and after the
+        // error) must appear in the index.  Mirrors real-world cases like
+        // __builtin_counted_by_ref errors in linux/slab.h.
+        FixtureSpec{
+            "diagnostic_error",
+            {"main.c"},
+            {
+                {"ERRORS_H", GLOBAL, MACRO},
+                {"broken_function", LOCAL, FUNCTION},
+                {"config", GLOBAL, TYPE},
+                {"errors.h", GLOBAL, FILETYPE},
+                {"global_cfg", GLOBAL, DATA},
+                {"global_opts", GLOBAL, DATA},
+                {"main", GLOBAL, FUNCTION},
+                {"main.c", GLOBAL, FILETYPE},
+                {"options", GLOBAL, TYPE},
+                {"setup", GLOBAL, FUNCTION},
+            },
+            {
+                {"errors.h", "config", 434, 440},
+                {"errors.h", "config", 570, 576},
+                {"main.c", "config", 28, 34},
+                {"main.c", "config", 94, 100},
+                {"main.c", "global_cfg", 182, 192},
+                {"main.c", "global_opts", 199, 210},
+                {"main.c", "options", 54, 61},
+                {"main.c", "setup", 175, 193},
+            }
         }
     ),
     [](const testing::TestParamInfo<FixtureSpec>& info) {

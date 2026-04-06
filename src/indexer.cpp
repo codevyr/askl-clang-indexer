@@ -19,12 +19,13 @@
 
 Indexer::Indexer(const std::string& project_name, const std::string& compile_commands_dir,
                 const std::string& root_path, int threads, bool include_git_files,
-                bool show_progress, const std::string& modules_method)
+                bool show_progress, bool show_warnings, const std::string& modules_method)
     : project_name_(project_name),
       root_path_(root_path),
       threads_(threads),
       include_git_files_(include_git_files),
       show_progress_(show_progress),
+      show_warnings_(show_warnings),
       modules_method_(modules_method),
       compile_db_(compile_commands_dir, modules_method) {}
 
@@ -86,16 +87,18 @@ void Indexer::processTU(const CompileCommand& cmd) {
         return;
     }
 
-    // Print any errors/warnings
-    unsigned num_diag = clang_getNumDiagnostics(tu);
-    for (unsigned i = 0; i < num_diag; i++) {
-        CXDiagnostic diag = clang_getDiagnostic(tu, i);
-        CXDiagnosticSeverity sev = clang_getDiagnosticSeverity(diag);
-        if (sev >= CXDiagnostic_Error) {
-            ClangString msg(clang_formatDiagnostic(diag, CXDiagnostic_DisplaySourceLocation));
-            fprintf(stderr, "%s\n", msg.c_str());
+    // Print any errors/warnings (only when --warn is set)
+    if (show_warnings_) {
+        unsigned num_diag = clang_getNumDiagnostics(tu);
+        for (unsigned i = 0; i < num_diag; i++) {
+            CXDiagnostic diag = clang_getDiagnostic(tu, i);
+            CXDiagnosticSeverity sev = clang_getDiagnosticSeverity(diag);
+            if (sev >= CXDiagnostic_Error) {
+                ClangString msg(clang_formatDiagnostic(diag, CXDiagnostic_DisplaySourceLocation));
+                fprintf(stderr, "%s\n", msg.c_str());
+            }
+            clang_disposeDiagnostic(diag);
         }
-        clang_disposeDiagnostic(diag);
     }
 
     // Stage 1: Extract symbols and direct references
