@@ -20,8 +20,9 @@ BuildResult ProtoBuilder::build(
     project.set_project_name(project_name);
     project.set_root_path(root_path);
 
-    // Add all symbols and collect directory symbol IDs in a single pass
+    // Add all symbols and collect directory/module symbol IDs in a single pass
     std::unordered_map<std::string, int64_t> dirSymbolID;
+    std::unordered_map<std::string, int64_t> modSymbolID;
     for (auto& sym : symbols.allSymbols()) {
         auto* pb_sym = project.add_symbols();
         pb_sym->set_local_id(sym.local_id);
@@ -30,6 +31,8 @@ BuildResult ProtoBuilder::build(
         pb_sym->set_type(static_cast<askl::index::SymbolType>(sym.type));
         if (sym.type == SYMTYPE_DIRECTORY) {
             dirSymbolID[sym.name] = sym.local_id;
+        } else if (sym.type == SYMTYPE_MODULE) {
+            modSymbolID[sym.name] = sym.local_id;
         }
     }
 
@@ -148,6 +151,20 @@ BuildResult ProtoBuilder::build(
         ref->set_to_symbol_local_id(symID);
         ref->set_from_offset_start(0);
         ref->set_from_offset_end(0);
+    }
+
+    // Add module containment instances on file objects
+    for (int i = 0; i < file_object_count; ++i) {
+        const auto& file = files[i];
+        if (file.modname.empty()) continue;
+        auto it = modSymbolID.find(file.modname);
+        if (it == modSymbolID.end()) continue;
+        auto* obj = project.mutable_objects(i);
+        auto* inst = obj->add_symbol_instances();
+        inst->set_symbol_local_id(it->second);
+        inst->set_instance_type(askl::index::InstanceType::CONTAINMENT);
+        inst->set_start_offset(0);
+        inst->set_end_offset(static_cast<int32_t>(content_entries[i].second->size()));
     }
 
     // Build result

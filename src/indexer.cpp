@@ -19,13 +19,14 @@
 
 Indexer::Indexer(const std::string& project_name, const std::string& compile_commands_dir,
                 const std::string& root_path, int threads, bool include_git_files,
-                bool show_progress)
+                bool show_progress, const std::string& modules_method)
     : project_name_(project_name),
       root_path_(root_path),
       threads_(threads),
       include_git_files_(include_git_files),
       show_progress_(show_progress),
-      compile_db_(compile_commands_dir) {}
+      modules_method_(modules_method),
+      compile_db_(compile_commands_dir, modules_method) {}
 
 std::string Indexer::computeCommonAncestor(const std::vector<CompileCommand>& cmds) {
     if (cmds.empty()) return ".";
@@ -117,6 +118,14 @@ void Indexer::processTU(const CompileCommand& cmd) {
         }
     }
 
+    // Pre-canonicalize outside the lock to avoid syscall under contention
+    std::string canon_filename;
+    if (!cmd.modname.empty()) {
+        std::error_code ec;
+        canon_filename = std::filesystem::weakly_canonical(cmd.filename, ec).string();
+        if (ec) canon_filename = cmd.filename;
+    }
+
     {
         std::lock_guard<std::mutex> lock(files_mutex_);
         for (auto& file : results.files) {
@@ -129,6 +138,13 @@ void Indexer::processTU(const CompileCommand& cmd) {
                 file_index_[file.filesystem_path] = all_files_.size();
                 all_files_.push_back(std::move(file));
             }
+        }
+
+        // Set modname only on the main TU source file (not included headers)
+        if (!cmd.modname.empty()) {
+            auto it = file_index_.find(canon_filename);
+            if (it != file_index_.end())
+                all_files_[it->second].modname = cmd.modname;
         }
     }
 }
@@ -223,6 +239,20 @@ void Indexer::addFile(const std::string& abs_path) {
     all_files_.push_back(std::move(fd));
 }
 
+void Indexer::createModuleSymbols() {
+    std::set<std::string> modules;
+    for (auto& file : all_files_) {
+        if (!file.modname.empty())
+            modules.insert(file.modname);
+    }
+
+    for (auto& mod : modules) {
+        symbol_table_.getOrCreate(mod, SCOPE_GLOBAL, SYMTYPE_MODULE);
+    }
+
+    fprintf(stderr, "Modules: %zu\n", modules.size());
+}
+
 void Indexer::createDirectorySymbols() {
     std::set<std::string> dirs;
     for (auto& file : all_files_) {
@@ -282,6 +312,8 @@ void Indexer::run() {
     }
 
     createDirectorySymbols();
+    if (!modules_method_.empty())
+        createModuleSymbols();
 
     fprintf(stderr, "Files: %zu\n", all_files_.size());
     fprintf(stderr, "Symbols: %zu\n", symbol_table_.allSymbols().size());

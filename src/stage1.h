@@ -27,6 +27,7 @@ struct FileData {
     std::string module_path;
     std::string filesystem_path;
     std::string filetype;
+    std::string modname;  // kernel module name, empty if not part of a module
     std::vector<uint8_t> content;
     std::vector<InstanceData> instances;
     std::vector<RefData> refs;

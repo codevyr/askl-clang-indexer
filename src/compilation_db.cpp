@@ -51,7 +51,8 @@ static bool isAssemblyFile(const std::string& path) {
     return hasExtension(path, ".S") || hasExtension(path, ".s");
 }
 
-CompilationDB::CompilationDB(const std::string& dir) {
+CompilationDB::CompilationDB(const std::string& dir, const std::string& modules_method)
+    : modules_method_(modules_method) {
     CXCompilationDatabase_Error error;
     db_ = clang_CompilationDatabase_fromDirectory(dir.c_str(), &error);
     if (error != CXCompilationDatabase_NoError || !db_) {
@@ -121,6 +122,7 @@ CompilationDB::CompilationDB(const std::string& dir) {
 
         filterGccFlags(entry.args);
         addSystemIncludes(compiler, entry.args);
+        extractModuleName(entry);
         commands_.push_back(std::move(entry));
     }
 
@@ -222,5 +224,20 @@ void CompilationDB::addSystemIncludes(const std::string& compiler, std::vector<s
     for (auto& path : it->second) {
         args.push_back("-isystem");
         args.push_back(path);
+    }
+}
+
+void CompilationDB::extractModuleName(CompileCommand& entry) {
+    if (modules_method_ == "kbuild") {
+        bool has_dmodule = false;
+        std::string modname;
+        for (const auto& arg : entry.args) {
+            if (arg == "-DMODULE") has_dmodule = true;
+            static const std::string prefix = "-D__KBUILD_MODNAME=";
+            if (arg.compare(0, prefix.size(), prefix) == 0)
+                modname = arg.substr(prefix.size());
+        }
+        if (has_dmodule && !modname.empty())
+            entry.modname = modname;
     }
 }

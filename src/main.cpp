@@ -13,6 +13,7 @@ int main(int argc, char* argv[]) {
     int threads = std::max(1u, std::thread::hardware_concurrency());
     bool include_git_files = false;
     bool show_progress = false;
+    std::string modules_method;
 
     app.add_option("project_dir", project_dir,
         "Project directory (contains compile_commands.json, used as root)");
@@ -22,12 +23,13 @@ int main(int argc, char* argv[]) {
     app.add_flag("--include-git-files", include_git_files,
         "Include all git-tracked files at HEAD in the project files list");
     app.add_flag("--progress", show_progress, "Show progress during indexing");
+    app.add_option("--modules", modules_method, "Create MODULE symbols (method: kbuild)");
 
     CLI11_PARSE(app, argc, argv);
 
     project_dir = std::filesystem::canonical(project_dir).string();
 
-    Indexer indexer(project_name, project_dir, project_dir, threads, include_git_files, show_progress);
+    Indexer indexer(project_name, project_dir, project_dir, threads, include_git_files, show_progress, modules_method);
     indexer.run();
     indexer.write(output_path);
     return 0;
