@@ -308,17 +308,29 @@ INSTANTIATE_TEST_SUITE_P(
             {"main.c"},
             {
                 {"COLORS_H", GLOBAL, MACRO},
-                {"GREEN", GLOBAL, DATA},
-                {"RED", GLOBAL, DATA},
                 {"color", GLOBAL, TYPE},
+                {"color.BLUE", GLOBAL, FIELD},
+                {"color.GREEN", GLOBAL, FIELD},
+                {"color.RED", GLOBAL, FIELD},
                 {"colors.h", GLOBAL, FILETYPE},
                 {"main.c", GLOBAL, FILETYPE},
                 {"pick_color", GLOBAL, FUNCTION},
             },
             {
                 {"main.c", "color", 52, 57},
-                {"main.c", "RED", 62, 65},
-                {"main.c", "GREEN", 80, 85},
+                {"main.c", "color.GREEN", 80, 85},
+                {"main.c", "color.RED", 62, 65},
+            },
+            // instances — validates enum constant FIELD definitions at correct offsets
+            {
+                {"colors.h", "COLORS_H", 1, 25, 33},
+                {"colors.h", "color", 1, 34, 65},
+                {"colors.h", "color.BLUE", 1, 59, 63},
+                {"colors.h", "color.GREEN", 1, 52, 57},
+                {"colors.h", "color.RED", 1, 47, 50},
+                {"colors.h", "colors.h", 7, 0, 74},
+                {"main.c", "main.c", 6, 0, 113},
+                {"main.c", "pick_color", 1, 20, 112},
             }
         },
         FixtureSpec{
@@ -415,23 +427,23 @@ INSTANTIATE_TEST_SUITE_P(
             "enum_in_switch",
             {"handler.c"},
             {
-                {"ERR_IO", GLOBAL, DATA},
-                {"ERR_MEM", GLOBAL, DATA},
-                {"OK", GLOBAL, DATA},
                 {"STATUS_H", GLOBAL, MACRO},
                 {"handle_status", GLOBAL, FUNCTION},
                 {"handler.c", GLOBAL, FILETYPE},
                 {"last_error", GLOBAL, DATA},
                 {"status", GLOBAL, TYPE},
+                {"status.ERR_IO", GLOBAL, FIELD},
+                {"status.ERR_MEM", GLOBAL, FIELD},
+                {"status.OK", GLOBAL, FIELD},
                 {"status.h", GLOBAL, FILETYPE},
             },
             {
                 {"handler.c", "status", 43, 49},
-                {"handler.c", "OK", 81, 83},
-                {"handler.c", "ERR_IO", 109, 115},
-                {"handler.c", "ERR_MEM", 137, 144},
+                {"handler.c", "status.ERR_IO", 109, 115},
+                {"handler.c", "status.ERR_IO", 218, 224},
+                {"handler.c", "status.ERR_MEM", 137, 144},
+                {"handler.c", "status.OK", 81, 83},
                 {"handler.c", "status", 198, 204},
-                {"handler.c", "ERR_IO", 218, 224},
                 {"status.h", "status", 94, 100},
             }
         },
@@ -443,7 +455,6 @@ INSTANTIATE_TEST_SUITE_P(
                 {"DEFINE_HANDLER", GLOBAL, MACRO},
                 {"MACROS_H", GLOBAL, MACRO},
                 {"RESULT", GLOBAL, MACRO},
-                {"S_OK", GLOBAL, DATA},
                 {"get_result", GLOBAL, FUNCTION},
                 {"handle_close", GLOBAL, FUNCTION},
                 {"handle_open", GLOBAL, FUNCTION},
@@ -451,14 +462,16 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", GLOBAL, FILETYPE},
                 {"result", GLOBAL, TYPE},
                 {"status", GLOBAL, TYPE},
+                {"status.S_ERR", GLOBAL, FIELD},
+                {"status.S_OK", GLOBAL, FIELD},
             },
             {
-                {"macros.h", "S_OK", 411, 415},
                 {"macros.h", "result", 321, 327},
+                {"macros.h", "status.S_OK", 411, 415},
                 // Expansion-site refs: clamped to macro name width
-                {"main.c", "S_OK", 325, 339},
                 {"main.c", "result", 272, 278},
                 {"main.c", "result", 302, 308},
+                {"main.c", "status.S_OK", 325, 339},
             }
         },
         FixtureSpec{
@@ -496,8 +509,6 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "ALL_TYPES"},
                 {"types.h", "ONE_TYPE"},
                 {"types.h", "TYPES_H"},
-                {"types.h", "any_type"},
-                {"types.h", "any_type"},
                 {"types.h", "any_type"},
                 {"types.h", "types.h"},
             }
@@ -548,8 +559,6 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "beta"},
                 {"types.h", "types.h"},
                 {"types.h", "wrapper"},
-                {"types.h", "wrapper"},
-                {"types.h", "wrapper"},
             }
         },
         FixtureSpec{
@@ -580,10 +589,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"b.c", "make_pair"},
                 {"types.h", "TYPES_H"},
                 {"types.h", "pair"},
-                {"types.h", "pair"},
                 {"types.h", "pair_t"},
-                {"types.h", "result_t"},
-                {"types.h", "result_t"},
                 {"types.h", "result_t"},
                 {"types.h", "types.h"},
             }
@@ -823,6 +829,43 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "main.c", 6},
                 // Expansion instance clamped to macro name (not full call)
                 {"main.c", "some_macro", 3, 56, 66},
+            }
+        },
+        // Validates fallback logic for anonymous/typedef enums vs named enums.
+        // Anonymous and typedef-with-unnamed-inner enums produce DATA symbols;
+        // named enums produce FIELD symbols with compound names.
+        FixtureSpec{
+            "enum_anonymous",
+            {"main.c"},
+            {
+                {"ANON_A", GLOBAL, DATA},
+                {"main.c", GLOBAL, FILETYPE},
+                {"named", GLOBAL, TYPE},
+                {"named.N_ONE", GLOBAL, FIELD},
+                {"named.N_TWO", GLOBAL, FIELD},
+                {"td_enum", GLOBAL, TYPE},
+                {"td_enum.TD_X", GLOBAL, FIELD},
+                {"td_enum.TD_Y", GLOBAL, FIELD},
+                {"use_enums", GLOBAL, FUNCTION},
+            },
+            {
+                {"main.c", "ANON_A", 305, 311},
+                {"main.c", "named", 344, 349},
+                {"main.c", "named.N_ONE", 354, 359},
+                {"main.c", "td_enum", 317, 324},
+                {"main.c", "td_enum.TD_X", 329, 333},
+            },
+            // instances — validates FIELD definitions for named/typedef enums,
+            // and absence of FIELD definitions for anonymous enum constants
+            {
+                {"main.c", "main.c", 6, 0, 385},
+                {"main.c", "named", 1, 241, 268},
+                {"main.c", "named.N_ONE", 1, 254, 259},
+                {"main.c", "named.N_TWO", 1, 261, 266},
+                {"main.c", "td_enum", 1, 148, 183},
+                {"main.c", "td_enum.TD_X", 1, 163, 167},
+                {"main.c", "td_enum.TD_Y", 1, 169, 173},
+                {"main.c", "use_enums", 1, 271, 384},
             }
         }
     ),

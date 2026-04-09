@@ -74,4 +74,10 @@ private:
     void addRef(CXCursor cursor, int64_t sym_id, unsigned name_len);
     void insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t end);
     void addDocComment(CXCursor cursor, int64_t sym_id, size_t file_idx);
+    void indexChildField(CXCursor child, CXCursorKind expected_parent_kind);
+
+    // Names of types whose hoisted EnumDecl/StructDecl/UnionDecl should skip
+    // TYPE instance creation because a TypedefDecl already covers it.
+    std::unordered_set<std::string> typedef_type_names_;
+    void collectTypedefTypes(CXTranslationUnit tu);
 };

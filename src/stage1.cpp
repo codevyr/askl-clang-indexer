@@ -103,6 +103,43 @@ void Stage1::collectMacros(CXTranslationUnit tu) {
     clang_visitChildren(root, macroVisitor, this);
 }
 
+void Stage1::collectTypedefTypes(CXTranslationUnit tu) {
+    CXCursor root = clang_getTranslationUnitCursor(tu);
+    clang_visitChildren(root, [](CXCursor cursor, CXCursor, CXClientData data) {
+        if (clang_getCursorKind(cursor) != CXCursor_TypedefDecl)
+            return CXChildVisit_Continue;
+        CXType underlying = clang_getTypedefDeclUnderlyingType(cursor);
+        CXCursor type_decl = clang_getTypeDeclaration(underlying);
+        CXCursorKind tk = clang_getCursorKind(type_decl);
+        if (tk != CXCursor_EnumDecl && tk != CXCursor_StructDecl && tk != CXCursor_UnionDecl)
+            return CXChildVisit_Continue;
+        ClangString typedef_name(clang_getCursorSpelling(cursor));
+        ClangString type_name(clang_getCursorSpelling(type_decl));
+        std::string tn = typedef_name.to_string();
+        if (!tn.empty() && tn == type_name.to_string())
+            static_cast<Stage1*>(data)->typedef_type_names_.insert(tn);
+        return CXChildVisit_Continue;
+    }, this);
+}
+
+// Index a child cursor (FieldDecl or EnumConstantDecl) as a FIELD symbol
+// with a compound name "parent.child".  Shared by struct field and enum
+// constant visitors.
+void Stage1::indexChildField(CXCursor child, CXCursorKind expected_parent_kind) {
+    std::string compound_name = resolveCompoundName(child, expected_parent_kind);
+    if (compound_name.empty()) return;
+
+    auto [sym_id, _] = symbols_.getOrCreate(compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
+
+    CXFile file;
+    unsigned start, end;
+    if (getExpansionRange(child, file, start, end)) {
+        size_t fi = getOrCreateFile(file);
+        result_.files[fi].instances.push_back(
+            {sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION});
+    }
+}
+
 // Create a ref at the spelling location.  When the cursor is inside a macro
 // expansion and the spelling location is in a different file than the
 // expansion location, also create a ref at the expansion site.  This ensures
@@ -207,43 +244,57 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
     case CXCursor_UnionDecl:
     case CXCursor_EnumDecl:
     case CXCursor_TypedefDecl: {
+        // Skip type decls that are children of a TypedefDecl — clang visits
+        // them both as hoisted TU children and as TypedefDecl children during
+        // recursion, which would create duplicate instances.
+        if (kind != CXCursor_TypedefDecl &&
+            clang_getCursorKind(parent) == CXCursor_TypedefDecl) break;
+
+        // Decide whether to skip TYPE symbol/instance creation:
+        // - Anonymous enums: synthetic name (e.g. "enum (unnamed at ...)") is useless
+        // - Hoisted typedef types: the TypedefDecl already creates the TYPE instance
+        // In both cases, still fall through to index child fields below.
+        bool skip_type = false;
+        if (kind == CXCursor_EnumDecl && clang_Cursor_isAnonymous(cursor))
+            skip_type = true;
+
         ClangString name(clang_getCursorSpelling(cursor));
         std::string sname = name.to_string();
         if (sname.empty()) break;
 
-        auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
-        int inst_type = clang_isCursorDefinition(cursor) ? INSTTYPE_DEFINITION : INSTTYPE_DECLARATION;
+        if (kind != CXCursor_TypedefDecl && typedef_type_names_.count(sname))
+            skip_type = true;
 
-        CXFile range_file;
-        unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off)) {
-            size_t fi = getOrCreateFile(range_file);
-            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
-            addDocComment(cursor, sym_id, fi);
+        if (!skip_type) {
+            auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
+            int inst_type = clang_isCursorDefinition(cursor) ? INSTTYPE_DEFINITION : INSTTYPE_DECLARATION;
+
+            CXFile range_file;
+            unsigned start_off, end_off;
+            if (getExpansionRange(cursor, range_file, start_off, end_off)) {
+                size_t fi = getOrCreateFile(range_file);
+                result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
+                addDocComment(cursor, sym_id, fi);
+            }
         }
 
-        // Index function pointer fields as Field symbols
+        // Index children as FIELD symbols with compound "parent.child" names.
+        // Struct fields: only function-pointer fields (for call-graph analysis).
+        // Enum constants: all constants (they are the enum's "members").
         if (kind == CXCursor_StructDecl) {
             clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
-                auto* self = static_cast<Stage1*>(data);
                 if (clang_getCursorKind(child) != CXCursor_FieldDecl)
                     return CXChildVisit_Continue;
                 if (!isFunctionPointerType(clang_getCursorType(child)))
                     return CXChildVisit_Continue;
-
-                std::string compound_name = resolveFieldCompoundName(child);
-                if (compound_name.empty()) return CXChildVisit_Continue;
-
-                auto [field_sym_id, _] = self->symbols_.getOrCreate(
-                    compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
-
-                CXFile field_file;
-                unsigned field_start, field_end;
-                if (getExpansionRange(child, field_file, field_start, field_end)) {
-                    size_t fi = self->getOrCreateFile(field_file);
-                    self->result_.files[fi].instances.push_back(
-                        {field_sym_id, static_cast<int32_t>(field_start), static_cast<int32_t>(field_end), INSTTYPE_DEFINITION});
-                }
+                static_cast<Stage1*>(data)->indexChildField(child, CXCursor_StructDecl);
+                return CXChildVisit_Continue;
+            }, this);
+        } else if (kind == CXCursor_EnumDecl) {
+            clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
+                if (clang_getCursorKind(child) != CXCursor_EnumConstantDecl)
+                    return CXChildVisit_Continue;
+                static_cast<Stage1*>(data)->indexChildField(child, CXCursor_EnumDecl);
                 return CXChildVisit_Continue;
             }, this);
         }
@@ -288,21 +339,30 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         CXCursorKind ref_kind = clang_getCursorKind(referenced);
 
-        // Only handle file-scope VarDecl and EnumConstantDecl.
-        // ParmDecl, FunctionDecl (handled by CallExpr/Stage2), and others are skipped.
-        if (ref_kind == CXCursor_VarDecl) {
+        if (ref_kind == CXCursor_EnumConstantDecl) {
+            ClangString ref_name(clang_getCursorSpelling(referenced));
+            std::string sname = ref_name.to_string();
+            if (sname.empty()) break;
+
+            std::string compound_name = resolveCompoundName(referenced, CXCursor_EnumDecl);
+            if (!compound_name.empty()) {
+                auto [sym_id, _] = symbols_.getOrCreate(compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
+                addRef(cursor, sym_id, sname.size());
+            } else {
+                int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_DATA);
+                addRef(cursor, sym_id, sname.size());
+            }
+        } else if (ref_kind == CXCursor_VarDecl) {
             CXCursor ref_parent = clang_getCursorSemanticParent(referenced);
             if (clang_getCursorKind(ref_parent) != CXCursor_TranslationUnit) break;
-        } else if (ref_kind != CXCursor_EnumConstantDecl) {
-            break;
+
+            ClangString ref_name(clang_getCursorSpelling(referenced));
+            std::string sname = ref_name.to_string();
+            if (sname.empty()) break;
+
+            int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_DATA);
+            addRef(cursor, sym_id, sname.size());
         }
-
-        ClangString ref_name(clang_getCursorSpelling(referenced));
-        std::string sname = ref_name.to_string();
-        if (sname.empty()) break;
-
-        int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_DATA);
-        addRef(cursor, sym_id, sname.size());
         break;
     }
     case CXCursor_TypeRef: {
@@ -326,7 +386,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (clang_getCursorKind(referenced) != CXCursor_FieldDecl) break;
         if (!isFunctionPointerType(clang_getCursorType(referenced))) break;
 
-        std::string compound_name = resolveFieldCompoundName(referenced);
+        std::string compound_name = resolveCompoundName(referenced, CXCursor_StructDecl);
         if (compound_name.empty()) break;
 
         // Extract just the field name for the ref span length
@@ -360,6 +420,9 @@ void Stage1::process(CXTranslationUnit tu, const std::string& tu_filename) {
 
     // Collect macro definitions and expansions (requires DetailedPreprocessingRecord)
     collectMacros(tu);
+
+    // Pre-scan for typedef'd types to avoid duplicate TYPE instances
+    collectTypedefTypes(tu);
 
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, visitor, this);

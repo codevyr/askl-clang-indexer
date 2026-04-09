@@ -15,18 +15,20 @@ inline bool isFunctionPointerType(CXType t) {
     return pointee.kind == CXType_FunctionProto || pointee.kind == CXType_FunctionNoProto;
 }
 
-// Resolve a FieldDecl cursor to its compound name "struct_name.field_name".
-// Returns empty string on failure (null cursor, non-struct parent, or empty names).
-inline std::string resolveFieldCompoundName(CXCursor field_decl) {
-    CXCursor parent = clang_getCursorSemanticParent(field_decl);
-    if (clang_getCursorKind(parent) != CXCursor_StructDecl) return "";
-    ClangString sn(clang_getCursorSpelling(parent));
-    std::string struct_name = sn.to_string();
-    if (struct_name.empty()) return "";
-    ClangString fn(clang_getCursorSpelling(field_decl));
-    std::string field_name = fn.to_string();
-    if (field_name.empty()) return "";
-    return struct_name + "." + field_name;
+// Resolve a child cursor (FieldDecl or EnumConstantDecl) to a compound name
+// "parent_name.child_name".  Returns empty string when the parent kind doesn't
+// match, the parent is anonymous (enum-only), or either name is empty.
+inline std::string resolveCompoundName(CXCursor child, CXCursorKind expected_parent_kind) {
+    CXCursor parent = clang_getCursorSemanticParent(child);
+    if (clang_getCursorKind(parent) != expected_parent_kind) return "";
+    if (expected_parent_kind == CXCursor_EnumDecl && clang_Cursor_isAnonymous(parent)) return "";
+    ClangString pn(clang_getCursorSpelling(parent));
+    std::string parent_name = pn.to_string();
+    if (parent_name.empty()) return "";
+    ClangString cn(clang_getCursorSpelling(child));
+    std::string child_name = cn.to_string();
+    if (child_name.empty()) return "";
+    return parent_name + "." + child_name;
 }
 
 // Canonicalize a path from clang_getFileName (resolve relative paths to absolute,
