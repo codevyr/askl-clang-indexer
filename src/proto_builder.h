@@ -7,8 +7,9 @@ class SymbolTable;
 struct FileData;
 
 struct BuildResult {
-    std::string project_data;                  // Serialized Project (hash-only Objects)
-    std::vector<std::string> content_batches;  // Serialized ContentBatch messages
+    bool content_inlined;                      // true = content inlined in Objects, no ContentBatch files
+    std::string project_data;                  // Serialized Project
+    std::vector<std::string> content_batches;  // Empty when content_inlined
 };
 
 class ProtoBuilder {

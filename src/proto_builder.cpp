@@ -150,34 +150,51 @@ BuildResult ProtoBuilder::build(
         inst->set_end_offset(static_cast<int32_t>(content_entries[i].second->size()));
     }
 
-    // Build result
-    BuildResult result;
-    project.SerializeToString(&result.project_data);
-
-    // Build ContentBatch messages, splitting when batch exceeds threshold
-    askl::index::ContentBatch current_batch;
-    size_t current_batch_size = 0;
-
+    // Decide whether to inline content into Objects or use separate ContentBatch files
+    size_t total_content_size = 0;
     for (auto& [hash, content_ptr] : content_entries) {
-        auto* oc = current_batch.add_contents();
-        oc->set_content_hash(hash);
-        oc->set_content(content_ptr->data(), content_ptr->size());
-        current_batch_size += content_ptr->size();
+        total_content_size += content_ptr->size();
+    }
 
-        if (current_batch_size >= CONTENT_BATCH_MAX_BYTES) {
+    BuildResult result;
+
+    if (total_content_size < CONTENT_BATCH_MAX_BYTES) {
+        // Content-inlined mode: set content on each file Object, keep content_hash
+        for (int i = 0; i < file_object_count; ++i) {
+            auto* obj = project.mutable_objects(i);
+            obj->set_content(content_entries[i].second->data(), content_entries[i].second->size());
+        }
+        result.content_inlined = true;
+        project.SerializeToString(&result.project_data);
+    } else {
+        // Multi-file mode: keep content_hash set, build ContentBatch messages
+        result.content_inlined = false;
+        project.SerializeToString(&result.project_data);
+
+        askl::index::ContentBatch current_batch;
+        size_t current_batch_size = 0;
+
+        for (auto& [hash, content_ptr] : content_entries) {
+            auto* oc = current_batch.add_contents();
+            oc->set_content_hash(hash);
+            oc->set_content(content_ptr->data(), content_ptr->size());
+            current_batch_size += content_ptr->size();
+
+            if (current_batch_size >= CONTENT_BATCH_MAX_BYTES) {
+                std::string batch_data;
+                current_batch.SerializeToString(&batch_data);
+                result.content_batches.push_back(std::move(batch_data));
+                current_batch.Clear();
+                current_batch_size = 0;
+            }
+        }
+
+        // Flush remaining entries
+        if (current_batch.contents_size() > 0) {
             std::string batch_data;
             current_batch.SerializeToString(&batch_data);
             result.content_batches.push_back(std::move(batch_data));
-            current_batch.Clear();
-            current_batch_size = 0;
         }
-    }
-
-    // Flush remaining entries
-    if (current_batch.contents_size() > 0) {
-        std::string batch_data;
-        current_batch.SerializeToString(&batch_data);
-        result.content_batches.push_back(std::move(batch_data));
     }
 
     return result;

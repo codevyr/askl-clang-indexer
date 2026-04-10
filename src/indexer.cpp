@@ -377,19 +377,30 @@ void Indexer::write(const std::string& output_dir) {
 
     std::filesystem::create_directories(output_dir);
 
+    // Remove stale contents-*.pb from prior runs
+    for (auto& entry : std::filesystem::directory_iterator(output_dir)) {
+        auto fname = entry.path().filename().string();
+        if (fname.rfind("contents-", 0) == 0 && fname.size() > 3 && fname.compare(fname.size() - 3, 3, ".pb") == 0) {
+            std::filesystem::remove(entry.path());
+        }
+    }
+
     // Write project.pb
     std::string project_path = output_dir + "/project.pb";
     write_file(project_path, result.project_data);
-    fprintf(stderr, "Wrote %s (%s)\n", project_path.c_str(),
-            human_size(result.project_data.size()).c_str());
+    fprintf(stderr, "Wrote %s (%s, content %s)\n", project_path.c_str(),
+            human_size(result.project_data.size()).c_str(),
+            result.content_inlined ? "inlined" : "in batch files");
 
-    // Write contents-NNNN.pb
-    for (size_t i = 0; i < result.content_batches.size(); ++i) {
-        char name[64];
-        snprintf(name, sizeof(name), "contents-%04zu.pb", i + 1);
-        std::string batch_path = output_dir + "/" + name;
-        write_file(batch_path, result.content_batches[i]);
-        fprintf(stderr, "Wrote %s (%s)\n", batch_path.c_str(),
-                human_size(result.content_batches[i].size()).c_str());
+    // Write contents-NNNN.pb only when content is NOT inlined
+    if (!result.content_inlined) {
+        for (size_t i = 0; i < result.content_batches.size(); ++i) {
+            char name[64];
+            snprintf(name, sizeof(name), "contents-%04zu.pb", i + 1);
+            std::string batch_path = output_dir + "/" + name;
+            write_file(batch_path, result.content_batches[i]);
+            fprintf(stderr, "Wrote %s (%s)\n", batch_path.c_str(),
+                    human_size(result.content_batches[i].size()).c_str());
+        }
     }
 }
