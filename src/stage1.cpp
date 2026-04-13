@@ -278,9 +278,10 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             }
         }
 
-        // Index children as FIELD symbols with compound "parent.child" names.
-        // Struct fields: only function-pointer fields (for call-graph analysis).
-        // Enum constants: all constants (they are the enum's "members").
+        // Index struct fields as FIELD symbols with compound "parent.child" names
+        // (only function-pointer fields, for call-graph analysis).
+        // Enum constants are indexed as standalone DATA symbols — in C they
+        // live in the global namespace regardless of whether the enum is named.
         if (kind == CXCursor_StructDecl) {
             clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
                 if (clang_getCursorKind(child) != CXCursor_FieldDecl)
@@ -294,7 +295,18 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
                 if (clang_getCursorKind(child) != CXCursor_EnumConstantDecl)
                     return CXChildVisit_Continue;
-                static_cast<Stage1*>(data)->indexChildField(child, CXCursor_EnumDecl);
+                auto* self = static_cast<Stage1*>(data);
+                ClangString name(clang_getCursorSpelling(child));
+                std::string sname = name.to_string();
+                if (sname.empty()) return CXChildVisit_Continue;
+                auto [sym_id, _] = self->symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_DATA);
+                CXFile file;
+                unsigned start, end;
+                if (getExpansionRange(child, file, start, end)) {
+                    size_t fi = self->getOrCreateFile(file);
+                    self->result_.files[fi].instances.push_back(
+                        {sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION});
+                }
                 return CXChildVisit_Continue;
             }, this);
         }
@@ -344,14 +356,8 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             std::string sname = ref_name.to_string();
             if (sname.empty()) break;
 
-            std::string compound_name = resolveCompoundName(referenced, CXCursor_EnumDecl);
-            if (!compound_name.empty()) {
-                auto [sym_id, _] = symbols_.getOrCreate(compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
-                addRef(cursor, sym_id, sname.size());
-            } else {
-                int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_DATA);
-                addRef(cursor, sym_id, sname.size());
-            }
+            auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_DATA);
+            addRef(cursor, sym_id, sname.size());
         } else if (ref_kind == CXCursor_VarDecl) {
             CXCursor ref_parent = clang_getCursorSemanticParent(referenced);
             if (clang_getCursorKind(ref_parent) != CXCursor_TranslationUnit) break;
