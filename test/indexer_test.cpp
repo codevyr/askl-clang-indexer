@@ -870,6 +870,39 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "td_enum.TD_Y", 1, 169, 173},
                 {"main.c", "use_enums", 1, 271, 384},
             }
+        },
+        // Validates that typedef'd function pointers in struct fields are
+        // recognized as FIELD symbols (requires resolving typedefs via
+        // clang_getCanonicalType before checking for pointer-to-function).
+        FixtureSpec{
+            "typedef_func_ptr",
+            {"main.c"},
+            {
+                {"OPS_H", GLOBAL, MACRO},
+                {"default_ops", LOCAL, DATA},
+                {"iface_ops", GLOBAL, TYPE},
+                {"iface_ops.read", GLOBAL, FIELD},
+                {"iface_ops.write", GLOBAL, FIELD},
+                {"main.c", GLOBAL, FILETYPE},
+                {"my_read", LOCAL, FUNCTION},
+                {"my_write", LOCAL, FUNCTION},
+                {"ops.h", GLOBAL, FILETYPE},
+                {"read_func_t", GLOBAL, TYPE},
+                {"use", GLOBAL, FUNCTION},
+                {"write_func_t", GLOBAL, TYPE},
+            },
+            {
+                {"main.c", "iface_ops", 170, 179},
+                {"main.c", "iface_ops", 276, 285},
+                {"main.c", "iface_ops.read", 298, 307},     // MemberRefExpr: ops->read(...)
+                {"main.c", "iface_ops.write", 322, 332},    // MemberRefExpr: ops->write(...)
+                {"main.c", "my_read", 200, 215},
+                {"main.c", "my_write", 221, 238},
+                {"ops.h", "my_read", 174, 191},              // field impl ref
+                {"ops.h", "my_write", 197, 215},             // field impl ref
+                {"ops.h", "read_func_t", 174, 185},          // TypeRef in field decl
+                {"ops.h", "write_func_t", 197, 209},         // TypeRef in field decl
+            },
         }
     ),
     [](const testing::TestParamInfo<FixtureSpec>& info) {
@@ -913,6 +946,89 @@ TEST(AbsolutePaths, RelativeIncludePath) {
             << "filesystem_path is not absolute: \"" << file.filesystem_path
             << "\" for object " << file.object_local_id;
     }
+}
+
+// --- Symlink deduplication test ---
+// When two TUs include the same header through different paths (one via a
+// symlink), clang_getFileName returns the path that was used to find the file
+// — producing two different names for the same physical file.  The indexer
+// must resolve both to the same canonical (real) path so the header appears
+// exactly once.  This is the root cause of the OMPI tree-view bug where
+// headers appeared under multiple bogus directories.
+TEST(AbsolutePaths, SymlinkIncludeDedup) {
+    TempDir temp_dir = makeTempDir();
+    ASSERT_FALSE(temp_dir.path.empty());
+
+    std::string project = temp_dir.path + "/project";
+    fs::create_directories(project + "/lib");
+
+    // helper.h — a small header declaring one function
+    {
+        std::ofstream out(project + "/lib/helper.h");
+        out << "#ifndef HELPER_H\n#define HELPER_H\n"
+            << "int helper_fn(int x);\n"
+            << "#endif\n";
+    }
+
+    // Create a symlink: project/alt -> project/lib
+    fs::create_directory_symlink(project + "/lib", project + "/alt");
+
+    // a.c includes helper.h through the real path (-I lib)
+    {
+        std::ofstream out(project + "/a.c");
+        out << "#include \"helper.h\"\n"
+            << "int a(void) { return helper_fn(1); }\n";
+    }
+
+    // b.c includes the same helper.h through the symlink (-I alt)
+    {
+        std::ofstream out(project + "/b.c");
+        out << "#include \"helper.h\"\n"
+            << "int b(void) { return helper_fn(2); }\n";
+    }
+
+    // Write compile_commands.json — two TUs with different -I paths
+    {
+        std::ofstream out(temp_dir.path + "/compile_commands.json");
+        out << "[\n"
+            << "  {\n"
+            << "    \"directory\": \"" << project << "\",\n"
+            << "    \"command\": \"cc -c -Ilib a.c -o a.o\",\n"
+            << "    \"file\": \"" << project << "/a.c\"\n"
+            << "  },\n"
+            << "  {\n"
+            << "    \"directory\": \"" << project << "\",\n"
+            << "    \"command\": \"cc -c -Ialt b.c -o b.o\",\n"
+            << "    \"file\": \"" << project << "/b.c\"\n"
+            << "  }\n"
+            << "]\n";
+    }
+
+    Indexer indexer("test", temp_dir.path, project, 1);
+    indexer.run();
+
+    // Collect all file paths
+    std::vector<std::string> paths;
+    for (auto& file : indexer.allFiles()) {
+        paths.push_back(file.filesystem_path);
+    }
+    std::sort(paths.begin(), paths.end());
+
+    // helper.h must appear exactly once, via its real path (through lib/, not alt/)
+    std::string real_helper = project + "/lib/helper.h";
+    std::vector<std::string> helper_paths;
+    for (auto& p : paths) {
+        if (p.find("helper.h") != std::string::npos)
+            helper_paths.push_back(p);
+    }
+    ASSERT_EQ(helper_paths.size(), 1u)
+        << "helper.h should appear exactly once; got " << helper_paths.size() << ":";
+    EXPECT_EQ(helper_paths[0], real_helper);
+
+    // The symlink path must NOT appear
+    std::string symlink_helper = project + "/alt/helper.h";
+    EXPECT_EQ(std::count(paths.begin(), paths.end(), symlink_helper), 0)
+        << "symlink path " << symlink_helper << " should not appear in file list";
 }
 
 // --- canonicalizePath tests ---

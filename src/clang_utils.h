@@ -8,10 +8,12 @@
 #include <filesystem>
 #include <string>
 
-// Check if a CXType is a pointer to a function (CXType_FunctionProto or CXType_FunctionNoProto)
+// Check if a CXType is a pointer to a function (CXType_FunctionProto or CXType_FunctionNoProto).
+// Resolves through typedefs so that e.g. `typedef void (*func_t)(void);` fields are recognized.
 inline bool isFunctionPointerType(CXType t) {
-    if (t.kind != CXType_Pointer) return false;
-    CXType pointee = clang_getPointeeType(t);
+    CXType canonical = clang_getCanonicalType(t);
+    if (canonical.kind != CXType_Pointer) return false;
+    CXType pointee = clang_getPointeeType(canonical);
     return pointee.kind == CXType_FunctionProto || pointee.kind == CXType_FunctionNoProto;
 }
 
@@ -46,8 +48,17 @@ inline std::string canonicalizePath(const std::string& path) {
     return std::filesystem::path(path).lexically_normal().string();
 }
 
-// Get the canonical path for a CXFile
+// Get the canonical path for a CXFile.
+// Prefer clang_File_tryGetRealPathName which returns the OS-resolved real path
+// (follows symlinks, resolves the actual location on disk).  This gives a
+// consistent canonical path regardless of which -I include path was used to
+// find the file.  Fall back to clang_getFileName + canonicalizePath when the
+// real-path API returns an empty string.
 inline std::string getCanonicalPath(CXFile file) {
+    ClangString real(clang_File_tryGetRealPathName(file));
+    std::string real_path = real.to_string();
+    if (!real_path.empty())
+        return real_path;
     ClangString name(clang_getFileName(file));
     return canonicalizePath(name.to_string());
 }
