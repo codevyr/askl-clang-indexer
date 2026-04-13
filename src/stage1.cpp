@@ -122,11 +122,10 @@ void Stage1::collectTypedefTypes(CXTranslationUnit tu) {
     }, this);
 }
 
-// Index a child cursor (FieldDecl or EnumConstantDecl) as a FIELD symbol
-// with a compound name "parent.child".  Shared by struct field and enum
-// constant visitors.
-void Stage1::indexChildField(CXCursor child, CXCursorKind expected_parent_kind) {
-    std::string compound_name = resolveCompoundName(child, expected_parent_kind);
+// Index a FieldDecl child cursor as a FIELD symbol with a compound name
+// "parent.child".  Used for struct and union field visitors.
+void Stage1::indexChildField(CXCursor child) {
+    std::string compound_name = resolveFieldCompoundName(child);
     if (compound_name.empty()) return;
 
     auto [sym_id, _] = symbols_.getOrCreate(compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
@@ -278,17 +277,14 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             }
         }
 
-        // Index struct fields as FIELD symbols with compound "parent.child" names
-        // (only function-pointer fields, for call-graph analysis).
+        // Index struct/union fields as FIELD symbols with compound "parent.child" names.
         // Enum constants are indexed as standalone DATA symbols — in C they
         // live in the global namespace regardless of whether the enum is named.
-        if (kind == CXCursor_StructDecl) {
+        if (kind == CXCursor_StructDecl || kind == CXCursor_UnionDecl) {
             clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
                 if (clang_getCursorKind(child) != CXCursor_FieldDecl)
                     return CXChildVisit_Continue;
-                if (!isFunctionPointerType(clang_getCursorType(child)))
-                    return CXChildVisit_Continue;
-                static_cast<Stage1*>(data)->indexChildField(child, CXCursor_StructDecl);
+                static_cast<Stage1*>(data)->indexChildField(child);
                 return CXChildVisit_Continue;
             }, this);
         } else if (kind == CXCursor_EnumDecl) {
@@ -390,9 +386,8 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         CXCursor referenced = clang_getCursorReferenced(cursor);
         if (clang_Cursor_isNull(referenced)) break;
         if (clang_getCursorKind(referenced) != CXCursor_FieldDecl) break;
-        if (!isFunctionPointerType(clang_getCursorType(referenced))) break;
 
-        std::string compound_name = resolveCompoundName(referenced, CXCursor_StructDecl);
+        std::string compound_name = resolveFieldCompoundName(referenced);
         if (compound_name.empty()) break;
 
         // Extract just the field name for the ref span length

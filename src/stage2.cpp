@@ -68,7 +68,7 @@ void Stage2::addFieldImplRef(CXCursor member_ref, CXCursor func_ref) {
     CXCursor field_decl = clang_getCursorReferenced(member_ref);
     if (clang_Cursor_isNull(field_decl)) return;
     if (clang_getCursorKind(field_decl) != CXCursor_FieldDecl) return;
-    if (resolveCompoundName(field_decl, CXCursor_StructDecl).empty()) return;
+    if (resolveFieldCompoundName(field_decl).empty()) return;
 
     // Get the field declaration's location (in the header)
     CXFile field_file;

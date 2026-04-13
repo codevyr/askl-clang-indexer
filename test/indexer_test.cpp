@@ -272,6 +272,8 @@ INSTANTIATE_TEST_SUITE_P(
             {
                 {"OPS_H", GLOBAL, MACRO},
                 {"container", GLOBAL, TYPE},
+                {"container.data", GLOBAL, FIELD},
+                {"container.ops", GLOBAL, FIELD},
                 {"default_ops", LOCAL, DATA},
                 {"file_ops", GLOBAL, TYPE},
                 {"file_ops.read", GLOBAL, FIELD},
@@ -345,12 +347,16 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", GLOBAL, FILETYPE},
                 {"make_point", GLOBAL, FUNCTION},
                 {"point", GLOBAL, TYPE},
+                {"point.x", GLOBAL, FIELD},
+                {"point.y", GLOBAL, FIELD},
                 {"point_t", GLOBAL, TYPE},
                 {"types.h", GLOBAL, FILETYPE},
             },
             {
-                {"main.c", "point_t", 19, 26},
                 {"main.c", "handle", 38, 44},
+                {"main.c", "point.x", 69, 72},
+                {"main.c", "point.y", 82, 85},
+                {"main.c", "point_t", 19, 26},
                 {"main.c", "point_t", 54, 61},
                 {"types.h", "point", 79, 84},
             }
@@ -362,9 +368,12 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", GLOBAL, FILETYPE},
                 {"set_int", GLOBAL, FUNCTION},
                 {"value", GLOBAL, TYPE},
+                {"value.f", GLOBAL, FIELD},
+                {"value.i", GLOBAL, FIELD},
             },
             {
                 {"main.c", "value", 52, 57},
+                {"main.c", "value.i", 71, 75},
             }
         },
         FixtureSpec{
@@ -410,8 +419,12 @@ INSTANTIATE_TEST_SUITE_P(
             {
                 {"TYPES_H", GLOBAL, MACRO},
                 {"list", GLOBAL, TYPE},
+                {"list.head", GLOBAL, FIELD},
+                {"list.length", GLOBAL, FIELD},
                 {"main.c", GLOBAL, FILETYPE},
                 {"node", GLOBAL, TYPE},
+                {"node.next", GLOBAL, FIELD},
+                {"node.value", GLOBAL, FIELD},
                 {"node_ptr", GLOBAL, TYPE},
                 {"node_t", GLOBAL, TYPE},
                 {"push", GLOBAL, FUNCTION},
@@ -466,6 +479,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"macros.h", GLOBAL, FILETYPE},
                 {"main.c", GLOBAL, FILETYPE},
                 {"result", GLOBAL, TYPE},
+                {"result.code", GLOBAL, FIELD},
                 {"status", GLOBAL, TYPE},
             },
             {
@@ -474,6 +488,7 @@ INSTANTIATE_TEST_SUITE_P(
                 // Expansion-site refs: clamped to macro name width
                 {"main.c", "result", 272, 278},
                 {"main.c", "result", 302, 308},
+                {"main.c", "result.code", 316, 322},
                 {"main.c", "S_OK", 325, 339},
             }
         },
@@ -485,6 +500,9 @@ INSTANTIATE_TEST_SUITE_P(
                 {"ONE_TYPE", GLOBAL, MACRO},
                 {"TYPES_H", GLOBAL, MACRO},
                 {"any_type", GLOBAL, TYPE},
+                {"any_type.__type_a__", GLOBAL, FIELD},
+                {"any_type.__type_b__", GLOBAL, FIELD},
+                {"any_type.__type_c__", GLOBAL, FIELD},
                 {"main.c", GLOBAL, FILETYPE},
                 {"type_a", GLOBAL, TYPE},
                 {"type_b", GLOBAL, TYPE},
@@ -513,6 +531,9 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "ONE_TYPE"},
                 {"types.h", "TYPES_H"},
                 {"types.h", "any_type"},
+                {"types.h", "any_type.__type_a__"},
+                {"types.h", "any_type.__type_b__"},
+                {"types.h", "any_type.__type_c__"},
                 {"types.h", "types.h"},
             }
         },
@@ -531,10 +552,12 @@ INSTANTIATE_TEST_SUITE_P(
                 {"TYPES_H", GLOBAL, MACRO},
                 {"alpha", GLOBAL, TYPE},
                 {"beta", GLOBAL, TYPE},
+                {"beta.value", GLOBAL, FIELD},
                 {"main.c", GLOBAL, FILETYPE},
                 {"types.h", GLOBAL, FILETYPE},
                 {"use_types", GLOBAL, FUNCTION},
                 {"wrapper", GLOBAL, TYPE},
+                {"wrapper.alpha_ptr", GLOBAL, FIELD},
                 {"x", GLOBAL, DATA},
             },
             {
@@ -560,8 +583,10 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "ONE_STRUCT"},
                 {"types.h", "TYPES_H"},
                 {"types.h", "beta"},
+                {"types.h", "beta.value"},
                 {"types.h", "types.h"},
                 {"types.h", "wrapper"},
+                {"types.h", "wrapper.alpha_ptr"},
             }
         },
         FixtureSpec{
@@ -574,15 +599,23 @@ INSTANTIATE_TEST_SUITE_P(
                 {"compute_a", GLOBAL, FUNCTION},
                 {"make_pair", GLOBAL, FUNCTION},
                 {"pair", GLOBAL, TYPE},
+                {"pair.first", GLOBAL, FIELD},
+                {"pair.second", GLOBAL, FIELD},
                 {"pair_t", GLOBAL, TYPE},
                 {"result_t", GLOBAL, TYPE},
+                {"result_t.quot", GLOBAL, FIELD},
+                {"result_t.rem", GLOBAL, FIELD},
                 {"types.h", GLOBAL, FILETYPE},
             },
             {
                 {"a.c", "result_t", 20, 28},
                 {"a.c", "result_t", 52, 60},
+                {"a.c", "result_t.quot", 68, 74},
+                {"a.c", "result_t.rem", 88, 93},
                 {"b.c", "pair_t", 20, 26},
                 {"b.c", "pair_t", 57, 63},
+                {"b.c", "pair.first", 71, 78},
+                {"b.c", "pair.second", 88, 96},
             },
             // instances — validates dedup across 2 TUs sharing types.h
             {
@@ -592,8 +625,12 @@ INSTANTIATE_TEST_SUITE_P(
                 {"b.c", "make_pair"},
                 {"types.h", "TYPES_H"},
                 {"types.h", "pair"},
+                {"types.h", "pair.first"},
+                {"types.h", "pair.second"},
                 {"types.h", "pair_t"},
                 {"types.h", "result_t"},
+                {"types.h", "result_t.quot"},
+                {"types.h", "result_t.rem"},
                 {"types.h", "types.h"},
             }
         },
@@ -680,6 +717,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"__exit", LOCAL, FUNCTION},
                 {"__init", LOCAL, FUNCTION},
                 {"driver_info", GLOBAL, TYPE},
+                {"driver_info.id", GLOBAL, FIELD},
                 {"main.c", GLOBAL, FILETYPE},
                 {"my_drv", LOCAL, DATA},
                 {"register.h", GLOBAL, FILETYPE},
@@ -687,10 +725,15 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"main.c", "driver_info", 37, 48},
+                // driver_info.id: expansion-site ref clamped to register_driver name
+                {"main.c", "driver_info.id", 73, 88},
                 // my_drv: expansion-site ref clamped to register_driver name
                 {"main.c", "my_drv", 73, 88},
                 // my_drv: spelling ref in the macro argument
                 {"main.c", "my_drv", 89, 95},
+                // driver_info.id: spelling refs inside register_driver macro body
+                {"register.h", "driver_info.id", 213, 215},
+                {"register.h", "driver_info.id", 264, 266},
             },
             {
                 {"main.c", "__exit"},
@@ -701,6 +744,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "register_driver"},
                 {"register.h", "REGISTER_H"},
                 {"register.h", "driver_info"},
+                {"register.h", "driver_info.id"},
                 {"register.h", "register.h"},
                 {"register.h", "register_driver"},
             }
@@ -715,6 +759,8 @@ INSTANTIATE_TEST_SUITE_P(
                 {"mul", GLOBAL, FUNCTION},
                 {"no_doc", GLOBAL, FUNCTION},
                 {"point", GLOBAL, TYPE},
+                {"point.x", GLOBAL, FIELD},
+                {"point.y", GLOBAL, FIELD},
             },
             {
                 {"main.c", "counter", 305, 312},
@@ -730,6 +776,8 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "no_doc", 1},
                 {"main.c", "point", 1},
                 {"main.c", "point", 10},
+                {"main.c", "point.x", 1},
+                {"main.c", "point.y", 1},
             }
         },
         // Proves that doc comments on header declarations produce documentation
@@ -769,12 +817,16 @@ INSTANTIATE_TEST_SUITE_P(
                 {"ERRORS_H", GLOBAL, MACRO},
                 {"broken_function", LOCAL, FUNCTION},
                 {"config", GLOBAL, TYPE},
+                {"config.debug", GLOBAL, FIELD},
+                {"config.verbose", GLOBAL, FIELD},
                 {"errors.h", GLOBAL, FILETYPE},
                 {"global_cfg", GLOBAL, DATA},
                 {"global_opts", GLOBAL, DATA},
                 {"main", GLOBAL, FUNCTION},
                 {"main.c", GLOBAL, FILETYPE},
                 {"options", GLOBAL, TYPE},
+                {"options.count", GLOBAL, FIELD},
+                {"options.name", GLOBAL, FIELD},
                 {"setup", GLOBAL, FUNCTION},
             },
             {
@@ -782,9 +834,12 @@ INSTANTIATE_TEST_SUITE_P(
                 {"errors.h", "config", 570, 576},
                 {"main.c", "config", 28, 34},
                 {"main.c", "config", 94, 100},
+                {"main.c", "config.debug", 135, 145},
+                {"main.c", "config.verbose", 113, 125},
                 {"main.c", "global_cfg", 182, 192},
                 {"main.c", "global_opts", 199, 210},
                 {"main.c", "options", 54, 61},
+                {"main.c", "options.count", 199, 216},
                 {"main.c", "setup", 175, 193},
             }
         },
@@ -883,6 +938,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"OPS_H", GLOBAL, MACRO},
                 {"default_ops", LOCAL, DATA},
                 {"iface_ops", GLOBAL, TYPE},
+                {"iface_ops.flags", GLOBAL, FIELD},
                 {"iface_ops.read", GLOBAL, FIELD},
                 {"iface_ops.write", GLOBAL, FIELD},
                 {"main.c", GLOBAL, FILETYPE},

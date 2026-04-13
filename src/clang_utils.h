@@ -19,15 +19,31 @@ inline bool isFunctionPointerType(CXType t) {
 
 // Resolve a child cursor (FieldDecl or EnumConstantDecl) to a compound name
 // "parent_name.child_name".  Returns empty string when the parent kind doesn't
-// match, the parent is anonymous (enum-only), or either name is empty.
+// match, the parent is anonymous, or either name is empty.
 inline std::string resolveCompoundName(CXCursor child, CXCursorKind expected_parent_kind) {
     CXCursor parent = clang_getCursorSemanticParent(child);
     if (clang_getCursorKind(parent) != expected_parent_kind) return "";
-    if (expected_parent_kind == CXCursor_EnumDecl && clang_Cursor_isAnonymous(parent)) return "";
+    if (clang_Cursor_isAnonymous(parent)) return "";
     ClangString pn(clang_getCursorSpelling(parent));
     std::string parent_name = pn.to_string();
     if (parent_name.empty()) return "";
     ClangString cn(clang_getCursorSpelling(child));
+    std::string child_name = cn.to_string();
+    if (child_name.empty()) return "";
+    return parent_name + "." + child_name;
+}
+
+// Overload for FieldDecl cursors: auto-detects struct or union parent.
+// Returns empty string when the parent is neither, is anonymous, or names are empty.
+inline std::string resolveFieldCompoundName(CXCursor field) {
+    CXCursor parent = clang_getCursorSemanticParent(field);
+    CXCursorKind pk = clang_getCursorKind(parent);
+    if (pk != CXCursor_StructDecl && pk != CXCursor_UnionDecl) return "";
+    if (clang_Cursor_isAnonymous(parent)) return "";
+    ClangString pn(clang_getCursorSpelling(parent));
+    std::string parent_name = pn.to_string();
+    if (parent_name.empty()) return "";
+    ClangString cn(clang_getCursorSpelling(field));
     std::string child_name = cn.to_string();
     if (child_name.empty()) return "";
     return parent_name + "." + child_name;
