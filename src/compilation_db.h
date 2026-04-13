@@ -28,7 +28,7 @@ private:
     std::unordered_map<std::string, std::vector<std::string>> system_includes_cache_;
     std::string modules_method_;
 
-    void filterGccFlags(std::vector<std::string>& args);
+    void adaptForCuda(CompileCommand& entry, const std::string& compiler);
     std::vector<std::string> querySystemIncludes(const std::string& compiler);
     void addSystemIncludes(const std::string& compiler, std::vector<std::string>& args);
     void extractModuleName(CompileCommand& entry);

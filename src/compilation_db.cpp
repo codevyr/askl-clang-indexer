@@ -9,38 +9,86 @@
 #include <unistd.h>
 #include <unordered_set>
 
-static const std::unordered_set<std::string> filtered_flags = {
-    // GCC-only flags that clang doesn't understand
-    "-mno-sse-fp-math", "-fno-var-tracking-assignments",
-    "-fconserve-stack", "-fno-allow-store-data-races",
-    "-fno-code-hoisting", "-fno-delete-null-pointer-checks",
-    "-fno-schedule-insns", "-fno-tree-loop-im",
-    "-mindirect-branch-register",
-    "-mrecord-mcount", "-mfentry",
-    "-fno-reorder-blocks-and-partition",
-    "-fno-partial-inlining",
-    "-fno-tree-loop-distribute-patterns",
-    "-fno-ipa-cp-clone", "-fsched-pressure", "-mhard-float",
-    "-fno-conserve-stack",
-    "-fsanitize=bounds-strict",
-    // GCC plugin defines — stripping these lets kernel headers use their
-    // fallback (empty) definitions instead of referencing plugin-only attributes.
-    "-DLATENT_ENTROPY_PLUGIN",
-    "-DRANDSTRUCT_PLUGIN",
-    "-DRANDSTRUCT",
-    "-DSTRUCTLEAK_PLUGIN",
-    // Note: all -W flags are stripped in filterGccFlags() since warnings
-    // are irrelevant for indexing.
+// ========== Flag filtering infrastructure ==========
+
+struct FlagFilter {
+    std::unordered_set<std::string> exact;      // Exact-match flags to drop
+    std::vector<std::string> prefixes;           // Prefix-match flags to drop
+    std::unordered_set<std::string> pairs;       // Flags that consume the next argument
 };
 
-static const std::vector<std::string> filtered_prefixes = {
-    "-mabi=", "-mpreferred-stack-boundary=",
-    "-mindirect-branch-cs-prefix", "-mindirect-branch=",
-    "-fzero-init-padding-bits=", "-fmin-function-alignment=",
-    "-fasan-shadow-offset=",
-    // GCC plugins can't be loaded by libclang
-    "-fplugin=", "-fplugin-arg-",
+// Filter args in-place, removing matching flags. Warning flags (-W...) are
+// always stripped since they are irrelevant for indexing.
+static void filterFlags(std::vector<std::string>& args, const FlagFilter& filter) {
+    std::vector<std::string> result;
+    for (size_t i = 0; i < args.size(); i++) {
+        const auto& arg = args[i];
+        if (arg.size() >= 2 && arg[0] == '-' && arg[1] == 'W') continue;
+        if (filter.exact.count(arg)) continue;
+        bool prefix_match = false;
+        for (auto& prefix : filter.prefixes) {
+            if (arg.compare(0, prefix.size(), prefix) == 0) { prefix_match = true; break; }
+        }
+        if (prefix_match) continue;
+        if (filter.pairs.count(arg)) {
+            i++; // skip the next argument
+            continue;
+        }
+        result.push_back(arg);
+    }
+    args = std::move(result);
+}
+
+// GCC-only flags that clang doesn't understand
+static const FlagFilter gcc_filter = {
+    {
+        "-mno-sse-fp-math", "-fno-var-tracking-assignments",
+        "-fconserve-stack", "-fno-allow-store-data-races",
+        "-fno-code-hoisting", "-fno-delete-null-pointer-checks",
+        "-fno-schedule-insns", "-fno-tree-loop-im",
+        "-mindirect-branch-register",
+        "-mrecord-mcount", "-mfentry",
+        "-fno-reorder-blocks-and-partition",
+        "-fno-partial-inlining",
+        "-fno-tree-loop-distribute-patterns",
+        "-fno-ipa-cp-clone", "-fsched-pressure", "-mhard-float",
+        "-fno-conserve-stack",
+        "-fsanitize=bounds-strict",
+        // GCC plugin defines — stripping these lets kernel headers use their
+        // fallback (empty) definitions instead of referencing plugin-only attributes.
+        "-DLATENT_ENTROPY_PLUGIN",
+        "-DRANDSTRUCT_PLUGIN",
+        "-DRANDSTRUCT",
+        "-DSTRUCTLEAK_PLUGIN",
+    },
+    {
+        "-mabi=", "-mpreferred-stack-boundary=",
+        "-mindirect-branch-cs-prefix", "-mindirect-branch=",
+        "-fzero-init-padding-bits=", "-fmin-function-alignment=",
+        "-fasan-shadow-offset=",
+        // GCC plugins can't be loaded by libclang
+        "-fplugin=", "-fplugin-arg-",
+    },
+    {},
 };
+
+// NVCC-specific flags that clang doesn't understand
+static const FlagFilter nvcc_filter = {
+    {
+        "--expt-extended-lambda", "--expt-relaxed-constexpr",
+        "-compress-all", "-dc", "-dw",
+    },
+    {
+        "-gencode=", "-maxrregcount=",
+    },
+    {
+        "--compiler-options", "-Xcompiler",
+        "-Xptxas", "-Xfatbin", "-Xlinker",
+        "-ccbin", "-gencode",
+    },
+};
+
+// ========== Utility helpers ==========
 
 static bool hasExtension(const std::string& path, const std::string& ext) {
     return path.size() >= ext.size() &&
@@ -50,6 +98,47 @@ static bool hasExtension(const std::string& path, const std::string& ext) {
 static bool isAssemblyFile(const std::string& path) {
     return hasExtension(path, ".S") || hasExtension(path, ".s");
 }
+
+// ========== CUDA/NVCC helpers ==========
+
+static bool isNvccCompiler(const std::string& compiler) {
+    auto slash = compiler.rfind('/');
+    std::string basename = (slash != std::string::npos) ? compiler.substr(slash + 1) : compiler;
+    return basename == "nvcc";
+}
+
+// Derive --cuda-path from the nvcc path (e.g. /usr/local/cuda/bin/nvcc -> /usr/local/cuda).
+static std::string deriveCudaPath(const std::string& compiler) {
+    auto pos = compiler.rfind("/bin/nvcc");
+    if (pos != std::string::npos) return compiler.substr(0, pos);
+    return "";
+}
+
+// Extract GPU arch from -gencode=arch=compute_XX,code=sm_XX.
+static std::string extractGpuArch(const std::vector<std::string>& args) {
+    for (auto& arg : args) {
+        static const std::string prefix = "-gencode=";
+        if (arg.compare(0, prefix.size(), prefix) == 0) {
+            auto code_pos = arg.find("code=sm_");
+            if (code_pos != std::string::npos) {
+                auto start = code_pos + 5; // after "code="
+                auto end = arg.find(',', start);
+                return arg.substr(start, end - start);
+            }
+        }
+    }
+    return "sm_70";
+}
+
+// Extract the host compiler from -ccbin.  Returns "g++" as default.
+static std::string extractCcbin(const std::vector<std::string>& args) {
+    for (size_t i = 0; i + 1 < args.size(); i++) {
+        if (args[i] == "-ccbin") return args[i + 1];
+    }
+    return "g++";
+}
+
+// ========== CompilationDB ==========
 
 CompilationDB::CompilationDB(const std::string& dir, const std::string& modules_method)
     : modules_method_(modules_method) {
@@ -120,8 +209,12 @@ CompilationDB::CompilationDB(const std::string& dir, const std::string& modules_
             entry.args.push_back(std::move(arg));
         }
 
-        filterGccFlags(entry.args);
-        addSystemIncludes(compiler, entry.args);
+        if (isNvccCompiler(compiler)) {
+            adaptForCuda(entry, compiler);
+        } else {
+            filterFlags(entry.args, gcc_filter);
+            addSystemIncludes(compiler, entry.args);
+        }
         extractModuleName(entry);
         commands_.push_back(std::move(entry));
     }
@@ -133,18 +226,37 @@ CompilationDB::~CompilationDB() {
     if (db_) clang_CompilationDatabase_dispose(db_);
 }
 
-void CompilationDB::filterGccFlags(std::vector<std::string>& args) {
-    args.erase(
-        std::remove_if(args.begin(), args.end(), [](const std::string& arg) {
-            // Warning flags are irrelevant for indexing
-            if (arg.size() >= 2 && arg[0] == '-' && arg[1] == 'W') return true;
-            if (filtered_flags.count(arg)) return true;
-            for (auto& prefix : filtered_prefixes) {
-                if (arg.compare(0, prefix.size(), prefix) == 0) return true;
-            }
-            return false;
-        }),
-        args.end());
+void CompilationDB::adaptForCuda(CompileCommand& entry, const std::string& compiler) {
+    // Extract metadata from raw args before filtering removes the flags
+    std::string host_compiler = extractCcbin(entry.args);
+    std::string cuda_path = deriveCudaPath(compiler);
+    std::string gpu_arch = extractGpuArch(entry.args);
+
+    // Filter NVCC-specific flags first (handles pairs like -Xcompiler <val>),
+    // then GCC flags (nvcc passes through to GCC for host compilation).
+    filterFlags(entry.args, nvcc_filter);
+    filterFlags(entry.args, gcc_filter);
+
+    // Tell clang to parse as CUDA
+    entry.args.insert(entry.args.begin(), {"-x", "cuda"});
+    if (!cuda_path.empty())
+        entry.args.push_back("--cuda-path=" + cuda_path);
+    entry.args.push_back("--cuda-gpu-arch=" + gpu_arch);
+    entry.args.push_back("--no-cuda-version-check");
+    entry.args.push_back("-fcuda-rdc");
+
+    // CUDA device code uses placement new without #include <new>
+    entry.args.push_back("-include");
+    entry.args.push_back("new");
+
+    // nvcc assumes GNU extensions (typeof, asm, etc.); promote -std=c++NN to -std=gnu++NN
+    for (auto& a : entry.args) {
+        if (a.compare(0, 8, "-std=c++") == 0) {
+            a = "-std=gnu++" + a.substr(8);
+        }
+    }
+
+    addSystemIncludes(host_compiler, entry.args);
 }
 
 std::vector<std::string> CompilationDB::querySystemIncludes(const std::string& compiler) {
@@ -169,7 +281,7 @@ std::vector<std::string> CompilationDB::querySystemIncludes(const std::string& c
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
         execlp(compiler.c_str(), compiler.c_str(),
-               "-E", "-x", "c", "-v", "/dev/null", nullptr);
+               "-E", "-x", "c++", "-v", "/dev/null", nullptr);
         _exit(127);
     }
 
@@ -200,7 +312,12 @@ std::vector<std::string> CompilationDB::querySystemIncludes(const std::string& c
         // Remove " (framework directory)" suffix if present
         auto paren = path.find(" (");
         if (paren != std::string::npos) path = path.substr(0, paren);
-        if (!path.empty()) includes.push_back(path);
+        if (path.empty()) continue;
+        // Skip GCC's compiler-internal intrinsics path (lib/gcc/.../include).
+        // Clang has its own intrinsics and GCC's use GCC-specific builtins
+        // that clang doesn't understand (e.g. __builtin_ia32_*).
+        if (path.find("/lib/gcc/") != std::string::npos) continue;
+        includes.push_back(path);
     }
 
     return includes;

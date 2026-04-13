@@ -39,6 +39,9 @@ inline std::string canonicalizePath(const std::string& path) {
         std::error_code ec;
         auto abs = std::filesystem::canonical(path, ec);
         if (!ec) return abs.string();
+        // canonical() failed (file doesn't exist on disk) — fall back to
+        // prepending cwd so the result is still an absolute path.
+        return (std::filesystem::current_path() / path).lexically_normal().string();
     }
     return std::filesystem::path(path).lexically_normal().string();
 }

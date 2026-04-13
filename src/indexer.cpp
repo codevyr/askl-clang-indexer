@@ -80,6 +80,13 @@ void Indexer::processTU(const CompileCommand& cmd) {
     std::vector<const char*> c_args;
     for (auto& arg : args_storage) c_args.push_back(arg.c_str());
 
+    if (show_warnings_) {
+        fprintf(stderr, "--- TU: %s ---\n", cmd.filename.c_str());
+        fprintf(stderr, "  clang args:");
+        for (auto& arg : args_storage) fprintf(stderr, " %s", arg.c_str());
+        fprintf(stderr, "\n");
+    }
+
     ClangTU tu;
     CXErrorCode err = clang_parseTranslationUnit2(
         index, cmd.filename.c_str(), c_args.data(), c_args.size(),

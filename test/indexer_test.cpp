@@ -1,4 +1,5 @@
 #include "clang_utils.h"
+#include "compilation_db.h"
 #include "indexer.h"
 #include "symbol_table.h"
 #include "stage1.h"
@@ -129,17 +130,19 @@ struct TempDir {
     ~TempDir() { if (!path.empty()) fs::remove_all(path); }
 };
 
+static TempDir makeTempDir() {
+    std::string tmpl = (fs::temp_directory_path() / "askl-test-XXXXXX").string();
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    char* dir = mkdtemp(buf.data());
+    return TempDir{dir ? dir : ""};
+}
+
 RunResult runFixture(const std::string& fixture_name,
                      const std::vector<std::string>& sources) {
     std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fixture_name;
 
-    // Create temp directory for compile_commands.json
-    std::string tmp_template = (fs::temp_directory_path() / "askl-test-XXXXXX").string();
-    std::vector<char> tmp_buf(tmp_template.begin(), tmp_template.end());
-    tmp_buf.push_back('\0');
-    char* tmp_dir = mkdtemp(tmp_buf.data());
-    EXPECT_NE(tmp_dir, nullptr) << "Failed to create temp directory";
-    TempDir temp_dir{tmp_dir ? tmp_dir : ""};
+    TempDir temp_dir = makeTempDir();
 
     generateCompileCommands(fixture_dir, temp_dir.path, sources);
 
@@ -874,6 +877,44 @@ INSTANTIATE_TEST_SUITE_P(
     }
 );
 
+// --- Absolute path test ---
+// When compile_commands.json uses a relative -I flag (e.g. -Ilib/include),
+// clang may report included headers with paths relative to the compilation
+// directory.  All filesystem_path values must still be absolute.
+// This reproduces the nccl bug where object 79 had filesystem_path
+// "transport/net_ib/gdaki/..." instead of an absolute path.
+TEST(AbsolutePaths, RelativeIncludePath) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/relative_include";
+    std::string src_dir = fixture_dir + "/src";
+
+    TempDir temp_dir = makeTempDir();
+    ASSERT_FALSE(temp_dir.path.empty());
+
+    // Key: use relative -I flag, just like nccl's compile_commands.json
+    // uses "-Itransport/net_ib/gdaki/doca-gpunetio/include"
+    {
+        std::ofstream out(temp_dir.path + "/compile_commands.json");
+        out << "[\n"
+            << "  {\n"
+            << "    \"directory\": \"" << src_dir << "\",\n"
+            << "    \"command\": \"cc -c -Ilib/include main.c -o main.o\",\n"
+            << "    \"file\": \"" << src_dir << "/main.c\"\n"
+            << "  }\n"
+            << "]\n";
+    }
+
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+
+    for (auto& file : indexer.allFiles()) {
+        EXPECT_FALSE(file.filesystem_path.empty())
+            << "filesystem_path is empty for object " << file.object_local_id;
+        EXPECT_EQ(file.filesystem_path[0], '/')
+            << "filesystem_path is not absolute: \"" << file.filesystem_path
+            << "\" for object " << file.object_local_id;
+    }
+}
+
 // --- canonicalizePath tests ---
 
 TEST(CanonicalizePath, ResolvesDotDot) {
@@ -897,4 +938,238 @@ TEST(CanonicalizePath, RealWorldBugReport) {
         canonicalizePath("/home/user/project/common/mmu/../../include/header.h"),
         "/home/user/project/include/header.h"
     );
+}
+
+// ========== CompilationDB tests ==========
+
+// Write a single-entry compile_commands.json using the arguments array format.
+static void writeCompileCommands(const std::string& dir, const std::string& compiler,
+                                 const std::string& file,
+                                 const std::vector<std::string>& extra_args) {
+    std::ofstream out(dir + "/compile_commands.json");
+    out << "[{\"directory\":\"" << dir << "\","
+        << "\"arguments\":[\"" << compiler << "\",\"-c\"";
+    for (auto& arg : extra_args) out << ",\"" << arg << "\"";
+    out << ",\"-o\",\"out.o\",\"" << file << "\"],"
+        << "\"file\":\"" << file << "\"}]\n";
+}
+
+// Strip -isystem pairs from args (host-dependent, not under our control).
+static std::vector<std::string> stripSystemIncludes(const std::vector<std::string>& args) {
+    std::vector<std::string> result;
+    for (size_t i = 0; i < args.size(); i++) {
+        if (args[i] == "-isystem") { i++; continue; }
+        result.push_back(args[i]);
+    }
+    return result;
+}
+
+static bool hasArg(const std::vector<std::string>& args, const std::string& val) {
+    return std::find(args.begin(), args.end(), val) != args.end();
+}
+
+static bool hasArgPair(const std::vector<std::string>& args,
+                       const std::string& a, const std::string& b) {
+    for (size_t i = 0; i + 1 < args.size(); i++) {
+        if (args[i] == a && args[i + 1] == b) return true;
+    }
+    return false;
+}
+
+TEST(CompilationDB, FiltersGccFlags) {
+    auto tmp = makeTempDir();
+    writeCompileCommands(tmp.path, "gcc", "/tmp/test.c",
+        {"-I.", "-fno-var-tracking-assignments", "-mrecord-mcount", "-O2"});
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    auto args = stripSystemIncludes(db.commands()[0].args);
+    EXPECT_TRUE(hasArg(args, "-I."));
+    EXPECT_TRUE(hasArg(args, "-O2"));
+    EXPECT_FALSE(hasArg(args, "-fno-var-tracking-assignments"));
+    EXPECT_FALSE(hasArg(args, "-mrecord-mcount"));
+}
+
+TEST(CompilationDB, FiltersWarnings) {
+    auto tmp = makeTempDir();
+    writeCompileCommands(tmp.path, "gcc", "/tmp/test.c",
+        {"-I.", "-Wall", "-Wextra", "-Werror"});
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    auto args = stripSystemIncludes(db.commands()[0].args);
+    EXPECT_TRUE(hasArg(args, "-I."));
+    EXPECT_FALSE(hasArg(args, "-Wall"));
+    EXPECT_FALSE(hasArg(args, "-Wextra"));
+    EXPECT_FALSE(hasArg(args, "-Werror"));
+}
+
+TEST(CompilationDB, FiltersGccPrefixes) {
+    auto tmp = makeTempDir();
+    writeCompileCommands(tmp.path, "gcc", "/tmp/test.c",
+        {"-I.", "-fplugin=some_plugin.so", "-mabi=lp64"});
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    auto args = stripSystemIncludes(db.commands()[0].args);
+    EXPECT_TRUE(hasArg(args, "-I."));
+    EXPECT_FALSE(hasArg(args, "-fplugin=some_plugin.so"));
+    EXPECT_FALSE(hasArg(args, "-mabi=lp64"));
+}
+
+TEST(CompilationDB, FiltersGccPluginDefines) {
+    auto tmp = makeTempDir();
+    writeCompileCommands(tmp.path, "gcc", "/tmp/test.c",
+        {"-DLATENT_ENTROPY_PLUGIN", "-DRANDSTRUCT_PLUGIN", "-DMODULE", "-DFOO=1"});
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    auto args = stripSystemIncludes(db.commands()[0].args);
+    EXPECT_FALSE(hasArg(args, "-DLATENT_ENTROPY_PLUGIN"));
+    EXPECT_FALSE(hasArg(args, "-DRANDSTRUCT_PLUGIN"));
+    // Non-plugin defines should survive
+    EXPECT_TRUE(hasArg(args, "-DMODULE"));
+    EXPECT_TRUE(hasArg(args, "-DFOO=1"));
+}
+
+TEST(CompilationDB, NvccBasicAdaptation) {
+    auto tmp = makeTempDir();
+    writeCompileCommands(tmp.path, "/usr/local/cuda/bin/nvcc", "/tmp/test.cu",
+        {"-std=c++14", "-I.",
+         "--expt-extended-lambda",
+         "-Xcompiler", "-fPIC",
+         "-ccbin", "g++",
+         "-gencode=arch=compute_80,code=sm_80",
+         "-dc", "-dw"});
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    auto args = stripSystemIncludes(db.commands()[0].args);
+
+    // CUDA flags added
+    EXPECT_TRUE(hasArgPair(args, "-x", "cuda"));
+    EXPECT_TRUE(hasArg(args, "--cuda-path=/usr/local/cuda"));
+    EXPECT_TRUE(hasArg(args, "--cuda-gpu-arch=sm_80"));
+    EXPECT_TRUE(hasArg(args, "--no-cuda-version-check"));
+    EXPECT_TRUE(hasArg(args, "-fcuda-rdc"));
+    EXPECT_TRUE(hasArgPair(args, "-include", "new"));
+
+    // -std promotion: c++14 → gnu++14
+    EXPECT_FALSE(hasArg(args, "-std=c++14"));
+    EXPECT_TRUE(hasArg(args, "-std=gnu++14"));
+
+    // NVCC-specific flags stripped
+    EXPECT_FALSE(hasArg(args, "--expt-extended-lambda"));
+    EXPECT_FALSE(hasArg(args, "-dc"));
+    EXPECT_FALSE(hasArg(args, "-dw"));
+    EXPECT_FALSE(hasArg(args, "-Xcompiler"));
+    EXPECT_FALSE(hasArg(args, "-fPIC"));
+    EXPECT_FALSE(hasArg(args, "-ccbin"));
+    EXPECT_FALSE(hasArg(args, "-gencode=arch=compute_80,code=sm_80"));
+
+    // Regular flags survive
+    EXPECT_TRUE(hasArg(args, "-I."));
+}
+
+TEST(CompilationDB, NvccFlagPairs) {
+    auto tmp = makeTempDir();
+    writeCompileCommands(tmp.path, "/usr/local/cuda/bin/nvcc", "/tmp/test.cu",
+        {"-std=c++14",
+         "-Xptxas", "-v",
+         "-Xfatbin", "--compress-all",
+         "--compiler-options", "-fvisibility=hidden"});
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    auto args = stripSystemIncludes(db.commands()[0].args);
+
+    // All pair flags and their values stripped
+    EXPECT_FALSE(hasArg(args, "-Xptxas"));
+    EXPECT_FALSE(hasArg(args, "-v"));
+    EXPECT_FALSE(hasArg(args, "-Xfatbin"));
+    EXPECT_FALSE(hasArg(args, "--compress-all"));
+    EXPECT_FALSE(hasArg(args, "--compiler-options"));
+    EXPECT_FALSE(hasArg(args, "-fvisibility=hidden"));
+}
+
+TEST(CompilationDB, NvccCudaPathDerivation) {
+    auto tmp = makeTempDir();
+    // Non-standard CUDA install path
+    writeCompileCommands(tmp.path, "/opt/nvidia/cuda-12.0/bin/nvcc", "/tmp/test.cu",
+        {"-std=c++17"});
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    auto args = stripSystemIncludes(db.commands()[0].args);
+    EXPECT_TRUE(hasArg(args, "--cuda-path=/opt/nvidia/cuda-12.0"));
+    EXPECT_TRUE(hasArg(args, "-std=gnu++17"));
+}
+
+TEST(CompilationDB, NvccGpuArchDefault) {
+    auto tmp = makeTempDir();
+    // No -gencode → default sm_70
+    writeCompileCommands(tmp.path, "/opt/cuda/bin/nvcc", "/tmp/test.cu",
+        {"-std=c++14"});
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    auto args = stripSystemIncludes(db.commands()[0].args);
+    EXPECT_TRUE(hasArg(args, "--cuda-gpu-arch=sm_70"));
+}
+
+TEST(CompilationDB, NvccAlsoFiltersGccFlags) {
+    // NVCC TUs should have BOTH nvcc and gcc flags filtered
+    auto tmp = makeTempDir();
+    writeCompileCommands(tmp.path, "/usr/local/cuda/bin/nvcc", "/tmp/test.cu",
+        {"-std=c++14", "-fno-var-tracking-assignments", "--expt-extended-lambda"});
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    auto args = stripSystemIncludes(db.commands()[0].args);
+    EXPECT_FALSE(hasArg(args, "-fno-var-tracking-assignments"));  // gcc filter
+    EXPECT_FALSE(hasArg(args, "--expt-extended-lambda"));          // nvcc filter
+}
+
+TEST(CompilationDB, SkipsAssemblyFiles) {
+    auto tmp = makeTempDir();
+    {
+        std::ofstream out(tmp.path + "/compile_commands.json");
+        out << "["
+            << "{\"directory\":\"" << tmp.path << "\","
+            << "\"arguments\":[\"gcc\",\"-c\",\"/tmp/code.c\",\"-o\",\"code.o\"],"
+            << "\"file\":\"/tmp/code.c\"},"
+            << "{\"directory\":\"" << tmp.path << "\","
+            << "\"arguments\":[\"gcc\",\"-c\",\"/tmp/boot.S\",\"-o\",\"boot.o\"],"
+            << "\"file\":\"/tmp/boot.S\"},"
+            << "{\"directory\":\"" << tmp.path << "\","
+            << "\"arguments\":[\"gcc\",\"-c\",\"/tmp/entry.s\",\"-o\",\"entry.o\"],"
+            << "\"file\":\"/tmp/entry.s\"}"
+            << "]\n";
+    }
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    EXPECT_EQ(db.commands()[0].filename, "/tmp/code.c");
+}
+
+TEST(CompilationDB, StripsOutputAndSourceFile) {
+    auto tmp = makeTempDir();
+    writeCompileCommands(tmp.path, "gcc", "/tmp/test.c", {"-I.", "-O2"});
+    CompilationDB db(tmp.path);
+    ASSERT_EQ(db.commands().size(), 1u);
+    auto args = stripSystemIncludes(db.commands()[0].args);
+    // -c, -o, out.o, and the source file should all be stripped
+    EXPECT_FALSE(hasArg(args, "-c"));
+    EXPECT_FALSE(hasArg(args, "-o"));
+    EXPECT_FALSE(hasArg(args, "out.o"));
+    EXPECT_FALSE(hasArg(args, "/tmp/test.c"));
+}
+
+TEST(CompilationDB, KbuildModuleName) {
+    auto tmp = makeTempDir();
+    writeCompileCommands(tmp.path, "gcc", "/tmp/test.c",
+        {"-DMODULE", "-D__KBUILD_MODNAME=my_driver"});
+    CompilationDB db(tmp.path, "kbuild");
+    ASSERT_EQ(db.commands().size(), 1u);
+    EXPECT_EQ(db.commands()[0].modname, "my_driver");
+}
+
+TEST(CompilationDB, KbuildNoModuleDefine) {
+    // Without -DMODULE, modname should be empty even with __KBUILD_MODNAME
+    auto tmp = makeTempDir();
+    writeCompileCommands(tmp.path, "gcc", "/tmp/test.c",
+        {"-D__KBUILD_MODNAME=my_driver"});
+    CompilationDB db(tmp.path, "kbuild");
+    ASSERT_EQ(db.commands().size(), 1u);
+    EXPECT_TRUE(db.commands()[0].modname.empty());
 }
