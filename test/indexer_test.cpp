@@ -961,6 +961,34 @@ INSTANTIATE_TEST_SUITE_P(
                 {"ops.h", "read_func_t", 174, 185},          // TypeRef in field decl
                 {"ops.h", "write_func_t", 197, 209},         // TypeRef in field decl
             },
+        },
+        // Validates that positional (non-designated) struct initializers create
+        // field impl refs by matching init list children to fields by position.
+        FixtureSpec{
+            "positional_init_func_ptr",
+            {"main.c"},
+            {
+                {"OPS_H", GLOBAL, MACRO},
+                {"default_ops", LOCAL, DATA},
+                {"iface_ops", GLOBAL, TYPE},
+                {"iface_ops.read", GLOBAL, FIELD},
+                {"iface_ops.write", GLOBAL, FIELD},
+                {"main.c", GLOBAL, FILETYPE},
+                {"my_read", LOCAL, FUNCTION},
+                {"my_write", LOCAL, FUNCTION},
+                {"ops.h", GLOBAL, FILETYPE},
+                {"read_func_t", GLOBAL, TYPE},
+                {"write_func_t", GLOBAL, TYPE},
+            },
+            {
+                {"main.c", "iface_ops", 170, 179},
+                {"main.c", "my_read", 200, 207},              // positional init funcPtrRef
+                {"main.c", "my_write", 213, 221},             // positional init funcPtrRef
+                {"ops.h", "my_read", 174, 191},               // field impl ref (positional)
+                {"ops.h", "my_write", 197, 215},              // field impl ref (positional)
+                {"ops.h", "read_func_t", 174, 185},           // TypeRef in field decl
+                {"ops.h", "write_func_t", 197, 209},          // TypeRef in field decl
+            },
         }
     ),
     [](const testing::TestParamInfo<FixtureSpec>& info) {

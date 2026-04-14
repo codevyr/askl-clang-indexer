@@ -17,13 +17,7 @@ void Stage2::visitCursor(CXCursor cursor, CXCursor parent) {
 
     switch (kind) {
     case CXCursor_InitListExpr:
-        clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
-            auto* self = static_cast<Stage2*>(data);
-            if (clang_getCursorKind(child) == CXCursor_UnexposedExpr) {
-                self->handleDesignatedInit(child);
-            }
-            return CXChildVisit_Continue;
-        }, this);
+        handleInitList(cursor);
         break;
 
     case CXCursor_BinaryOperator:
@@ -53,6 +47,21 @@ void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start
 }
 
 void Stage2::addFieldImplRef(CXCursor member_ref, CXCursor func_ref) {
+    CXCursor field_decl = clang_getCursorReferenced(member_ref);
+    addFieldImplRefFromDecl(field_decl, func_ref);
+}
+
+void Stage2::addFieldImplRefFromDecl(CXCursor field_decl, CXCursor func_ref) {
+    // Validate the field declaration first (cheap checks)
+    if (clang_Cursor_isNull(field_decl)) return;
+    if (clang_getCursorKind(field_decl) != CXCursor_FieldDecl) return;
+    if (resolveFieldCompoundName(field_decl).empty()) return;
+
+    // Get the field declaration's location (in the header)
+    CXFile field_file;
+    unsigned field_start, field_end;
+    if (!getExpansionRange(field_decl, field_file, field_start, field_end)) return;
+
     // Resolve the function being assigned
     CXCursor func_referenced = clang_getCursorReferenced(func_ref);
     if (clang_Cursor_isNull(func_referenced)) return;
@@ -64,17 +73,6 @@ void Stage2::addFieldImplRef(CXCursor member_ref, CXCursor func_ref) {
 
     int64_t func_sym_id = resolveSymbol(symbols_, func_referenced, fname, SYMTYPE_FUNCTION);
 
-    // Resolve the field declaration from the member ref
-    CXCursor field_decl = clang_getCursorReferenced(member_ref);
-    if (clang_Cursor_isNull(field_decl)) return;
-    if (clang_getCursorKind(field_decl) != CXCursor_FieldDecl) return;
-    if (resolveFieldCompoundName(field_decl).empty()) return;
-
-    // Get the field declaration's location (in the header)
-    CXFile field_file;
-    unsigned field_start, field_end;
-    if (!getExpansionRange(field_decl, field_file, field_start, field_end)) return;
-
     // Create synthetic ref: func implementation attributed to the field's declaration site
     Stage2Ref ref;
     ref.source_file = getCanonicalPath(field_file);
@@ -83,7 +81,6 @@ void Stage2::addFieldImplRef(CXCursor member_ref, CXCursor func_ref) {
 }
 
 struct DesignatedInitData {
-    Stage2* self;
     CXCursor member_ref;
     CXCursor func_ref;
     bool has_member;
@@ -110,18 +107,59 @@ static CXChildVisitResult designatedInitVisitor(CXCursor child, CXCursor, CXClie
     return CXChildVisit_Continue;
 }
 
-void Stage2::handleDesignatedInit(CXCursor cursor) {
-    DesignatedInitData data{this, {}, {}, false, false};
-    clang_visitChildren(cursor, designatedInitVisitor, &data);
+void Stage2::handleInitList(CXCursor cursor) {
+    // Get the struct type and enumerate its fields in declaration order.
+    // Use getCanonicalType to resolve through typedefs.
+    CXType init_type = clang_getCanonicalType(clang_getCursorType(cursor));
+    CXCursor type_decl = clang_getTypeDeclaration(init_type);
 
-    if (data.has_member && data.has_func) {
-        CXFile range_file;
-        unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off, true)) {
-            addFuncPtrRef(data.func_ref, range_file, start_off, end_off);
+    std::vector<CXCursor> fields;
+    if (!clang_Cursor_isNull(type_decl)) {
+        clang_visitChildren(type_decl, [](CXCursor child, CXCursor, CXClientData d) {
+            if (clang_getCursorKind(child) == CXCursor_FieldDecl)
+                static_cast<std::vector<CXCursor>*>(d)->push_back(child);
+            return CXChildVisit_Continue;
+        }, &fields);
+    }
+
+    struct Data { Stage2* self; std::vector<CXCursor>* fields; int index; }
+        data{this, &fields, 0};
+
+    clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData d) {
+        auto* data = static_cast<Data*>(d);
+        data->self->handleInitEntry(child, data->index, *data->fields);
+        data->index++;
+        return CXChildVisit_Continue;
+    }, &data);
+}
+
+void Stage2::handleInitEntry(CXCursor child, int field_index,
+                             const std::vector<CXCursor>& fields) {
+    DesignatedInitData data{};
+    CXCursorKind kind = clang_getCursorKind(child);
+
+    if (kind == CXCursor_UnexposedExpr) {
+        clang_visitChildren(child, designatedInitVisitor, &data);
+    } else if (kind == CXCursor_DeclRefExpr) {
+        CXCursor ref = clang_getCursorReferenced(child);
+        if (!clang_Cursor_isNull(ref) &&
+            clang_getCursorKind(ref) == CXCursor_FunctionDecl) {
+            data.func_ref = child;
+            data.has_func = true;
         }
-        // Create synthetic ref from field declaration to implementing function
+    }
+
+    if (!data.has_func) return;
+
+    CXFile range_file;
+    unsigned start_off, end_off;
+    if (getExpansionRange(child, range_file, start_off, end_off, true))
+        addFuncPtrRef(data.func_ref, range_file, start_off, end_off);
+
+    if (data.has_member) {
         addFieldImplRef(data.member_ref, data.func_ref);
+    } else if (field_index < (int)fields.size()) {
+        addFieldImplRefFromDecl(fields[field_index], data.func_ref);
     }
 }
 

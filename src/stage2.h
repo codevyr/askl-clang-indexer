@@ -31,8 +31,10 @@ private:
 
     static CXChildVisitResult visitor(CXCursor cursor, CXCursor parent, CXClientData data);
     void visitCursor(CXCursor cursor, CXCursor parent);
-    void handleDesignatedInit(CXCursor cursor);
+    void handleInitList(CXCursor cursor);
+    void handleInitEntry(CXCursor child, int field_index, const std::vector<CXCursor>& fields);
     void handleBinaryAssignment(CXCursor cursor);
     void addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start_off, unsigned end_off);
     void addFieldImplRef(CXCursor member_ref, CXCursor func_ref);
+    void addFieldImplRefFromDecl(CXCursor field_decl, CXCursor func_ref);
 };
