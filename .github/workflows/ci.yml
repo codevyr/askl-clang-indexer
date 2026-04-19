@@ -69,7 +69,7 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
-            type=ref,event=tag
+            type=semver,pattern={{version}}
             type=ref,event=pr
             type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
@@ -115,7 +115,7 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
-            type=ref,event=tag
+            type=semver,pattern={{version}}
             type=ref,event=pr
             type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
