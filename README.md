@@ -58,6 +58,48 @@ protoc --decode=askl.index.Project proto/index.proto < index.pb
 | `--root` | auto-detect | Project root directory |
 | `--threads`, `-j` | CPU count | Number of parallel threads |
 
+## Docker
+
+### Base indexer image
+
+Builds the indexer binary in a multi-stage Docker build:
+
+```bash
+docker build -f docker/Dockerfile -t askl-clang-indexer:latest .
+docker run --rm askl-clang-indexer:latest --help
+```
+
+Index a project with an existing `compile_commands.json`:
+
+```bash
+docker run --rm \
+  -v /path/to/project:/project:ro \
+  -v /path/to/output:/out \
+  askl-clang-indexer:latest /project --project myproject -o /out
+```
+
+### Target-specific images
+
+The `docker/` directory contains subdirectories for building indexes of specific software projects. Each extends the base indexer image with the target's build dependencies and an entrypoint that configures, builds, and indexes the project.
+
+#### `docker/linux/` — Linux kernel
+
+Builds on top of `askl-clang-indexer:latest`. Installs kernel build dependencies, then runs `make allmodconfig`, builds the kernel, generates `compile_commands.json`, and runs the indexer.
+
+```bash
+# Build the base image first
+docker build -f docker/Dockerfile -t askl-clang-indexer:latest .
+
+# Build the linux indexer image
+docker build -f docker/linux/Dockerfile -t askl-linux-indexer:latest docker/linux/
+
+# Index a kernel tree (sources are bind-mounted read-write for the build)
+docker run --rm \
+  -v /path/to/linux:/linux \
+  -v /path/to/output:/out \
+  askl-linux-indexer
+```
+
 ## Architecture
 
 - **Stage 1**: Per-TU AST walk extracting symbols (functions, structs, typedefs, enums, variables), symbol instances, and direct references (calls, type refs, decl refs).
