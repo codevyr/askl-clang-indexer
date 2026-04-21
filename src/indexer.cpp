@@ -21,12 +21,12 @@
 #include <unistd.h>
 
 Indexer::Indexer(const std::string& project_name, const std::string& compile_commands_dir,
-                const std::string& root_path, int threads, bool include_git_files,
+                const std::string& root_path, int threads, const std::string& git_root,
                 bool show_progress, bool show_warnings, const std::string& modules_method)
     : project_name_(project_name),
       root_path_(root_path),
       threads_(threads),
-      include_git_files_(include_git_files),
+      git_root_(git_root),
       show_progress_(show_progress),
       show_warnings_(show_warnings),
       modules_method_(modules_method),
@@ -198,7 +198,7 @@ void Indexer::addGitTrackedFiles() {
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
-        execlp("git", "git", "-C", root_path_.c_str(), "ls-files", "-z", nullptr);
+        execlp("git", "git", "-C", git_root_.c_str(), "ls-files", "-z", nullptr);
         _exit(127);
     }
 
@@ -231,7 +231,7 @@ void Indexer::addGitTrackedFiles() {
 
         if (rel_path.empty()) continue;
 
-        addFile(root_path_ + "/" + rel_path);
+        addFile(git_root_ + "/" + rel_path);
     }
 
     fprintf(stderr, "Git-tracked files added: %zu\n", all_files_.size() - before);
@@ -336,7 +336,7 @@ void Indexer::run() {
     for (auto& w : workers) w.join();
     if (show_progress_) fprintf(stderr, "\n");
 
-    if (include_git_files_) {
+    if (!git_root_.empty()) {
         addGitTrackedFiles();
     }
 

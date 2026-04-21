@@ -13,7 +13,7 @@
 class Indexer {
 public:
     Indexer(const std::string& project_name, const std::string& compile_commands_dir,
-            const std::string& root_path, int threads, bool include_git_files = false,
+            const std::string& root_path, int threads, const std::string& git_root = "",
             bool show_progress = false, bool show_warnings = false,
             const std::string& modules_method = "");
 
@@ -27,7 +27,7 @@ private:
     std::string project_name_;
     std::string root_path_;
     int threads_;
-    bool include_git_files_;
+    std::string git_root_;
     bool show_progress_;
     bool show_warnings_;
     std::string modules_method_;

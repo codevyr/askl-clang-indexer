@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libclang1-${LLVM_VERSION} \
     libclang-common-${LLVM_VERSION}-dev \
     libprotobuf32t64 \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 65532 nonroot \

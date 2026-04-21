@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
+if [ "$(id -u)" = "0" ]; then
+    TARGET=$(stat -c %u:%g /ucx)
+    chown "$TARGET" /out
+    exec gosu "$TARGET" "$0" "$@"
+fi
+
 cd /ucx
 
 ./autogen.sh
@@ -35,6 +41,5 @@ exec askl-clang-indexer /ucx \
   --project ucx \
   -j "$(nproc)" \
   --progress \
-  --include-git-files \
   -o /out \
   "$@"

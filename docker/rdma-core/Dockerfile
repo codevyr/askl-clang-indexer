@@ -7,7 +7,7 @@ FROM ${BASE_IMAGE}
 USER root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake ninja-build gcc g++ \
+    cmake ninja-build gcc g++ git \
     python3 \
     pkg-config \
     libnl-3-dev libnl-route-3-dev \
@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+ENV HOME=/tmp
 WORKDIR /rdma-core
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

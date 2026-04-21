@@ -1,7 +1,15 @@
 #!/bin/sh
 set -eu
 
+if [ "$(id -u)" = "0" ]; then
+    TARGET=$(stat -c %u:%g /rdma-core)
+    chown "$TARGET" /out
+    exec gosu "$TARGET" "$0" "$@"
+fi
+
 cd /rdma-core
+
+rm -rf build
 
 cmake -B build -GNinja \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=1 \
@@ -17,6 +25,6 @@ exec askl-clang-indexer /rdma-core/build \
   --project rdma-core \
   -j "$(nproc)" \
   --progress \
-  --include-git-files \
+  --git-root /rdma-core \
   -o /out \
   "$@"

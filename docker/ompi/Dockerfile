@@ -11,28 +11,28 @@ RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmwa
     /etc/apt/sources.list.d/debian.sources
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    make gcc g++ automake autoconf libtool pkg-config \
-    bear git ca-certificates \
+    make gcc g++ gfortran automake autoconf libtool pkg-config flex \
+    bear git ca-certificates perl python3 \
+    libnl-3-dev libnl-route-3-dev \
+    libevent-dev libhwloc-dev \
+    \
     libibverbs-dev librdmacm-dev \
+    libfabric-dev \
+    libucx-dev \
     libnuma-dev \
-    libfuse3-dev \
-    libbfd-dev libiberty-dev \
     valgrind \
+    zlib1g-dev \
     nvidia-cuda-dev \
     libamdhip64-dev hipcc \
     && rm -rf /var/lib/apt/lists/*
 
-# gdrcopy - no Debian package, build lib + headers from source
-RUN git clone --depth 1 --branch v2.5.2 https://github.com/NVIDIA/gdrcopy.git /tmp/gdrcopy && \
-    cd /tmp/gdrcopy && \
-    make CUDA=/usr prefix=/usr/local lib lib_install && \
-    ldconfig && \
-    rm -rf /tmp/gdrcopy
+# OMPI checks /usr/lib for libamdhip64 but Debian puts it in /usr/lib/x86_64-linux-gnu
+RUN ln -s /usr/lib/x86_64-linux-gnu/libamdhip64.so /usr/lib/libamdhip64.so
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV HOME=/tmp
-WORKDIR /ucx
+WORKDIR /ompi
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
