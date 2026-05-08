@@ -80,6 +80,34 @@ void Stage2::addFieldImplRefFromDecl(CXCursor field_decl, CXCursor func_ref) {
     result_.refs.push_back(std::move(ref));
 }
 
+void Stage2::addFieldToFieldRef(CXCursor lhs_member_ref, CXCursor rhs_member_ref) {
+    // Get the LHS field declaration and its source location
+    CXCursor lhs_field_decl = clang_getCursorReferenced(lhs_member_ref);
+    if (clang_Cursor_isNull(lhs_field_decl)) return;
+    if (clang_getCursorKind(lhs_field_decl) != CXCursor_FieldDecl) return;
+    if (resolveFieldCompoundName(lhs_field_decl).empty()) return;
+
+    CXFile field_file;
+    unsigned field_start, field_end;
+    if (!getExpansionRange(lhs_field_decl, field_file, field_start, field_end)) return;
+
+    // Get the RHS field symbol
+    CXCursor rhs_field_decl = clang_getCursorReferenced(rhs_member_ref);
+    if (clang_Cursor_isNull(rhs_field_decl)) return;
+    if (clang_getCursorKind(rhs_field_decl) != CXCursor_FieldDecl) return;
+
+    std::string rhs_compound = resolveFieldCompoundName(rhs_field_decl);
+    if (rhs_compound.empty()) return;
+
+    auto [rhs_sym_id, _] = symbols_.getOrCreate(rhs_compound, SCOPE_GLOBAL, SYMTYPE_FIELD);
+
+    // Synthetic ref: at the LHS field declaration site, reference to the RHS field symbol
+    Stage2Ref ref;
+    ref.source_file = getCanonicalPath(field_file);
+    ref.data = {rhs_sym_id, static_cast<int32_t>(field_start), static_cast<int32_t>(field_end)};
+    result_.refs.push_back(std::move(ref));
+}
+
 struct DesignatedInitData {
     CXCursor member_ref;
     CXCursor func_ref;
@@ -169,6 +197,30 @@ struct RhsFuncFinder {
     bool found = false;
 };
 
+// Helper to find a MemberRefExpr to a function-pointer field in the AST subtree
+struct RhsFieldFinder {
+    CXCursor member_ref;
+    bool found = false;
+};
+
+static CXChildVisitResult findFieldInRhs(CXCursor child, CXCursor, CXClientData data) {
+    auto* rd = static_cast<RhsFieldFinder*>(data);
+    if (rd->found) return CXChildVisit_Break;
+
+    CXCursorKind k = clang_getCursorKind(child);
+    if (k == CXCursor_MemberRefExpr) {
+        if (isFunctionPointerType(clang_getCursorType(child))) {
+            rd->member_ref = child;
+            rd->found = true;
+            return CXChildVisit_Break;
+        }
+    } else if (k == CXCursor_UnexposedExpr) {
+        clang_visitChildren(child, findFieldInRhs, data);
+        if (rd->found) return CXChildVisit_Break;
+    }
+    return CXChildVisit_Continue;
+}
+
 static CXChildVisitResult findFuncInRhs(CXCursor child, CXCursor, CXClientData data) {
     auto* rd = static_cast<RhsFuncFinder*>(data);
     if (rd->found) return CXChildVisit_Break;
@@ -226,7 +278,20 @@ void Stage2::handleBinaryAssignment(CXCursor cursor) {
         clang_visitChildren(rhs, findFuncInRhs, &rhs_data);
     }
 
-    if (!rhs_data.found) return;
+    if (!rhs_data.found) {
+        // field-to-field: ptr->a = other->b
+        RhsFieldFinder field_data;
+        if (clang_getCursorKind(rhs) == CXCursor_MemberRefExpr &&
+            isFunctionPointerType(clang_getCursorType(rhs))) {
+            field_data.member_ref = rhs;
+            field_data.found = true;
+        }
+        if (!field_data.found)
+            clang_visitChildren(rhs, findFieldInRhs, &field_data);
+        if (field_data.found)
+            addFieldToFieldRef(lhs, field_data.member_ref);
+        return;
+    }
 
     CXFile range_file;
     unsigned start_off, end_off;

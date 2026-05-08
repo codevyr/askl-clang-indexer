@@ -37,4 +37,5 @@ private:
     void addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start_off, unsigned end_off);
     void addFieldImplRef(CXCursor member_ref, CXCursor func_ref);
     void addFieldImplRefFromDecl(CXCursor field_decl, CXCursor func_ref);
+    void addFieldToFieldRef(CXCursor lhs_member_ref, CXCursor rhs_member_ref);
 };
