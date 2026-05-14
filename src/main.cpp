@@ -1,7 +1,9 @@
 #include <CLI/CLI.hpp>
 #include "indexer.h"
 
+#include <cstdio>
 #include <filesystem>
+#include <stdexcept>
 #include <thread>
 
 int main(int argc, char* argv[]) {
@@ -39,8 +41,13 @@ int main(int argc, char* argv[]) {
                                     : std::filesystem::canonical(git_root).string();
     }
 
-    Indexer indexer(project_name, project_dir, project_dir, threads, git_root, show_progress, show_warnings, modules_method);
-    indexer.run();
-    indexer.write(output_path);
+    try {
+        Indexer indexer(project_name, project_dir, project_dir, threads, git_root, show_progress, show_warnings, modules_method);
+        indexer.run();
+        indexer.write(output_path);
+    } catch (const std::runtime_error& e) {
+        fprintf(stderr, "Error: %s\n", e.what());
+        return 1;
+    }
     return 0;
 }
