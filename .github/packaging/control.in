@@ -1,0 +1,8 @@
+Package: askl-clang-indexer
+Version: @VERSION@
+Architecture: amd64
+Maintainer: Codevyr <codevyr@gmail.com>
+Depends: @DEPS@
+Description: C language indexer for the askl code search engine
+ Parses C source code using libclang and produces a protobuf index
+ compatible with the askl server.
