@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <sstream>
+#include <stdexcept>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_set>
@@ -145,8 +146,12 @@ CompilationDB::CompilationDB(const std::string& dir, const std::string& modules_
     CXCompilationDatabase_Error error;
     db_ = clang_CompilationDatabase_fromDirectory(dir.c_str(), &error);
     if (error != CXCompilationDatabase_NoError || !db_) {
-        fprintf(stderr, "Failed to load compile_commands.json from: %s\n", dir.c_str());
-        return;
+        throw std::runtime_error(
+            "No compile_commands.json found in: " + dir + "\n"
+            "Generate it with:\n"
+            "  CMake:  cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ...\n"
+            "  Bear:   bear -- make\n"
+            "Then run askl-clang-indexer from the directory containing compile_commands.json.");
     }
 
     CXCompileCommands cmds = clang_CompilationDatabase_getAllCompileCommands(db_);
