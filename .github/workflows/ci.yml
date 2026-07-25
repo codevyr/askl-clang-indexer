@@ -85,6 +85,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # SBOM + provenance attestations (push-only; buildkit needs the OCI exporter).
+          sbom: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          provenance: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'mode=max' || 'false' }}
 
   build-linux:
     name: Build and push linux image
