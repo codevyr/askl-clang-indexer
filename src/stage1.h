@@ -28,6 +28,14 @@ struct InstanceData {
     int32_t nesting_level = 0;
     int64_t dfs_enter = 0;
     int64_t dfs_exit = 0;
+
+    // Finer spans inside [start_offset, end_offset).  -1 = the indexer does not
+    // know one: a ##-pasted identifier has no file location at all (its name
+    // lives in clang's <scratch space> buffer), and not every kind has a
+    // signature or a body.  Absent must stay distinguishable from empty.
+    int32_t name_start = -1, name_end = -1;
+    int32_t sig_start = -1, sig_end = -1;
+    int32_t content_start = -1, content_end = -1;
 };
 
 struct RefData {
@@ -40,6 +48,10 @@ struct RefData {
     // nesting_level - 1.
     int32_t nesting_level = 0;
     int64_t dfs_enter = 0;
+
+    // FULL span of the referencing construct -- `printk(foo)` where
+    // [from_offset_start, from_offset_end) covers only `printk`.  Display only.
+    int32_t full_start = -1, full_end = -1;
 };
 
 struct FileData {
@@ -117,9 +129,14 @@ private:
                                   unsigned len, CXClientData data);
     void visitCursor(CXCursor cursor, CXCursor parent);
     void addRef(CXCursor cursor, int64_t sym_id, unsigned name_len);
-    void insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t end);
+    void insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t end,
+                   int32_t full_start = -1, int32_t full_end = -1);
     void addDocComment(CXCursor cursor, int64_t sym_id, size_t file_idx);
     void indexChildField(CXCursor child);
+    /// Fill in the name / signature / content spans for `cursor`, leaving any
+    /// the indexer cannot determine at -1.  Only spans that land in `file` and
+    /// inside the instance's own extent are recorded.
+    static void fillSpans(CXCursor cursor, CXFile file, InstanceData& d);
 
     // Names of types whose hoisted EnumDecl/StructDecl/UnionDecl should skip
     // TYPE instance creation because a TypedefDecl already covers it.

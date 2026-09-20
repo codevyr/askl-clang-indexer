@@ -140,8 +140,9 @@ void Stage1::indexChildField(CXCursor child) {
     unsigned start, end;
     if (getExpansionRange(child, file, start, end)) {
         size_t fi = getOrCreateFile(file);
-        addInstance(fi, {sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION},
-                    true);
+        InstanceData d{sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION};
+        fillSpans(child, file, d);
+        addInstance(fi, d, true);
         closeScopesTo(dfs_stack_.size() - 1);
     }
 }
@@ -152,6 +153,47 @@ void Stage1::indexChildField(CXCursor child) {
 // that symbols referenced in a macro body (e.g. a TypeRef to the variable's
 // type) appear within the expanded declaration's instance range, enabling
 // containment queries like `data @i {...} / #i {type}`.
+void Stage1::fillSpans(CXCursor cursor, CXFile file, InstanceData& d) {
+    auto record = [&](CXSourceRange range, int32_t& out_start, int32_t& out_end) {
+        CXFile f = nullptr;
+        unsigned s = 0, e = 0;
+        if (!getExpansionRange(range, f, s, e, /*clamp_zero_width=*/true)) return;
+        if (!f || !clang_File_isEqual(f, file)) return;
+        // A span outside the instance's own extent is not a finer detail of it
+        // -- that happens for ##-pasted names, which clang places in a virtual
+        // <scratch space> buffer rather than in any file.
+        if (static_cast<int32_t>(s) < d.start_offset || static_cast<int32_t>(e) > d.end_offset)
+            return;
+        out_start = static_cast<int32_t>(s);
+        out_end = static_cast<int32_t>(e);
+    };
+
+    record(clang_Cursor_getSpellingNameRange(cursor, 0, 0), d.name_start, d.name_end);
+
+    // The body, where there is one.  For a function that is the CompoundStmt
+    // child; everything before it is the signature, which is what makes a
+    // multi-line C declaration render correctly.
+    CXCursor body = clang_getNullCursor();
+    clang_visitChildren(
+        cursor,
+        [](CXCursor child, CXCursor, CXClientData data) {
+            if (clang_getCursorKind(child) == CXCursor_CompoundStmt) {
+                *static_cast<CXCursor*>(data) = child;
+                return CXChildVisit_Break;
+            }
+            return CXChildVisit_Continue;
+        },
+        &body);
+
+    if (!clang_Cursor_isNull(body)) {
+        record(clang_getCursorExtent(body), d.content_start, d.content_end);
+        if (d.content_start > d.start_offset) {
+            d.sig_start = d.start_offset;
+            d.sig_end = d.content_start;
+        }
+    }
+}
+
 int32_t Stage1::currentDepth(size_t fi) const {
     // The file's own instance is the root at depth 0, so the walk starts at 1.
     int32_t depth = 1;
@@ -198,7 +240,8 @@ void Stage1::finalizeFileRoots() {
     }
 }
 
-void Stage1::insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t end) {
+void Stage1::insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t end,
+                       int32_t full_start, int32_t full_end) {
     if (!file_ref_sets_[file_idx].insert({sym_id, start, end}).second)
         return;
     // A ref is a point, so it takes the file's current counter WITHOUT
@@ -209,6 +252,8 @@ void Stage1::insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t e
     // below its dfs_exit, which is stamped later from a higher counter.
     // Several refs in one scope may share a number; nothing tells them apart.
     RefData r{sym_id, start, end};
+    r.full_start = full_start;
+    r.full_end = full_end;
     r.nesting_level = currentDepth(file_idx);
     r.dfs_enter = dfs_counter_[file_idx] + 1;
     result_.files[file_idx].refs.push_back(r);
@@ -219,7 +264,20 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
     unsigned spelling_start, spelling_end;
     if (getSpellingRange(cursor, spelling_file, spelling_start, spelling_end, name_len)) {
         size_t fi = getOrCreateFile(spelling_file);
-        insertRef(fi, sym_id, static_cast<int32_t>(spelling_start), static_cast<int32_t>(spelling_end));
+        // The FULL span is the whole referencing construct -- `foo(a, b)` where
+        // the name span covers only `foo`.  Display only; ownership comes from
+        // the DFS position.  Absent when the construct straddles files, which
+        // is exactly the macro case.
+        int32_t full_start = -1, full_end = -1;
+        CXFile full_file = nullptr;
+        unsigned fs = 0, fe = 0;
+        if (getExpansionRange(cursor, full_file, fs, fe) && full_file &&
+            clang_File_isEqual(full_file, spelling_file)) {
+            full_start = static_cast<int32_t>(fs);
+            full_end = static_cast<int32_t>(fe);
+        }
+        insertRef(fi, sym_id, static_cast<int32_t>(spelling_start), static_cast<int32_t>(spelling_end),
+                  full_start, full_end);
     }
 
     // Use cursor location expansion (not extent) for tight expansion-site refs.
@@ -305,7 +363,9 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         unsigned start_off, end_off;
         if (getExpansionRange(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
-            addInstance(fi, {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type}, true);
+            InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
+            fillSpans(cursor, range_file, d);
+            addInstance(fi, d, true);
             addDocComment(cursor, sym_id, fi);
         }
         break;
@@ -343,7 +403,9 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             unsigned start_off, end_off;
             if (getExpansionRange(cursor, range_file, start_off, end_off)) {
                 size_t fi = getOrCreateFile(range_file);
-                addInstance(fi, {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type}, true);
+                InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
+                fillSpans(cursor, range_file, d);
+                addInstance(fi, d, true);
                 addDocComment(cursor, sym_id, fi);
             }
         }
@@ -395,7 +457,9 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         unsigned start_off, end_off;
         if (getExpansionRange(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
-            addInstance(fi, {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type}, true);
+            InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
+            fillSpans(cursor, range_file, d);
+            addInstance(fi, d, true);
             addDocComment(cursor, sym_id, fi);
         }
         break;

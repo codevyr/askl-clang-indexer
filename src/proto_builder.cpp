@@ -127,6 +127,23 @@ BuildResult ProtoBuilder::build(
                 pb_inst->set_nesting_level(inst.nesting_level);
                 pb_inst->set_dfs_enter(inst.dfs_enter);
                 pb_inst->set_dfs_exit(inst.dfs_exit);
+                // -1 means the indexer could not determine the span; leave the
+                // field unset so "unknown" stays distinct from "empty".
+                if (inst.name_start >= 0) {
+                    auto* sp = pb_inst->mutable_name();
+                    sp->set_start(inst.name_start);
+                    sp->set_end(inst.name_end);
+                }
+                if (inst.sig_start >= 0) {
+                    auto* sp = pb_inst->mutable_signature();
+                    sp->set_start(inst.sig_start);
+                    sp->set_end(inst.sig_end);
+                }
+                if (inst.content_start >= 0) {
+                    auto* sp = pb_inst->mutable_content();
+                    sp->set_start(inst.content_start);
+                    sp->set_end(inst.content_end);
+                }
             }
         }
 
@@ -141,6 +158,11 @@ BuildResult ProtoBuilder::build(
                 pb_ref->set_from_offset_end(ref.from_offset_end);
                 pb_ref->set_nesting_level(ref.nesting_level);
                 pb_ref->set_dfs_enter(ref.dfs_enter);
+                if (ref.full_start >= 0) {
+                    auto* sp = pb_ref->mutable_full();
+                    sp->set_start(ref.full_start);
+                    sp->set_end(ref.full_end);
+                }
             }
         }
     }
