@@ -9,20 +9,61 @@
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace {
-/// Directory and module containment instances span the whole object, exactly
-/// like the file instance the indexer already emitted.  Co-extensive instances
-/// are PEERS, not ancestors -- nothing in the ranges says which of them holds
-/// the others -- so they share the file root's interval and depth.  Keeping
-/// them at depth 0 is what lets `mod { func }`, `file { func }` and
-/// `dir { func }` all reach the same depth-1 declarations.
-void copyRootInterval(askl::index::Object* obj, askl::index::SymbolInstance* inst) {
-    if (obj->symbol_instances_size() == 0) return;
-    const auto& root = obj->symbol_instances(0);
-    inst->set_dfs_enter(root.dfs_enter());
-    inst->set_dfs_exit(root.dfs_exit());
-    inst->set_nesting_level(root.nesting_level());
+/// Slot the enclosing containment instances above the file's own numbering.
+///
+/// Stage1 numbers each file locally: the file instance at 0 and its
+/// declarations above it.  The module and directory instances are only added
+/// here, and they are genuine ANCESTORS of the file, not peers -- a module
+/// contains directories, a directory contains files.  So make room by shifting
+/// the whole file up by one stride per enclosing level and giving the chain the
+/// vacated numbers, outermost first.
+///
+/// Renumbering here rather than reserving a fixed prefix in Stage1 is what
+/// handles the chain length varying: a file outside any module has only a
+/// directory above it, and a fixed reservation would leave a hole in the depths
+/// that breaks "a direct child is at depth + 1".
+void nestUnderContainers(askl::index::Object* obj,
+                         const std::unordered_set<int64_t>& modIDs,
+                         const std::unordered_set<int64_t>& dirIDs,
+                         int64_t stride) {
+    // Outermost first: a module may span several directories.
+    std::vector<askl::index::SymbolInstance*> chain;
+    for (int i = 0; i < obj->symbol_instances_size(); ++i)
+        if (modIDs.count(obj->symbol_instances(i).symbol_local_id()))
+            chain.push_back(obj->mutable_symbol_instances(i));
+    for (int i = 0; i < obj->symbol_instances_size(); ++i)
+        if (dirIDs.count(obj->symbol_instances(i).symbol_local_id()))
+            chain.push_back(obj->mutable_symbol_instances(i));
+    if (chain.empty()) return;
+
+    const int64_t k = static_cast<int64_t>(chain.size());
+    const int64_t shift = k * stride;
+
+    int64_t max_exit = 0;
+    for (int i = 0; i < obj->symbol_instances_size(); ++i) {
+        auto* inst = obj->mutable_symbol_instances(i);
+        bool is_chain = false;
+        for (auto* c : chain) is_chain = is_chain || (c == inst);
+        if (is_chain) continue;
+        inst->set_dfs_enter(inst->dfs_enter() + shift);
+        inst->set_dfs_exit(inst->dfs_exit() + shift);
+        inst->set_nesting_level(inst->nesting_level() + static_cast<int32_t>(k));
+        max_exit = std::max(max_exit, inst->dfs_exit());
+    }
+    for (int i = 0; i < obj->refs_size(); ++i) {
+        auto* ref = obj->mutable_refs(i);
+        ref->set_dfs_enter(ref->dfs_enter() + shift);
+        ref->set_nesting_level(ref->nesting_level() + static_cast<int32_t>(k));
+    }
+
+    for (int64_t d = 0; d < k; ++d) {
+        chain[d]->set_dfs_enter(d * stride);
+        chain[d]->set_dfs_exit(max_exit + (k - d) * stride);
+        chain[d]->set_nesting_level(static_cast<int32_t>(d));
+    }
 }
 } // namespace
 
@@ -143,7 +184,6 @@ BuildResult ProtoBuilder::build(
         inst->set_start_offset(0);
         // Use file.content.size() via content_entries instead of obj->content().size()
         inst->set_end_offset(static_cast<int32_t>(content_entries[i].second->size()));
-        copyRootInterval(obj, inst);
     }
 
     // Add parent→child refs on directory sentinels
@@ -172,7 +212,16 @@ BuildResult ProtoBuilder::build(
         inst->set_instance_type(askl::index::InstanceType::CONTAINMENT);
         inst->set_start_offset(0);
         inst->set_end_offset(static_cast<int32_t>(content_entries[i].second->size()));
-        copyRootInterval(obj, inst);
+    }
+
+    // Both containment loops have run, so each file object now knows its full
+    // enclosing chain.  Slot it above the file's own numbering.
+    {
+        std::unordered_set<int64_t> modIDs, dirIDs;
+        for (auto& [name, id] : modSymbolID) modIDs.insert(id);
+        for (auto& [name, id] : dirSymbolID) dirIDs.insert(id);
+        for (int i = 0; i < file_object_count; ++i)
+            nestUnderContainers(project.mutable_objects(i), modIDs, dirIDs, 1024);
     }
 
     // Decide whether to inline content into Objects or use separate ContentBatch files
