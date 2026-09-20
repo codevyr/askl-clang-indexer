@@ -91,13 +91,18 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
             // Opens a scope so the expansion-site refs addRef emits land inside
             // its interval; closed immediately below, since a MacroExpansion
             // cursor has no AST children of its own.
-            self->addInstance(
-                fi, {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), INSTTYPE_EXPANSION},
-                true);
+            InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off),
+                           INSTTYPE_EXPANSION};
+            d.folded = true; // an expansion is the fold boundary itself
+            size_t idx = self->result_.files[fi].instances.size();
+            self->addInstance(fi, d, true);
             self->closeScopesTo(self->dfs_stack_.size() - 1);
-            // Record macro name end for expansion-site ref clamping in addRef
+            // Remember where the macro sits, so addRef can place an
+            // expansion-site ref INSIDE it rather than beside it.
+            const InstanceData& placed = self->result_.files[fi].instances[idx];
             uint64_t key = fileOffsetKey(fi, start_off);
-            self->macro_name_ends_[key] = end_off;
+            self->macro_sites_[key] =
+                MacroSite{end_off, placed.dfs_enter, placed.fold_depth};
         }
     }
 
@@ -142,6 +147,7 @@ void Stage1::indexChildField(CXCursor child) {
         size_t fi = getOrCreateFile(file);
         InstanceData d{sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION};
         fillSpans(child, file, d);
+        d.folded = isMacroGenerated(child);
         addInstance(fi, d, true);
         closeScopesTo(dfs_stack_.size() - 1);
     }
@@ -202,17 +208,42 @@ int32_t Stage1::currentDepth(size_t fi) const {
     return depth;
 }
 
+int32_t Stage1::currentFoldDepth(size_t fi) const {
+    for (auto it = dfs_stack_.rbegin(); it != dfs_stack_.rend(); ++it)
+        if (it->file_idx == fi)
+            return it->fold_depth + (it->folded ? 1 : 0);
+    return 0;
+}
+
+bool Stage1::isMacroGenerated(CXCursor cursor) {
+    CXSourceLocation loc = clang_getCursorLocation(cursor);
+    CXFile spell_file = nullptr, exp_file = nullptr;
+    unsigned spell_off = 0, exp_off = 0;
+    clang_getSpellingLocation(loc, &spell_file, nullptr, nullptr, &spell_off);
+    clang_getExpansionLocation(loc, &exp_file, nullptr, nullptr, &exp_off);
+    if (!exp_file) return false;
+    // No spelling file at all is the STRONGEST evidence, not the weakest: a
+    // ##-pasted identifier exists in no file, clang materialises it in a
+    // virtual <scratch space> buffer.  That is exactly `event_show` in
+    // PMU_FORMAT_ATTR(event, ...).
+    if (!spell_file) return true;
+    // Otherwise the two differ exactly when the code was written somewhere
+    // other than where it landed -- i.e. it came out of a macro.
+    return spell_off != exp_off || !clang_File_isEqual(spell_file, exp_file);
+}
+
 void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
     int64_t& counter = dfs_counter_[fi];
     counter += kDfsStride;
     d.dfs_enter = counter;
     d.dfs_exit = counter; // provisional; stamped by closeScopesTo for scopes
     d.nesting_level = currentDepth(fi);
+    d.fold_depth = currentFoldDepth(fi);
 
     size_t idx = result_.files[fi].instances.size();
     result_.files[fi].instances.push_back(d);
     if (opens_scope)
-        dfs_stack_.push_back({fi, idx});
+        dfs_stack_.push_back({fi, idx, d.folded, d.fold_depth});
 }
 
 void Stage1::closeScopesTo(size_t mark) {
@@ -255,6 +286,7 @@ void Stage1::insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t e
     r.full_start = full_start;
     r.full_end = full_end;
     r.nesting_level = currentDepth(file_idx);
+    r.fold_depth = currentFoldDepth(file_idx);
     r.dfs_enter = dfs_counter_[file_idx] + 1;
     result_.files[file_idx].refs.push_back(r);
 }
@@ -303,13 +335,20 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
         }
         if (diff_file || same_file_macro) {
             size_t fi = getOrCreateFile(expansion_file);
-            // Clamp to enclosing macro name width
+            // Clamp to the enclosing macro's name width, and place the ref
+            // inside that macro: one fold level deeper, so it is out of reach
+            // of `mod { func }` and reached by `mod { macro { func } }`.
             uint64_t key = fileOffsetKey(fi, exp_off);
-            auto it = macro_name_ends_.find(key);
-            int32_t exp_end = (it != macro_name_ends_.end())
-                ? static_cast<int32_t>(it->second)
+            auto it = macro_sites_.find(key);
+            int32_t exp_end = (it != macro_sites_.end())
+                ? static_cast<int32_t>(it->second.name_end)
                 : static_cast<int32_t>(exp_off + 1);  // fallback
             insertRef(fi, sym_id, static_cast<int32_t>(exp_off), exp_end);
+            if (it != macro_sites_.end()) {
+                RefData& r = result_.files[fi].refs.back();
+                r.dfs_enter = it->second.dfs_enter + 1;
+                r.fold_depth = it->second.fold_depth + 1;
+            }
         }
     }
 }
@@ -365,6 +404,10 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             size_t fi = getOrCreateFile(range_file);
             InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
             fillSpans(cursor, range_file, d);
+            // A declaration the preprocessor produced is a fold boundary: it is
+            // still a real symbol of this module, but what IT contains is macro
+            // plumbing and stays out of reach by default.
+            d.folded = isMacroGenerated(cursor);
             addInstance(fi, d, true);
             addDocComment(cursor, sym_id, fi);
         }
@@ -405,6 +448,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
                 size_t fi = getOrCreateFile(range_file);
                 InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
                 fillSpans(cursor, range_file, d);
+                d.folded = isMacroGenerated(cursor);
                 addInstance(fi, d, true);
                 addDocComment(cursor, sym_id, fi);
             }
@@ -459,6 +503,10 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             size_t fi = getOrCreateFile(range_file);
             InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
             fillSpans(cursor, range_file, d);
+            // A declaration the preprocessor produced is a fold boundary: it is
+            // still a real symbol of this module, but what IT contains is macro
+            // plumbing and stays out of reach by default.
+            d.folded = isMacroGenerated(cursor);
             addInstance(fi, d, true);
             addDocComment(cursor, sym_id, fi);
         }

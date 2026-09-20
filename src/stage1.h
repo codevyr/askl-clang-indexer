@@ -29,6 +29,14 @@ struct InstanceData {
     int64_t dfs_enter = 0;
     int64_t dfs_exit = 0;
 
+    // FOLDING -- orthogonal to depth.  An instance is folded when it exists
+    // only because of a macro expansion; fold_depth counts the folded
+    // ancestors above it.  `X { Y }` reaches descendants at the same
+    // fold_depth, so what a macro generates is one step out of reach by
+    // default and `mod { macro { func } }` steps into it on purpose.
+    bool folded = false;
+    int32_t fold_depth = 0;
+
     // Finer spans inside [start_offset, end_offset).  -1 = the indexer does not
     // know one: a ##-pasted identifier has no file location at all (its name
     // lives in clang's <scratch space> buffer), and not every kind has a
@@ -48,6 +56,11 @@ struct RefData {
     // nesting_level - 1.
     int32_t nesting_level = 0;
     int64_t dfs_enter = 0;
+
+    // Fold state of the owning scope: the argument token in `printk(foo)`
+    // stays at the caller's fold depth, each expanded use sits one deeper.
+    bool folded = false;
+    int32_t fold_depth = 0;
 
     // FULL span of the referencing construct -- `printk(foo)` where
     // [from_offset_start, from_offset_end) covers only `printk`.  Display only.
@@ -85,7 +98,15 @@ private:
     // Per-TU state
     std::unordered_map<std::string, size_t> file_index_; // filepath -> index in result_.files
     std::unordered_map<size_t, std::unordered_set<EntryKey, EntryKeyHash>> file_ref_sets_; // per-file ref dedup
-    std::unordered_map<uint64_t, unsigned> macro_name_ends_; // fileOffsetKey(fi, off) -> end_offset
+    /// What addRef needs to place an expansion-site ref inside the macro that
+    /// produced it: the clamped name end, plus the macro instance's own
+    /// position so the ref lands one fold level deeper.
+    struct MacroSite {
+        unsigned name_end;
+        int64_t dfs_enter;
+        int32_t fold_depth;
+    };
+    std::unordered_map<uint64_t, MacroSite> macro_sites_; // fileOffsetKey(fi, off) -> site
 
     // --- DFS numbering -------------------------------------------------
     //
@@ -98,6 +119,8 @@ private:
     struct DfsScope {
         size_t file_idx;
         size_t instance_idx;
+        bool folded;
+        int32_t fold_depth;
     };
     std::vector<DfsScope> dfs_stack_;
     std::unordered_map<size_t, int64_t> dfs_counter_; // file idx -> last number used
@@ -106,6 +129,14 @@ private:
     /// own instance is the root at depth 0, so everything the walk produces
     /// starts at 1.
     int32_t currentDepth(size_t fi) const;
+    /// Fold depth an instance created right now in `fi` would sit at: the
+    /// innermost open scope's depth, plus one if that scope is itself a fold
+    /// boundary.
+    int32_t currentFoldDepth(size_t fi) const;
+    /// True when the cursor exists only because of a macro expansion -- its
+    /// spelling location (where the text is) differs from its expansion
+    /// location (where the code lands).
+    static bool isMacroGenerated(CXCursor cursor);
     /// Append `d` to `fi`, numbering it into the enclosing scope.  When
     /// `opens_scope`, it becomes the parent of whatever is created next until
     /// the matching closeScopesTo.
