@@ -7,7 +7,33 @@
 #include "stage2.h"
 #include "symbol_types.h"
 
+namespace {
+/// Assign a ref its DFS position from the instance that contains it, for refs
+/// produced outside the numbering walk.  Narrowest containing extent wins;
+/// ties go to the greatest depth, then the latest dfs_enter.
+void numberRefByRange(const FileData& file, RefData& ref) {
+    const InstanceData* best = nullptr;
+    int64_t best_width = 0;
+    for (const auto& inst : file.instances) {
+        if (inst.start_offset > ref.from_offset_start || inst.end_offset < ref.from_offset_end)
+            continue;
+        int64_t width = static_cast<int64_t>(inst.end_offset) - inst.start_offset;
+        if (!best || width < best_width ||
+            (width == best_width &&
+             std::tie(inst.nesting_level, inst.dfs_enter) >
+                 std::tie(best->nesting_level, best->dfs_enter))) {
+            best = &inst;
+            best_width = width;
+        }
+    }
+    if (!best) return; // leave at the object root
+    ref.nesting_level = best->nesting_level + 1;
+    ref.dfs_enter = best->dfs_enter + 1;
+}
+} // namespace
+
 #include <algorithm>
+#include <tuple>
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -123,6 +149,8 @@ void Indexer::processTU(const CompileCommand& cmd) {
     auto results = stage1.takeResults();
     auto stage2_result = stage2.takeResults();
 
+
+
     // Merge stage2 refs into the appropriate FileData using stage1's file index,
     // deduplicating against existing refs (Stage2 can produce identical synthetic
     // refs when the same function is assigned to the same field via multiple
@@ -136,7 +164,17 @@ void Indexer::processTU(const CompileCommand& cmd) {
                        r.from_offset_start == ref.data.from_offset_start &&
                        r.from_offset_end == ref.data.from_offset_end;
             });
-            if (!dup) file_refs.push_back(ref.data);
+            if (!dup) {
+                // Stage2 runs as its own pass and has no DFS scope stack, so
+                // its refs arrive unnumbered.  Place each one by range instead:
+                // the innermost instance whose extent contains it, preferring
+                // the deepest on a tie.  That is correct here because macro
+                // expansion instances stay clamped to the macro name, so an
+                // argument token falls outside its macro and belongs to the
+                // enclosing scope.
+                numberRefByRange(results.files[it->second], ref.data);
+                file_refs.push_back(ref.data);
+            }
         }
     }
 

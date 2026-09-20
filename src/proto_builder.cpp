@@ -10,6 +10,22 @@
 #include <unordered_map>
 #include <unordered_set>
 
+namespace {
+/// Directory and module containment instances span the whole object, exactly
+/// like the file instance the indexer already emitted.  Co-extensive instances
+/// are PEERS, not ancestors -- nothing in the ranges says which of them holds
+/// the others -- so they share the file root's interval and depth.  Keeping
+/// them at depth 0 is what lets `mod { func }`, `file { func }` and
+/// `dir { func }` all reach the same depth-1 declarations.
+void copyRootInterval(askl::index::Object* obj, askl::index::SymbolInstance* inst) {
+    if (obj->symbol_instances_size() == 0) return;
+    const auto& root = obj->symbol_instances(0);
+    inst->set_dfs_enter(root.dfs_enter());
+    inst->set_dfs_exit(root.dfs_exit());
+    inst->set_nesting_level(root.nesting_level());
+}
+} // namespace
+
 BuildResult ProtoBuilder::build(
     const std::string& project_name,
     const std::string& root_path,
@@ -20,6 +36,8 @@ BuildResult ProtoBuilder::build(
     askl::index::Project project;
     project.set_project_name(project_name);
     project.set_root_path(root_path);
+
+
 
     // Add all symbols and collect directory/module symbol IDs in a single pass
     std::unordered_map<std::string, int64_t> dirSymbolID;
@@ -65,6 +83,9 @@ BuildResult ProtoBuilder::build(
                 pb_inst->set_instance_type(static_cast<askl::index::InstanceType>(inst.instance_type));
                 pb_inst->set_start_offset(inst.start_offset);
                 pb_inst->set_end_offset(inst.end_offset);
+                pb_inst->set_nesting_level(inst.nesting_level);
+                pb_inst->set_dfs_enter(inst.dfs_enter);
+                pb_inst->set_dfs_exit(inst.dfs_exit);
             }
         }
 
@@ -77,6 +98,8 @@ BuildResult ProtoBuilder::build(
                 pb_ref->set_to_symbol_local_id(ref.to_symbol_local_id);
                 pb_ref->set_from_offset_start(ref.from_offset_start);
                 pb_ref->set_from_offset_end(ref.from_offset_end);
+                pb_ref->set_nesting_level(ref.nesting_level);
+                pb_ref->set_dfs_enter(ref.dfs_enter);
             }
         }
     }
@@ -120,6 +143,7 @@ BuildResult ProtoBuilder::build(
         inst->set_start_offset(0);
         // Use file.content.size() via content_entries instead of obj->content().size()
         inst->set_end_offset(static_cast<int32_t>(content_entries[i].second->size()));
+        copyRootInterval(obj, inst);
     }
 
     // Add parent→child refs on directory sentinels
@@ -148,6 +172,7 @@ BuildResult ProtoBuilder::build(
         inst->set_instance_type(askl::index::InstanceType::CONTAINMENT);
         inst->set_start_offset(0);
         inst->set_end_offset(static_cast<int32_t>(content_entries[i].second->size()));
+        copyRootInterval(obj, inst);
     }
 
     // Decide whether to inline content into Objects or use separate ContentBatch files

@@ -66,8 +66,9 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         unsigned start_off, end_off;
         if (getSpellingRange(cursor, range_file, start_off, end_off)) {
             size_t fi = self->getOrCreateFile(range_file);
-            self->result_.files[fi].instances.push_back(
-                {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), INSTTYPE_DEFINITION});
+            self->addInstance(
+                fi, {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), INSTTYPE_DEFINITION},
+                false);
         }
     } else if (kind == CXCursor_MacroExpansion) {
         ClangString name(clang_getCursorSpelling(cursor));
@@ -87,8 +88,13 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         if (getSpellingRange(cursor, range_file, start_off, end_off)) {
             end_off = start_off + sname.size();  // clamp to macro name only
             size_t fi = self->getOrCreateFile(range_file);
-            self->result_.files[fi].instances.push_back(
-                {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), INSTTYPE_EXPANSION});
+            // Opens a scope so the expansion-site refs addRef emits land inside
+            // its interval; closed immediately below, since a MacroExpansion
+            // cursor has no AST children of its own.
+            self->addInstance(
+                fi, {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), INSTTYPE_EXPANSION},
+                true);
+            self->closeScopesTo(self->dfs_stack_.size() - 1);
             // Record macro name end for expansion-site ref clamping in addRef
             uint64_t key = fileOffsetKey(fi, start_off);
             self->macro_name_ends_[key] = end_off;
@@ -134,8 +140,9 @@ void Stage1::indexChildField(CXCursor child) {
     unsigned start, end;
     if (getExpansionRange(child, file, start, end)) {
         size_t fi = getOrCreateFile(file);
-        result_.files[fi].instances.push_back(
-            {sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION});
+        addInstance(fi, {sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION},
+                    true);
+        closeScopesTo(dfs_stack_.size() - 1);
     }
 }
 
@@ -145,9 +152,66 @@ void Stage1::indexChildField(CXCursor child) {
 // that symbols referenced in a macro body (e.g. a TypeRef to the variable's
 // type) appear within the expanded declaration's instance range, enabling
 // containment queries like `data @i {...} / #i {type}`.
+int32_t Stage1::currentDepth(size_t fi) const {
+    // The file's own instance is the root at depth 0, so the walk starts at 1.
+    int32_t depth = 1;
+    for (const auto& sc : dfs_stack_)
+        if (sc.file_idx == fi) ++depth;
+    return depth;
+}
+
+void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
+    int64_t& counter = dfs_counter_[fi];
+    counter += kDfsStride;
+    d.dfs_enter = counter;
+    d.dfs_exit = counter; // provisional; stamped by closeScopesTo for scopes
+    d.nesting_level = currentDepth(fi);
+
+    size_t idx = result_.files[fi].instances.size();
+    result_.files[fi].instances.push_back(d);
+    if (opens_scope)
+        dfs_stack_.push_back({fi, idx});
+}
+
+void Stage1::closeScopesTo(size_t mark) {
+    while (dfs_stack_.size() > mark) {
+        DfsScope sc = dfs_stack_.back();
+        dfs_stack_.pop_back();
+        int64_t& counter = dfs_counter_[sc.file_idx];
+        counter += kDfsStride;
+        result_.files[sc.file_idx].instances[sc.instance_idx].dfs_exit = counter;
+    }
+}
+
+void Stage1::finalizeFileRoots() {
+    // instances[0] of every file is the FILE instance created by
+    // getOrCreateFile.  Give it the whole interval so it is the root every
+    // other instance in the object nests inside.
+    for (size_t fi = 0; fi < result_.files.size(); ++fi) {
+        auto& insts = result_.files[fi].instances;
+        if (insts.empty()) continue;
+        auto it = dfs_counter_.find(fi);
+        int64_t last = (it == dfs_counter_.end()) ? 0 : it->second;
+        insts[0].dfs_enter = 0;
+        insts[0].dfs_exit = last + kDfsStride;
+        insts[0].nesting_level = 0;
+    }
+}
+
 void Stage1::insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t end) {
-    if (file_ref_sets_[file_idx].insert({sym_id, start, end}).second)
-        result_.files[file_idx].refs.push_back({sym_id, start, end});
+    if (!file_ref_sets_[file_idx].insert({sym_id, start, end}).second)
+        return;
+    // A ref is a point, so it takes the file's current counter WITHOUT
+    // advancing it -- plus one, because a ref emitted immediately after its
+    // scope opened would otherwise land exactly ON the scope's dfs_enter and
+    // fail the strict containment test.  The stride leaves ample room.  The
+    // result is strictly inside the enclosing scope: above its dfs_enter, and
+    // below its dfs_exit, which is stamped later from a higher counter.
+    // Several refs in one scope may share a number; nothing tells them apart.
+    RefData r{sym_id, start, end};
+    r.nesting_level = currentDepth(file_idx);
+    r.dfs_enter = dfs_counter_[file_idx] + 1;
+    result_.files[file_idx].refs.push_back(r);
 }
 
 void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
@@ -201,15 +265,22 @@ void Stage1::addDocComment(CXCursor cursor, int64_t sym_id, size_t /*file_idx*/)
     if (!getExpansionRange(comment_range, file, start_off, end_off)) return;
 
     size_t comment_file_idx = getOrCreateFile(file);
-    result_.files[comment_file_idx].instances.push_back(
-        {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off),
-         INSTTYPE_DOCUMENTATION});
+    addInstance(comment_file_idx,
+                {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off),
+                 INSTTYPE_DOCUMENTATION},
+                false);
 }
 
 CXChildVisitResult Stage1::visitor(CXCursor cursor, CXCursor parent, CXClientData data) {
     auto* self = static_cast<Stage1*>(data);
+    // Recurse explicitly rather than returning CXChildVisit_Recurse: libclang
+    // gives no "leaving this cursor" callback, and the DFS exit number has to
+    // be stamped after the subtree is done.  Traversal is otherwise identical.
+    size_t mark = self->dfs_stack_.size();
     self->visitCursor(cursor, parent);
-    return CXChildVisit_Recurse;
+    clang_visitChildren(cursor, visitor, self);
+    self->closeScopesTo(mark);
+    return CXChildVisit_Continue;
 }
 
 void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
@@ -234,7 +305,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         unsigned start_off, end_off;
         if (getExpansionRange(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
-            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
+            addInstance(fi, {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type}, true);
             addDocComment(cursor, sym_id, fi);
         }
         break;
@@ -272,7 +343,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             unsigned start_off, end_off;
             if (getExpansionRange(cursor, range_file, start_off, end_off)) {
                 size_t fi = getOrCreateFile(range_file);
-                result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
+                addInstance(fi, {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type}, true);
                 addDocComment(cursor, sym_id, fi);
             }
         }
@@ -300,8 +371,9 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
                 unsigned start, end;
                 if (getExpansionRange(child, file, start, end)) {
                     size_t fi = self->getOrCreateFile(file);
-                    self->result_.files[fi].instances.push_back(
-                        {sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION});
+                    self->addInstance(
+                        fi, {sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION},
+                        false);
                 }
                 return CXChildVisit_Continue;
             }, this);
@@ -323,7 +395,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         unsigned start_off, end_off;
         if (getExpansionRange(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
-            result_.files[fi].instances.push_back({sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type});
+            addInstance(fi, {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type}, true);
             addDocComment(cursor, sym_id, fi);
         }
         break;
@@ -427,6 +499,8 @@ void Stage1::process(CXTranslationUnit tu, const std::string& tu_filename) {
 
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, visitor, this);
+    closeScopesTo(0);
+    finalizeFileRoots();
 }
 
 Stage1Result Stage1::takeResults() {
