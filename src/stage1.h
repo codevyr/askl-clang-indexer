@@ -37,6 +37,12 @@ struct InstanceData {
     bool folded = false;
     int32_t fold_depth = 0;
 
+    // TRANSIENT, never on the wire: the instance this one was nested inside
+    // according to the AST walk (nearest open scope in the same file), or -1.
+    // `numberTree` uses it only to break ties between instances with IDENTICAL
+    // ranges -- the one case ranges cannot decide.
+    int32_t stack_parent = -1;
+
     // Finer spans inside [start_offset, end_offset).  -1 = the indexer does not
     // know one: a ##-pasted identifier has no file location at all (its name
     // lives in clang's <scratch space> buffer), and not every kind has a
@@ -61,6 +67,13 @@ struct RefData {
     // stays at the caller's fold depth, each expanded use sits one deeper.
     bool folded = false;
     int32_t fold_depth = 0;
+
+    // TRANSIENT, never on the wire: the instance that owns this reference.
+    // Set from the AST scope for an ordinary ref and from the enclosing macro
+    // for an expansion-site ref -- a distinction ranges cannot make, since both
+    // lie inside the caller.  `numberTree` stamps the numbers above from it, so
+    // "a ref lies inside its owner" holds by construction.
+    int32_t owner_idx = -1;
 
     // FULL span of the referencing construct -- `printk(foo)` where
     // [from_offset_start, from_offset_end) covers only `printk`.  Display only.
@@ -103,36 +116,37 @@ private:
     /// position so the ref lands one fold level deeper.
     struct MacroSite {
         unsigned name_end;
-        int64_t dfs_enter;
-        int32_t fold_depth;
+        int32_t instance_idx; // numbers are not known until numberTree runs
     };
     std::unordered_map<uint64_t, MacroSite> macro_sites_; // fileOffsetKey(fi, off) -> site
 
     // --- DFS numbering -------------------------------------------------
     //
     // Numbers are SPARSE so an ephemeral layer can later insert an instance
-    // between two neighbours without renumbering: 10 successive inserts at one
-    // position (1024 -> 512 -> ... -> 1) before a local renumber is needed.
-    // Counters are per FILE, because containment never crosses objects.
+    // between two neighbours without renumbering; one stride per instance is
+    // what `DFS_STRIDE` on the askld side requires.  Numbering is per FILE,
+    // because containment never crosses objects.
+    //
+    // The WALK only records structure -- a parent index per instance, an owner
+    // index per ref.  `numberTree` then assigns every tree field in one place,
+    // which is what makes it impossible to set three of four and forget the
+    // fourth (the zero-width-leaf bug).
     static constexpr int64_t kDfsStride = 1024;
 
     struct DfsScope {
         size_t file_idx;
         size_t instance_idx;
-        bool folded;
-        int32_t fold_depth;
     };
     std::vector<DfsScope> dfs_stack_;
-    std::unordered_map<size_t, int64_t> dfs_counter_; // file idx -> last number used
 
-    /// Depth an instance created right now in `fi` would sit at.  The file's
-    /// own instance is the root at depth 0, so everything the walk produces
-    /// starts at 1.
-    int32_t currentDepth(size_t fi) const;
-    /// Fold depth an instance created right now in `fi` would sit at: the
-    /// innermost open scope's depth, plus one if that scope is itself a fold
-    /// boundary.
-    int32_t currentFoldDepth(size_t fi) const;
+    /// Index of the innermost open scope in `fi`, or -1.  Scopes from other
+    /// files are skipped: one TU walk descends into headers, and each file has
+    /// its own tree.
+    int32_t stackParent(size_t fi) const;
+
+    /// Derive the containment tree from the ranges the walk collected, then
+    /// number it.  See the definition for the parentage rule.
+    static void numberTree(FileData& f);
     /// True when the cursor exists only because of a macro expansion -- its
     /// spelling location (where the text is) differs from its expansion
     /// location (where the code lands).
@@ -144,7 +158,6 @@ private:
     /// Close scopes until the stack is back to `mark`, stamping each exit.
     void closeScopesTo(size_t mark);
     /// Give every file's root instance an interval covering the whole file.
-    void finalizeFileRoots();
 
     static uint64_t fileOffsetKey(size_t file_idx, unsigned offset) {
         return (static_cast<uint64_t>(file_idx) << 32) | offset;

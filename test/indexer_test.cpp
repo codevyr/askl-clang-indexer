@@ -3,6 +3,9 @@
 #include "indexer.h"
 #include "symbol_table.h"
 #include "stage1.h"
+#include "proto_builder.h"
+#include "symbol_types.h"
+#include "proto/index.pb.h"
 
 #include <gtest/gtest.h>
 
@@ -886,7 +889,14 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "foo", 1},
                 {"main.c", "main.c", 6},
                 // Expansion instance clamped to macro name (not full call)
-                {"main.c", "some_macro", 3, 56, 66},
+                // The expansion spans the WHOLE invocation `some_macro(bar)`,
+                // not just the name.  It used to be clamped to `[56,66)` so
+                // that `bar` fell outside it and became a child of the
+                // enclosing scope BY RANGE; parentage comes from the DFS
+                // interval now, so the clamp only discarded the span that
+                // records what the author wrote.  What keeps `bar`'s text the
+                // caller's is that a folded instance owns no text.
+                {"main.c", "some_macro", 3, 56, 71},
             }
         },
         // Validates fallback logic for anonymous/typedef enums vs named enums.
@@ -1374,4 +1384,344 @@ TEST(CompilationDB, KbuildNoModuleDefine) {
     CompilationDB db(tmp.path, "kbuild");
     ASSERT_EQ(db.commands().size(), 1u);
     EXPECT_TRUE(db.commands()[0].modname.empty());
+}
+
+// --- Object root intervals -----------------------------------------------
+//
+// Containment is `parent.dfs_enter < child.dfs_enter < parent.dfs_exit`, so an
+// object whose root instance is left at [0,0) can contain nothing at all --
+// silently, since a zero-width interval is not an error anywhere.  Two kinds
+// of object bypass Stage1's numbering walk and used to end up that way: files
+// pulled in by --include-git-files (their file instance comes from
+// Indexer::addFile) and directory sentinels (built from the symbol table).
+
+TEST(ObjectRoots, UnparsedFileGetsNonEmptyRootInterval) {
+    SymbolTable symbols;
+    const std::string path = "/proj/README.md";
+    const std::string text = "hello\n";
+
+    auto [file_sym, _] = symbols.getOrCreate(path, SCOPE_GLOBAL, SYMTYPE_FILE);
+
+    FileData fd;
+    fd.object_local_id = 1;
+    fd.module_path = path;
+    fd.filesystem_path = path;
+    fd.filetype = "documentation";
+    fd.content.assign(text.begin(), text.end());
+    // Exactly what Indexer::addFile builds: four fields, no DFS numbers.
+    fd.instances.push_back(
+        {file_sym, 0, static_cast<int32_t>(text.size()), INSTTYPE_FILE});
+    ASSERT_EQ(fd.instances[0].dfs_exit, 0) << "fixture must start unnumbered";
+
+    auto built = ProtoBuilder::build("test", "/proj", symbols, {fd}, 1);
+    askl::index::Project project;
+    ASSERT_TRUE(project.ParseFromString(built.project_data));
+    ASSERT_GE(project.objects_size(), 1);
+
+    const auto& root = project.objects(0).symbol_instances(0);
+    EXPECT_GT(root.dfs_exit(), root.dfs_enter())
+        << "an unparsed file's root must be able to contain something";
+}
+
+TEST(ObjectRoots, EveryObjectInARealProjectIsNumbered) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/small_project";
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"ops.c", "main.c"});
+
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+
+    auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                     indexer.allFiles(), 1);
+    askl::index::Project project;
+    ASSERT_TRUE(project.ParseFromString(built.project_data));
+    ASSERT_GT(project.objects_size(), 0);
+
+    for (const auto& obj : project.objects()) {
+        ASSERT_GT(obj.symbol_instances_size(), 0)
+            << "object " << obj.module_path() << " has no instances";
+        const auto& root = obj.symbol_instances(0);
+        EXPECT_GT(root.dfs_exit(), root.dfs_enter())
+            << "degenerate root interval on " << obj.module_path()
+            << " (filetype " << obj.filetype() << ")";
+
+        // A ref is a point in the same DFS order, and the engine finds it by
+        // `container.dfs_enter < ref.dfs_enter < container.dfs_exit`.  A ref
+        // outside every interval is as invisible as an unnumbered instance.
+        for (const auto& ref : obj.refs()) {
+            bool inside = false;
+            for (const auto& inst : obj.symbol_instances())
+                inside = inside || (inst.dfs_enter() < ref.dfs_enter() &&
+                                    ref.dfs_enter() < inst.dfs_exit());
+            EXPECT_TRUE(inside)
+                << "ref at dfs_enter " << ref.dfs_enter() << " on "
+                << obj.module_path() << " lies outside every instance interval";
+        }
+    }
+}
+
+// The invariants askld's `validate_object_tree` enforces at upload, checked
+// here at the producer so the two cannot drift.  Every one of them was a real
+// bug at some point: zero-width intervals (three call sites that never stamped
+// an exit), unnumbered roots and refs, and a nesting_level that disagreed with
+// the interval.  An index violating any of them is REJECTED at upload, so this
+// test is what stands between a change here and a reindex that cannot be
+// uploaded.
+// A macro expansion belongs to the function it is written in.
+//
+// `collectMacros` runs before the AST walk with an empty scope stack, so an
+// expansion used to be numbered at file level -- in `macro_nested/main.c`,
+// `handler` got [4096,5120) while `FATAL("boom")` inside it got [2048,3072),
+// a SIBLING numbered earlier.  `func("handler") { macro }` could not work, and
+// only `mod { macro { func } }` did, because that route goes mod -> file ->
+// macro.  Deriving parentage from ranges fixes it; this pins that it stays
+// fixed, since the cause (a pre-pass with no stack) is still there.
+TEST(ObjectRoots, AMacroExpansionIsInsideItsEnclosingFunction) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/macro_nested";
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"main.c"});
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+    auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                     indexer.allFiles(), 1);
+    askl::index::Project project;
+    ASSERT_TRUE(project.ParseFromString(built.project_data));
+
+    bool checked = false;
+    for (const auto& obj : project.objects()) {
+        if (obj.module_path().find("main.c") == std::string::npos) continue;
+        const askl::index::SymbolInstance* func = nullptr;
+        const askl::index::SymbolInstance* expansion = nullptr;
+        for (const auto& i : obj.symbol_instances()) {
+            if (i.instance_type() == askl::index::InstanceType::EXPANSION)
+                expansion = &i;
+            else if (i.instance_type() == askl::index::InstanceType::DEFINITION)
+                func = &i;
+        }
+        ASSERT_NE(func, nullptr) << "fixture must define a function";
+        ASSERT_NE(expansion, nullptr) << "fixture must expand a macro inside it";
+        ASSERT_LT(func->start_offset(), expansion->start_offset())
+            << "and the expansion must sit textually inside it";
+
+        EXPECT_TRUE(func->dfs_enter() < expansion->dfs_enter() &&
+                    expansion->dfs_enter() < func->dfs_exit())
+            << "the expansion at [" << expansion->dfs_enter() << ","
+            << expansion->dfs_exit() << ") must be inside the function at ["
+            << func->dfs_enter() << "," << func->dfs_exit() << ")";
+        EXPECT_EQ(expansion->nesting_level(), func->nesting_level() + 1)
+            << "one level down, not a sibling";
+        // And it is still a fold boundary at the function's fold depth, which
+        // is what keeps the function itself in `mod { func }` while what the
+        // macro GENERATES stays one level out of reach.
+        EXPECT_TRUE(expansion->folded());
+        EXPECT_EQ(expansion->fold_depth(), func->fold_depth());
+        checked = true;
+    }
+    ASSERT_TRUE(checked) << "main.c was not in the built project";
+}
+
+// A ref merged from a LATER translation unit is renumbered against the
+// instances it will actually live with.
+//
+// `Indexer::processTU` keeps the FIRST TU's instances for a shared header and
+// merges only later TUs' refs -- so a merged ref's numbers were computed
+// against an instance set that is then discarded.  It worked only while two TUs
+// happened to walk the header identically.
+//
+// This fixture makes them differ: `ops.h` declares `struct extra_decl` under
+// `#ifdef WANT_EXTRA`, which only `b.c` defines, and it sits BEFORE
+// `struct ops` so every later instance shifts in b.c's walk.  Both TUs then
+// attribute a Stage2 synthetic ref to the SAME field (`run`), so both refs land
+// on one range and must resolve to one owner.  Un-renumbered, b.c's ref came
+// out at dfs 11265 against a.c's numbering -- outside the field entirely --
+// while a.c's sat correctly at 5121.
+TEST(ObjectRoots, ARefMergedFromAnotherTuIsRenumbered) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/cross_tu_field_refs";
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"a.c", "b.c"});
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+
+    bool checked = false;
+    for (const auto& f : indexer.allFiles()) {
+        if (f.module_path.find("ops.h") == std::string::npos) continue;
+
+        // Both TUs contributed, so the merge path really ran.
+        ASSERT_EQ(f.refs.size(), 2u)
+            << "each TU attributes one synthetic ref to ops.h's field";
+        ASSERT_EQ(f.refs[0].from_offset_start, f.refs[1].from_offset_start)
+            << "and both to the SAME field declaration";
+        ASSERT_NE(f.refs[0].to_symbol_local_id, f.refs[1].to_symbol_local_id)
+            << "pointing at different workers, which is why dedup keeps both";
+
+        // One range, one owner: the numbers must agree.
+        EXPECT_EQ(f.refs[0].dfs_enter, f.refs[1].dfs_enter);
+        EXPECT_EQ(f.refs[0].nesting_level, f.refs[1].nesting_level);
+        EXPECT_EQ(f.refs[0].fold_depth, f.refs[1].fold_depth);
+
+        // And that owner is the field they are attributed to, in THIS file's
+        // surviving instances.
+        for (const auto& r : f.refs) {
+            const InstanceData* owner = nullptr;
+            for (const auto& i : f.instances)
+                if (i.dfs_enter < r.dfs_enter && r.dfs_enter < i.dfs_exit &&
+                    (!owner || i.dfs_enter > owner->dfs_enter))
+                    owner = &i;
+            ASSERT_NE(owner, nullptr)
+                << "ref at dfs " << r.dfs_enter << " is outside every interval";
+            EXPECT_EQ(r.nesting_level, owner->nesting_level + 1);
+            EXPECT_EQ(owner->start_offset, r.from_offset_start)
+                << "the owner is the field the ref was attributed to";
+        }
+        checked = true;
+    }
+    ASSERT_TRUE(checked) << "ops.h was not indexed";
+}
+
+TEST(ObjectRoots, EveryInstanceFormsAValidTree) {
+    for (const char* fx : {"small_project", "doc_comments", "typedef_basic",
+                           "enum_basic", "enum_in_switch", "macro_nested",
+                           "macro_expansion_arg", "shared_header_typedef",
+                           "union_basic", "type_ref_chain",
+                           // Two TUs sharing a header they number differently:
+                           // covers the cross-TU ref merge.
+                           "cross_tu_field_refs"}) {
+        std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fx;
+        TempDir temp_dir = makeTempDir();
+        std::vector<std::string> srcs;
+        for (auto& e : fs::directory_iterator(fixture_dir))
+            if (e.path().extension() == ".c") srcs.push_back(e.path().filename().string());
+        ASSERT_FALSE(srcs.empty()) << "fixture " << fx << " has no .c sources";
+        std::sort(srcs.begin(), srcs.end());
+        generateCompileCommands(fixture_dir, temp_dir.path, srcs);
+
+        Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+        indexer.run();
+        auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                         indexer.allFiles(), 1);
+        askl::index::Project project;
+        ASSERT_TRUE(project.ParseFromString(built.project_data));
+        ASSERT_GT(project.objects_size(), 0) << fx;
+
+        for (const auto& obj : project.objects()) {
+            std::string where = std::string(fx) + " " + obj.module_path();
+
+            // (enter, exit, nesting_level, folded, fold_depth), outermost
+            // first; exit DESC breaks ties so a parent precedes a child that
+            // starts at the same number.
+            struct Node { int64_t enter, exit; int32_t level; bool folded; int32_t fold; };
+            std::vector<Node> nodes;
+            for (const auto& i : obj.symbol_instances())
+                nodes.push_back({i.dfs_enter(), i.dfs_exit(), i.nesting_level(),
+                                 i.folded(), i.fold_depth()});
+            std::sort(nodes.begin(), nodes.end(), [](const Node& a, const Node& b) {
+                return a.enter != b.enter ? a.enter < b.enter : a.exit > b.exit;
+            });
+
+            std::vector<Node> stack;
+            int64_t prev_enter = -1;
+            for (const auto& n : nodes) {
+                ASSERT_GT(n.exit, n.enter)
+                    << where << ": empty interval [" << n.enter << ", " << n.exit
+                    << ") can never contain anything";
+                ASSERT_NE(n.enter, prev_enter)
+                    << where << ": two instances share dfs_enter " << n.enter;
+                prev_enter = n.enter;
+
+                while (!stack.empty() && stack.back().exit <= n.enter) stack.pop_back();
+                if (!stack.empty()) {
+                    const Node& p = stack.back();
+                    ASSERT_LE(n.exit, p.exit)
+                        << where << ": [" << n.enter << ", " << n.exit
+                        << ") escapes its parent [" << p.enter << ", " << p.exit << ")";
+                    ASSERT_EQ(n.fold, p.fold + (p.folded ? 1 : 0))
+                        << where << ": [" << n.enter << ", " << n.exit
+                        << ") fold_depth disagrees with its parent";
+                } else {
+                    ASSERT_EQ(n.fold, 0)
+                        << where << ": root [" << n.enter << ", " << n.exit
+                        << ") has fold_depth " << n.fold;
+                }
+                ASSERT_EQ(n.level, static_cast<int32_t>(stack.size()))
+                    << where << ": [" << n.enter << ", " << n.exit
+                    << ") says nesting_level " << n.level << " but sits "
+                    << stack.size() << " levels deep";
+                stack.push_back(n);
+            }
+
+            // The tree AGREES WITH RANGE NESTING, with the DFS order as the
+            // tie-break for the equal ranges synthesised code produces.  After
+            // W7 that is the parentage rule's definition rather than an
+            // aspiration, so this holds with NO exceptions -- including for
+            // macro expansions, which used to be numbered as siblings of the
+            // function they textually sit in.
+            //
+            // It was written once before W7 and failed twice: on the macro
+            // expansion, and on every `opens_scope = false` instance that was
+            // a tree leaf whose range still contained other instances.
+            for (int a = 0; a < obj.symbol_instances_size(); ++a) {
+                const auto& ia = obj.symbol_instances(a);
+                for (int b = 0; b < obj.symbol_instances_size(); ++b) {
+                    if (a == b) continue;
+                    const auto& ib = obj.symbol_instances(b);
+                    bool strictly_contains =
+                        ia.start_offset() <= ib.start_offset() &&
+                        ib.end_offset() <= ia.end_offset() &&
+                        (ia.start_offset() != ib.start_offset() ||
+                         ia.end_offset() != ib.end_offset());
+                    if (!strictly_contains) continue;
+                    EXPECT_TRUE(ia.dfs_enter() < ib.dfs_enter() &&
+                                ib.dfs_enter() < ia.dfs_exit())
+                        << where << ": range [" << ia.start_offset() << ","
+                        << ia.end_offset() << ") strictly contains ["
+                        << ib.start_offset() << "," << ib.end_offset()
+                        << ") but interval [" << ia.dfs_enter() << ","
+                        << ia.dfs_exit() << ") does not contain ["
+                        << ib.dfs_enter() << "," << ib.dfs_exit() << ")";
+                }
+            }
+
+            // A ref is a point in the same order, so it has to land strictly
+            // inside some instance -- and its depth and fold depth have to
+            // agree with the instance its NUMBER puts it in.
+            //
+            // Those can drift, because they come from different places: the
+            // expansion-site branch of `addRef` takes a ref's dfs_enter from
+            // the macro it landed in, while `insertRef` already set its
+            // nesting_level from whatever AST scope was open.  They agree only
+            // while a reference sits inside exactly one scope, which is the
+            // common case and the only one these fixtures have.  Asserting it
+            // is what turns "happens to hold" into "is checked".
+            for (const auto& ref : obj.refs()) {
+                const Node* owner = nullptr;
+                for (const auto& n : nodes)
+                    if (n.enter < ref.dfs_enter() && ref.dfs_enter() < n.exit &&
+                        (!owner || n.enter > owner->enter))
+                        owner = &n;
+                ASSERT_NE(owner, nullptr)
+                    << where << ": ref at dfs_enter " << ref.dfs_enter()
+                    << " lies outside every instance interval";
+                EXPECT_EQ(ref.nesting_level(), owner->level + 1)
+                    << where << ": ref at " << ref.dfs_enter() << " says nesting_level "
+                    << ref.nesting_level() << ", but its interval puts it inside ["
+                    << owner->enter << ", " << owner->exit << ") at level " << owner->level;
+                EXPECT_EQ(ref.fold_depth(), owner->fold + (owner->folded ? 1 : 0))
+                    << where << ": ref at " << ref.dfs_enter() << " says fold_depth "
+                    << ref.fold_depth() << ", but its owner [" << owner->enter << ", "
+                    << owner->exit << ") has fold_depth " << owner->fold
+                    << " folded=" << owner->folded;
+            }
+
+            // One full stride between enter and exit, which numbering by
+            // stride gives for free.  That gap is where query-time rows are
+            // numbered, so an instance narrower than a stride cannot hold its
+            // own search matches -- they land past its dfs_exit and silently
+            // stop being its descendants.  Mirrors askld's DFS_STRIDE, which
+            // the upload validator enforces.
+            for (const auto& n : nodes)
+                ASSERT_GE(n.exit - n.enter, 1024)
+                    << where << ": [" << n.enter << ", " << n.exit
+                    << ") is narrower than one DFS stride";
+        }
+    }
 }

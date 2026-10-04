@@ -12,6 +12,50 @@
 #include <vector>
 
 namespace {
+/// Give an object's first instance a root interval when nothing numbered it.
+///
+/// Stage1::finalizeFileRoots() numbers instances[0] of every file it PARSED.
+/// Two kinds of object never go through that walk:
+///
+///  - a file with no compile command -- everything --include-git-files pulls
+///    in -- whose file instance comes from Indexer::addFile;
+///  - a directory sentinel, created above out of the symbol table alone.
+///
+/// Left at [0,0) such a root can contain nothing, because containment is
+/// `parent.enter < child.enter < parent.exit` and a zero-width interval
+/// satisfies it in neither direction.  For a git-only file that is visible:
+/// `file(...) { search(...) }` returns nothing and a match inside the file
+/// attaches to the directory instead.
+///
+/// A parsed file always ends at `last + stride >= stride`, so `dfs_exit == 0`
+/// is an exact test for "never numbered".  Such an object has no declarations,
+/// so one empty stride is the whole interval it needs.
+///
+/// The same holds for refs: Stage1 places every ref at its scope's dfs_enter
+/// plus one, so a parsed ref is never at 0.  The parent->child refs added to
+/// directory sentinels above are, and a ref outside every interval is as
+/// invisible as an instance outside one.
+///
+/// Doing it here, at the single point every producer's objects pass through,
+/// is what keeps a future path that appends objects from silently reopening
+/// the hole.
+void ensureObjectRoot(askl::index::Object* obj, int64_t stride) {
+    if (obj->symbol_instances_size() == 0) return;
+    auto* root = obj->mutable_symbol_instances(0);
+    if (root->dfs_exit() == 0) {
+        root->set_dfs_enter(0);
+        root->set_dfs_exit(stride);
+        root->set_nesting_level(0);
+    }
+    for (int i = 0; i < obj->refs_size(); ++i) {
+        auto* ref = obj->mutable_refs(i);
+        if (ref->dfs_enter() != 0) continue;
+        ref->set_dfs_enter(root->dfs_enter() + 1);
+        ref->set_nesting_level(root->nesting_level() + 1);
+        ref->set_fold_depth(root->fold_depth() + (root->folded() ? 1 : 0));
+    }
+}
+
 /// Slot the enclosing containment instances above the file's own numbering.
 ///
 /// Stage1 numbers each file locally: the file instance at 0 and its
@@ -246,6 +290,11 @@ BuildResult ProtoBuilder::build(
         std::unordered_set<int64_t> modIDs, dirIDs;
         for (auto& [name, id] : modSymbolID) modIDs.insert(id);
         for (auto& [name, id] : dirSymbolID) dirIDs.insert(id);
+        // Every object first, so nestUnderContainers shifts a real interval
+        // and the directory sentinels -- which it never visits -- are numbered
+        // too.  Already-numbered objects are left alone.
+        for (int i = 0; i < project.objects_size(); ++i)
+            ensureObjectRoot(project.mutable_objects(i), 1024);
         for (int i = 0; i < file_object_count; ++i)
             nestUnderContainers(project.mutable_objects(i), modIDs, dirIDs, 1024);
     }

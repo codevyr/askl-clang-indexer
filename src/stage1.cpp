@@ -78,15 +78,25 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         // Look up the MACRO symbol (should have been created by MacroDefinition)
         auto [sym_id, _] = self->symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_MACRO);
 
-        // Create an instance at the expansion site, clamped to the macro
-        // name only (excluding arguments).  This way macro arguments like
-        // `bar` in `some_macro(bar)` fall outside the macro instance range
-        // and become direct children of the enclosing scope, while still
-        // appearing as has-children of the macro via expansion-site refs.
+        // Create an instance at the expansion site spanning the WHOLE
+        // invocation -- `some_macro(bar)`, not just `some_macro`.
+        //
+        // This used to be clamped to the name, so that macro arguments like
+        // `bar` fell OUTSIDE the macro's range and became children of the
+        // enclosing scope.  That reasoning was range-based parentage, and
+        // parentage no longer comes from ranges: refs are placed by scope (see
+        // `insertRef`) and instances by the DFS interval.  So the clamp only
+        // threw away the one span that records what the author actually wrote.
+        //
+        // What keeps the argument text the CALLER's is a rule where ownership
+        // is decided, not a narrowed span: a folded instance owns no text.  A
+        // macro expansion owns the symbols it generates, through the interval,
+        // and no bytes at all -- every byte at the call site was typed by the
+        // caller.  The name span below is what identifies the macro itself.
         CXFile range_file;
         unsigned start_off, end_off;
         if (getSpellingRange(cursor, range_file, start_off, end_off)) {
-            end_off = start_off + sname.size();  // clamp to macro name only
+            const unsigned name_end = start_off + sname.size();
             size_t fi = self->getOrCreateFile(range_file);
             // Opens a scope so the expansion-site refs addRef emits land inside
             // its interval; closed immediately below, since a MacroExpansion
@@ -94,15 +104,19 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
             InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off),
                            INSTTYPE_EXPANSION};
             d.folded = true; // an expansion is the fold boundary itself
+            d.name_start = static_cast<int32_t>(start_off);
+            d.name_end = static_cast<int32_t>(name_end);
             size_t idx = self->result_.files[fi].instances.size();
             self->addInstance(fi, d, true);
             self->closeScopesTo(self->dfs_stack_.size() - 1);
-            // Remember where the macro sits, so addRef can place an
-            // expansion-site ref INSIDE it rather than beside it.
-            const InstanceData& placed = self->result_.files[fi].instances[idx];
+            // Remember WHICH INSTANCE the macro is, so addRef can own an
+            // expansion-site ref to it rather than to the enclosing scope.  An
+            // index, not numbers: nothing is numbered until `numberTree`.  The
+            // NAME end is what clamps those refs, which is what keeps them out
+            // of the argument token's dedup slot.
             uint64_t key = fileOffsetKey(fi, start_off);
             self->macro_sites_[key] =
-                MacroSite{end_off, placed.dfs_enter, placed.fold_depth};
+                MacroSite{name_end, static_cast<int32_t>(idx)};
         }
     }
 
@@ -200,19 +214,10 @@ void Stage1::fillSpans(CXCursor cursor, CXFile file, InstanceData& d) {
     }
 }
 
-int32_t Stage1::currentDepth(size_t fi) const {
-    // The file's own instance is the root at depth 0, so the walk starts at 1.
-    int32_t depth = 1;
-    for (const auto& sc : dfs_stack_)
-        if (sc.file_idx == fi) ++depth;
-    return depth;
-}
-
-int32_t Stage1::currentFoldDepth(size_t fi) const {
+int32_t Stage1::stackParent(size_t fi) const {
     for (auto it = dfs_stack_.rbegin(); it != dfs_stack_.rend(); ++it)
-        if (it->file_idx == fi)
-            return it->fold_depth + (it->folded ? 1 : 0);
-    return 0;
+        if (it->file_idx == fi) return static_cast<int32_t>(it->instance_idx);
+    return -1;
 }
 
 bool Stage1::isMacroGenerated(CXCursor cursor) {
@@ -233,41 +238,144 @@ bool Stage1::isMacroGenerated(CXCursor cursor) {
 }
 
 void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
-    int64_t& counter = dfs_counter_[fi];
-    counter += kDfsStride;
-    d.dfs_enter = counter;
-    d.dfs_exit = counter; // provisional; stamped by closeScopesTo for scopes
-    d.nesting_level = currentDepth(fi);
-    d.fold_depth = currentFoldDepth(fi);
+    // Record structure, number later.  `numberTree` assigns dfs_enter,
+    // dfs_exit, nesting_level and fold_depth together, so none of them can be
+    // set while another is forgotten -- which is exactly how non-scope
+    // instances ended up with dfs_exit == dfs_enter, able to contain nothing.
+    d.stack_parent = stackParent(fi);
 
     size_t idx = result_.files[fi].instances.size();
     result_.files[fi].instances.push_back(d);
-    if (opens_scope)
-        dfs_stack_.push_back({fi, idx, d.folded, d.fold_depth});
+    // `opens_scope` now means only "later cursors nest inside this one", which
+    // is all it ever should have meant.
+    if (opens_scope) dfs_stack_.push_back({fi, idx});
 }
 
 void Stage1::closeScopesTo(size_t mark) {
-    while (dfs_stack_.size() > mark) {
-        DfsScope sc = dfs_stack_.back();
-        dfs_stack_.pop_back();
-        int64_t& counter = dfs_counter_[sc.file_idx];
-        counter += kDfsStride;
-        result_.files[sc.file_idx].instances[sc.instance_idx].dfs_exit = counter;
-    }
+    // Nothing to stamp any more: the exit number comes from the walk over the
+    // derived tree, not from where the cursor happened to close.
+    while (dfs_stack_.size() > mark) dfs_stack_.pop_back();
 }
 
-void Stage1::finalizeFileRoots() {
-    // instances[0] of every file is the FILE instance created by
-    // getOrCreateFile.  Give it the whole interval so it is the root every
-    // other instance in the object nests inside.
-    for (size_t fi = 0; fi < result_.files.size(); ++fi) {
-        auto& insts = result_.files[fi].instances;
-        if (insts.empty()) continue;
-        auto it = dfs_counter_.find(fi);
-        int64_t last = (it == dfs_counter_.end()) ? 0 : it->second;
-        insts[0].dfs_enter = 0;
-        insts[0].dfs_exit = last + kDfsStride;
-        insts[0].nesting_level = 0;
+void Stage1::numberTree(FileData& f) {
+    const size_t n = f.instances.size();
+    if (n == 0) return;
+
+    // --- PARENTAGE -----------------------------------------------------
+    //
+    //   parent(x) = the innermost instance containing x, where "containing"
+    //   means (a) its range STRICTLY contains x's, or (b) its range EQUALS x's
+    //   and it is x's stack ancestor.  Innermost = narrowest range, then
+    //   deepest on the stack.
+    //
+    // (a) is what ranges are good at, and it is what the walk could not do: a
+    // macro expansion comes from `collectMacros`, a pass that runs before the
+    // AST walk with an empty stack, so it was numbered as a sibling of the
+    // function it textually sits in and `func { macro }` could not work.  The
+    // same blindness made every `opens_scope = false` instance a tree leaf
+    // whose range none the less contained other instances.
+    //
+    // (b) is the only thing ranges cannot do, and the stack is exactly the
+    // information that can.  Everything `PMU_FORMAT_ATTR(...)` generates shares
+    // one extent; the stack knows the assert is inside `event_show`'s body
+    // while `format_attr_event` is beside it.  An equal range is narrower than
+    // any strict container, so (b) outranks (a) -- but ONLY for a stack
+    // ancestor, which is what keeps `event_show` a child of the enclosing
+    // function at fold depth 0 instead of sliding under the macro and
+    // disappearing from `mod { func }`.
+    std::vector<int32_t> parent(n, -1);
+    for (size_t i = 0; i < n; ++i) {
+        const InstanceData& x = f.instances[i];
+        int32_t s = x.stack_parent;
+        while (s >= 0) {
+            const InstanceData& a = f.instances[static_cast<size_t>(s)];
+            if (a.start_offset == x.start_offset && a.end_offset == x.end_offset) break;
+            s = a.stack_parent;
+        }
+        if (s >= 0) {
+            parent[i] = s;
+            continue;
+        }
+        int64_t best_w = 0;
+        int32_t best = -1;
+        for (size_t j = 0; j < n; ++j) {
+            if (j == i) continue;
+            const InstanceData& c = f.instances[j];
+            if (c.start_offset > x.start_offset || c.end_offset < x.end_offset) continue;
+            if (c.start_offset == x.start_offset && c.end_offset == x.end_offset)
+                continue; // equal, not strict -- only (b) may use it
+            int64_t w = static_cast<int64_t>(c.end_offset) - c.start_offset;
+            if (best < 0 || w < best_w) {
+                best = static_cast<int32_t>(j);
+                best_w = w;
+            }
+        }
+        parent[i] = best;
+    }
+
+    // --- NUMBERING -----------------------------------------------------
+    // One preorder walk, one stride per event, every field assigned together.
+    std::vector<std::vector<int32_t>> kids(n);
+    std::vector<int32_t> roots;
+    for (size_t i = 0; i < n; ++i) {
+        if (parent[i] < 0)
+            roots.push_back(static_cast<int32_t>(i));
+        else
+            kids[static_cast<size_t>(parent[i])].push_back(static_cast<int32_t>(i));
+    }
+
+    int64_t counter = 0;
+    size_t numbered = 0;
+    std::vector<std::pair<int32_t, size_t>> st; // (node, next child)
+    for (int32_t r : roots) {
+        counter += kDfsStride;
+        f.instances[static_cast<size_t>(r)].dfs_enter = counter;
+        f.instances[static_cast<size_t>(r)].nesting_level = 0;
+        f.instances[static_cast<size_t>(r)].fold_depth = 0;
+        ++numbered;
+        st.push_back({r, 0});
+        while (!st.empty()) {
+            int32_t node = st.back().first;
+            size_t next = st.back().second;
+            if (next < kids[static_cast<size_t>(node)].size()) {
+                st.back().second = next + 1;
+                int32_t c = kids[static_cast<size_t>(node)][next];
+                const InstanceData& p = f.instances[static_cast<size_t>(node)];
+                counter += kDfsStride;
+                InstanceData& ci = f.instances[static_cast<size_t>(c)];
+                ci.dfs_enter = counter;
+                ci.nesting_level = p.nesting_level + 1;
+                ci.fold_depth = p.fold_depth + (p.folded ? 1 : 0);
+                ++numbered;
+                st.push_back({c, 0});
+            } else {
+                counter += kDfsStride;
+                f.instances[static_cast<size_t>(node)].dfs_exit = counter;
+                st.pop_back();
+            }
+        }
+    }
+    // Parentage is acyclic by construction -- (a) strictly narrows the range,
+    // (b) follows the scope stack -- so every instance is reached exactly once.
+    // Assert it rather than trust it: a cycle would silently leave instances at
+    // [0,0), which is the invisible-row failure all over again.
+    if (numbered != n) {
+        fprintf(stderr,
+                "Warning: numbered %zu of %zu instances in %s; containment tree is not acyclic\n",
+                numbered, n, f.module_path.c_str());
+    }
+
+    // --- REFS ----------------------------------------------------------
+    // A ref is a point one step inside its owner, on every axis.  Stamping it
+    // here from `owner_idx` is what makes "a ref lies inside its owner" true by
+    // construction, instead of two independently computed numbers that agreed
+    // only while a reference sat inside exactly one scope.
+    for (RefData& r : f.refs) {
+        if (r.owner_idx < 0 || static_cast<size_t>(r.owner_idx) >= n) continue;
+        const InstanceData& o = f.instances[static_cast<size_t>(r.owner_idx)];
+        r.dfs_enter = o.dfs_enter + 1;
+        r.nesting_level = o.nesting_level + 1;
+        r.fold_depth = o.fold_depth + (o.folded ? 1 : 0);
     }
 }
 
@@ -275,19 +383,19 @@ void Stage1::insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t e
                        int32_t full_start, int32_t full_end) {
     if (!file_ref_sets_[file_idx].insert({sym_id, start, end}).second)
         return;
-    // A ref is a point, so it takes the file's current counter WITHOUT
-    // advancing it -- plus one, because a ref emitted immediately after its
-    // scope opened would otherwise land exactly ON the scope's dfs_enter and
-    // fail the strict containment test.  The stride leaves ample room.  The
-    // result is strictly inside the enclosing scope: above its dfs_enter, and
-    // below its dfs_exit, which is stamped later from a higher counter.
-    // Several refs in one scope may share a number; nothing tells them apart.
+    // Record the OWNER; `numberTree` turns it into numbers.  A ref is a point
+    // one step inside its owner, so several refs in one scope share a number
+    // and nothing tells them apart -- ordering comes from the byte range.
+    //
+    // The owner is the enclosing AST scope, not the innermost instance by
+    // range, and that distinction is the whole `printk(foo)` doctrine: the
+    // argument token and the macro's own expansion-site use of it both lie
+    // inside the caller's text, so only the scope the walk was in can say
+    // which is which.  `addRef` overrides this for the expansion-site ref.
     RefData r{sym_id, start, end};
     r.full_start = full_start;
     r.full_end = full_end;
-    r.nesting_level = currentDepth(file_idx);
-    r.fold_depth = currentFoldDepth(file_idx);
-    r.dfs_enter = dfs_counter_[file_idx] + 1;
+    r.owner_idx = stackParent(file_idx);
     result_.files[file_idx].refs.push_back(r);
 }
 
@@ -344,10 +452,17 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
                 ? static_cast<int32_t>(it->second.name_end)
                 : static_cast<int32_t>(exp_off + 1);  // fallback
             insertRef(fi, sym_id, static_cast<int32_t>(exp_off), exp_end);
-            if (it != macro_sites_.end()) {
+            // Own it to the MACRO, overriding the enclosing scope `insertRef`
+            // recorded.  `numberTree` then places it one step inside the macro
+            // and one fold level deeper, which is what puts it out of reach of
+            // `mod { func }` and within reach of `mod { macro { func } }`.
+            // Guarded on `refs.back()` because insertRef dedups and may not
+            // have pushed anything.
+            if (it != macro_sites_.end() && !result_.files[fi].refs.empty()) {
                 RefData& r = result_.files[fi].refs.back();
-                r.dfs_enter = it->second.dfs_enter + 1;
-                r.fold_depth = it->second.fold_depth + 1;
+                if (r.to_symbol_local_id == sym_id &&
+                    r.from_offset_start == static_cast<int32_t>(exp_off))
+                    r.owner_idx = it->second.instance_idx;
             }
         }
     }
@@ -612,7 +727,11 @@ void Stage1::process(CXTranslationUnit tu, const std::string& tu_filename) {
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, visitor, this);
     closeScopesTo(0);
-    finalizeFileRoots();
+    // Every instance and ref now carries its structure; derive the tree and
+    // number it.  Per TU, which is where it has to stay: the Indexer merges a
+    // second TU's REFS into a file whose instances came from the first, so a
+    // ref's numbers must be computed against the instances it shipped with.
+    for (auto& f : result_.files) numberTree(f);
 }
 
 Stage1Result Stage1::takeResults() {
