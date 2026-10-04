@@ -92,6 +92,24 @@ message SymbolInstance {
   int64 dfs_enter = 11;
   int64 dfs_exit = 12;
 
+  // FOLDING -- orthogonal to depth.  nesting_level says where a symbol sits;
+  // folding says whether a level is interesting by default.  An instance is
+  // folded when it exists only because of a macro expansion, which the indexer
+  // can tell because the spelling location differs from the expansion one.
+  //
+  // fold_depth counts the folded ancestors on the path from the object root, so
+  // `X { Y }` can be a plain equality in all three traversal modes:
+  //
+  //   direct    d.nesting_level = X.nesting_level + 1
+  //   unfolded  d.fold_depth = X.fold_depth + (X.folded ? 1 : 0)   <- default
+  //   unnest    nothing beyond the interval
+  //
+  // `folded` is carried separately from the depth because that last term needs
+  // to know whether the PARENT is a boundary -- which is what lets
+  // `mod { macro { func } }` step one level past a fold on purpose.
+  bool folded = 13;
+  int32 fold_depth = 14;
+
   // Finer spans, each within [start_offset, end_offset).  All optional:
   // `name` is absent for synthesised symbols that have no identifier in the
   // source, `signature` for kinds that cannot be declared.
@@ -124,6 +142,14 @@ message SymbolRef {
   // is a point, not an interval: it is owned by the instance whose
   // [dfs_enter, dfs_exit] contains this number at depth - 1.
   int64 dfs_enter = 8;
+
+  // Fold state of the owning scope.  This is what separates the two
+  // occurrences of `foo` in `printk(foo)`: the argument token stays at the
+  // caller's fold depth, while each expanded use sits one deeper and is
+  // therefore hidden from `mod { func }` but reachable via
+  // `mod { macro { func } }`.
+  bool folded = 9;
+  int32 fold_depth = 10;
 }
 
 enum SymbolScope {
