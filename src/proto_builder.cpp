@@ -158,38 +158,47 @@ BuildResult ProtoBuilder::build(
 
         content_entries.emplace_back(hash_hex, &file.content);
 
-        // Deduplicate instances by (symbol_local_id, start_offset, end_offset)
-        std::unordered_set<EntryKey, EntryKeyHash> seen_instances;
+        // Every instance, in the order the numbering gave them.  NOT
+        // deduplicated by (symbol, extent): a macro expanded twice at one
+        // extent is two instances that mean different things.  A header
+        // included twice under different macro definitions expands ONE
+        // source line into two different functions, and `(symbol, extent)`
+        // cannot tell those expansions apart -- only the DFS position can,
+        // which is why that is the identity now.
+        //
+        // The dedup here was added for a shared header seen by several
+        // translation units, but `Indexer::processTU` already keeps only the
+        // first TU's instances, so there was nothing left to collapse: on
+        // `shared_header_typedef` it removed ZERO rows.  Where it did fire --
+        // re-inclusion -- it dropped an instance AFTER the refs had been
+        // numbered against it, leaving them pointing into the hole.
         for (auto& inst : file.instances) {
-            EntryKey key{inst.symbol_local_id, inst.start_offset, inst.end_offset};
-            if (seen_instances.insert(key).second) {
-                auto* pb_inst = obj->add_symbol_instances();
-                pb_inst->set_symbol_local_id(inst.symbol_local_id);
-                pb_inst->set_instance_type(static_cast<askl::index::InstanceType>(inst.instance_type));
-                pb_inst->set_start_offset(inst.start_offset);
-                pb_inst->set_end_offset(inst.end_offset);
-                pb_inst->set_nesting_level(inst.nesting_level);
-                pb_inst->set_dfs_enter(inst.dfs_enter);
-                pb_inst->set_dfs_exit(inst.dfs_exit);
-                pb_inst->set_folded(inst.folded);
-                pb_inst->set_fold_depth(inst.fold_depth);
-                // -1 means the indexer could not determine the span; leave the
-                // field unset so "unknown" stays distinct from "empty".
-                if (inst.name_start >= 0) {
-                    auto* sp = pb_inst->mutable_name();
-                    sp->set_start(inst.name_start);
-                    sp->set_end(inst.name_end);
-                }
-                if (inst.sig_start >= 0) {
-                    auto* sp = pb_inst->mutable_signature();
-                    sp->set_start(inst.sig_start);
-                    sp->set_end(inst.sig_end);
-                }
-                if (inst.content_start >= 0) {
-                    auto* sp = pb_inst->mutable_content();
-                    sp->set_start(inst.content_start);
-                    sp->set_end(inst.content_end);
-                }
+            auto* pb_inst = obj->add_symbol_instances();
+            pb_inst->set_symbol_local_id(inst.symbol_local_id);
+            pb_inst->set_instance_type(static_cast<askl::index::InstanceType>(inst.instance_type));
+            pb_inst->set_start_offset(inst.start_offset);
+            pb_inst->set_end_offset(inst.end_offset);
+            pb_inst->set_nesting_level(inst.nesting_level);
+            pb_inst->set_dfs_enter(inst.dfs_enter);
+            pb_inst->set_dfs_exit(inst.dfs_exit);
+            pb_inst->set_folded(inst.folded);
+            pb_inst->set_fold_depth(inst.fold_depth);
+            // -1 means the indexer could not determine the span; leave the
+            // field unset so "unknown" stays distinct from "empty".
+            if (inst.name_start >= 0) {
+                auto* sp = pb_inst->mutable_name();
+                sp->set_start(inst.name_start);
+                sp->set_end(inst.name_end);
+            }
+            if (inst.sig_start >= 0) {
+                auto* sp = pb_inst->mutable_signature();
+                sp->set_start(inst.sig_start);
+                sp->set_end(inst.sig_end);
+            }
+            if (inst.content_start >= 0) {
+                auto* sp = pb_inst->mutable_content();
+                sp->set_start(inst.content_start);
+                sp->set_end(inst.content_end);
             }
         }
 

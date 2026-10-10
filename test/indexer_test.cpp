@@ -13,7 +13,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -1578,6 +1581,136 @@ TEST(ObjectRoots, ARefMergedFromAnotherTuIsRenumbered) {
     ASSERT_TRUE(checked) << "ops.h was not indexed";
 }
 
+// A header included twice under different macro definitions.
+//
+// `multi.h` has no include guard and holds one line, `DECL(alpha)`.  `a.c`
+// includes it twice, once with `SUFFIX` defined to `_f` and once to `_d`, so
+// the preprocessor turns that single line into TWO different functions:
+//
+//     int alpha_f(int v) { return helper(v); }
+//     int alpha_d(int v) { return helper(v); }
+//
+// Both expansions are of the macro `DECL` and both occupy the same extent, so
+// `(symbol, extent)` -- what identified an instance before -- says they are the
+// same thing.  They are not: one made `alpha_f` and the other made `alpha_d`.
+//
+// This used to lose one of them, and the loss was not quiet.  `macro_sites_` is
+// keyed by (file, offset), so the LAST expansion at an offset wins and owns the
+// expansion-site refs; the dedup kept the FIRST.  So the surviving instance was
+// never the one the refs had been numbered against, and every such ref pointed
+// into the stride the dropped instance used to occupy.
+TEST(ObjectRoots, ReincludedHeaderKeepsBothExpansions) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/reincluded_header";
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"a.c"});
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+    auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                     indexer.allFiles(), 1);
+    askl::index::Project project;
+    ASSERT_TRUE(project.ParseFromString(built.project_data));
+
+    std::unordered_map<int64_t, std::string> name;
+    for (const auto& sym : project.symbols()) name[sym.local_id()] = sym.name();
+
+    bool checked = false;
+    for (const auto& obj : project.objects()) {
+        if (obj.module_path().find("multi.h") == std::string::npos) continue;
+        checked = true;
+
+        std::vector<const askl::index::SymbolInstance*> decls;
+        std::set<std::string> generated;
+        for (const auto& i : obj.symbol_instances()) {
+            if (i.instance_type() == askl::index::InstanceType::EXPANSION &&
+                name[i.symbol_local_id()] == "DECL")
+                decls.push_back(&i);
+            if (i.instance_type() == askl::index::InstanceType::DEFINITION)
+                generated.insert(name[i.symbol_local_id()]);
+        }
+
+        ASSERT_EQ(decls.size(), 2u)
+            << "one source line expanded twice must give two expansions";
+        EXPECT_EQ(decls[0]->start_offset(), decls[1]->start_offset())
+            << "and they must share an extent -- otherwise the fixture is not "
+               "testing what it claims";
+        EXPECT_NE(decls[0]->dfs_enter(), decls[1]->dfs_enter())
+            << "the DFS position is what tells them apart, so it must differ";
+
+        EXPECT_EQ(generated.count("alpha_f"), 1u);
+        EXPECT_EQ(generated.count("alpha_d"), 1u);
+
+        // The point of keeping both: a ref numbered against one of them still
+        // lands inside it.  `EveryInstanceFormsAValidTree` checks this across
+        // every fixture; here it is the whole reason the instance survived.
+        for (const auto& ref : obj.refs()) {
+            bool inside = false;
+            for (const auto& i : obj.symbol_instances())
+                inside = inside || (i.dfs_enter() < ref.dfs_enter() &&
+                                    ref.dfs_enter() < i.dfs_exit() &&
+                                    i.instance_type() ==
+                                        askl::index::InstanceType::EXPANSION);
+            EXPECT_TRUE(inside)
+                << "ref to " << name[ref.to_symbol_local_id()] << " at dfs "
+                << ref.dfs_enter() << " is not inside any expansion";
+        }
+    }
+    ASSERT_TRUE(checked) << "multi.h was not in the built project";
+}
+
+// ProtoBuilder serialises; it does not filter.
+//
+// It used to drop instances sharing (symbol, extent), which runs AFTER
+// `numberTree` has stamped refs against them -- so a drop silently orphaned
+// references.  Whatever the identity of an instance is, deciding it here is
+// too late: the numbers are already assigned.
+TEST(ProtoBuilder, EmitsEveryInstanceItWasGiven) {
+    for (const char* fx : {"reincluded_header", "shared_header_typedef",
+                           "macro_nested", "small_project"}) {
+        std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fx;
+        TempDir temp_dir = makeTempDir();
+        std::vector<std::string> srcs;
+        for (auto& e : fs::directory_iterator(fixture_dir))
+            if (e.path().extension() == ".c") srcs.push_back(e.path().filename().string());
+        std::sort(srcs.begin(), srcs.end());
+        generateCompileCommands(fixture_dir, temp_dir.path, srcs);
+        Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+        indexer.run();
+
+        // Keyed on what the input HAS -- the DFS position is assigned before
+        // this point, so it is the one field that distinguishes two instances
+        // sharing a symbol and an extent.  Counted, not set-collapsed, so
+        // dropping one of two identical rows is caught too.
+        using Key = std::tuple<int64_t, int32_t, int32_t, int>;
+        std::map<std::string, std::map<Key, int>> given;
+        for (const auto& f : indexer.allFiles())
+            for (const auto& i : f.instances)
+                given[f.module_path][{i.symbol_local_id, i.start_offset,
+                                      i.end_offset, i.instance_type}]++;
+
+        auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                         indexer.allFiles(), 1);
+        askl::index::Project project;
+        ASSERT_TRUE(project.ParseFromString(built.project_data));
+
+        for (const auto& obj : project.objects()) {
+            auto it = given.find(obj.module_path());
+            if (it == given.end()) continue; // a container object ProtoBuilder adds
+            std::map<Key, int> emitted;
+            for (const auto& i : obj.symbol_instances())
+                emitted[{i.symbol_local_id(), i.start_offset(), i.end_offset(),
+                         static_cast<int>(i.instance_type())}]++;
+            // Subset, not equality: ProtoBuilder ADDS the module/directory
+            // container instances that `nestUnderContainers` nests under.
+            for (const auto& [key, n] : it->second)
+                EXPECT_GE(emitted[key], n)
+                    << fx << " " << obj.module_path() << ": symbol "
+                    << std::get<0>(key) << " at [" << std::get<1>(key) << ","
+                    << std::get<2>(key) << ") given " << n << " times, emitted "
+                    << emitted[key];
+        }
+    }
+}
+
 TEST(ObjectRoots, EveryInstanceFormsAValidTree) {
     for (const char* fx : {"small_project", "doc_comments", "typedef_basic",
                            "enum_basic", "enum_in_switch", "macro_nested",
@@ -1585,7 +1718,10 @@ TEST(ObjectRoots, EveryInstanceFormsAValidTree) {
                            "union_basic", "type_ref_chain",
                            // Two TUs sharing a header they number differently:
                            // covers the cross-TU ref merge.
-                           "cross_tu_field_refs"}) {
+                           "cross_tu_field_refs",
+                           // One header included twice under different macro
+                           // definitions: two expansions at ONE extent.
+                           "reincluded_header"}) {
         std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fx;
         TempDir temp_dir = makeTempDir();
         std::vector<std::string> srcs;
