@@ -91,6 +91,31 @@ struct FileData {
     std::vector<RefData> refs;
 };
 
+/// THE ONE PLACEMENT RULE FOR REFERENCES: a reference belongs to the narrowest
+/// UNFOLDED instance whose extent contains its text.  Returns an index into
+/// `f.instances`, or -1 when nothing contains it.
+///
+/// Unfolded, because *a macro expansion owns no text*: every byte at the call
+/// site of `foo(a)` -- the name, the parens, the argument -- was typed by the
+/// CALLER.  An expansion owns the symbols it generates, through the DFS
+/// interval, and no bytes at all.  So excluding folded instances is what keeps
+/// `DEV_PRINT(threshold)` from producing an edge `DEV_PRINT -> threshold`.
+///
+/// This replaced placement by AST scope (`Stage1::stackParent`), which could
+/// not see a macro body at all: the scope stack is consulted per FILE, and when
+/// `handler` in main.c expands a macro defined in log.h, nothing from log.h is
+/// on it.  So `printk`, written inside `DEV_PRINT`'s `#define` body, was
+/// attributed to log.h's file root and the edge read `log.h -> printk` instead
+/// of `DEV_PRINT -> printk`.  Text containment gets the same answer as the
+/// scope for every ordinary reference and the right one here.
+///
+/// The one thing text alone could not tell used to be an argument token from
+/// the macro's own expansion-site use of it, both lying inside the caller at
+/// overlapping offsets.  There are no expansion-site references any more --
+/// each layer records only what its own body names -- so the ambiguity is gone
+/// with them.
+int32_t ownerOfText(const FileData& f, int32_t start, int32_t end);
+
 struct Stage1Result {
     std::vector<FileData> files;
     std::unordered_map<std::string, size_t> file_index; // filesystem_path -> index in files
@@ -111,14 +136,23 @@ private:
     // Per-TU state
     std::unordered_map<std::string, size_t> file_index_; // filepath -> index in result_.files
     std::unordered_map<size_t, std::unordered_set<EntryKey, EntryKeyHash>> file_ref_sets_; // per-file ref dedup
-    /// What addRef needs to place an expansion-site ref inside the macro that
-    /// produced it: the clamped name end, plus the macro instance's own
-    /// position so the ref lands one fold level deeper.
-    struct MacroSite {
-        unsigned name_end;
-        int32_t instance_idx; // numbers are not known until numberTree runs
+    /// Every macro this TU defined, by name.  Scoped to the TU on purpose: a
+    /// macro body can only name a macro visible in the same TU, so resolving
+    /// against this rather than the project-global symbol table is both
+    /// cheaper and stricter -- it cannot invent an edge to a same-named macro
+    /// from an unrelated file.
+    std::unordered_map<std::string, int64_t> tu_macros_;
+
+    /// A `#define` body awaiting the token pass that finds the macros it
+    /// names.  Deferred to the end of `collectMacros` so that `tu_macros_` is
+    /// complete first: `#define A B` is legal before `B` is defined.
+    struct MacroBody {
+        CXFile file;
+        size_t file_idx;
+        unsigned start, end;   // the whole `#define` body extent
+        std::string name;      // the macro being defined
     };
-    std::unordered_map<uint64_t, MacroSite> macro_sites_; // fileOffsetKey(fi, off) -> site
+    std::vector<MacroBody> macro_bodies_;
 
     // --- DFS numbering -------------------------------------------------
     //
@@ -159,13 +193,18 @@ private:
     void closeScopesTo(size_t mark);
     /// Give every file's root instance an interval covering the whole file.
 
-    static uint64_t fileOffsetKey(size_t file_idx, unsigned offset) {
-        return (static_cast<uint64_t>(file_idx) << 32) | offset;
-    }
-
     size_t getOrCreateFile(CXFile file);
 
     void collectMacros(CXTranslationUnit tu);
+    /// Emit a reference for every macro a `#define` body names, which is the
+    /// layerwise edge between two macros.  libclang does not report it: the
+    /// preprocessing record carries only the OUTERMOST expansion at a use
+    /// site, so `#define FATAL(m) ERR(m)` produces no expansion of `ERR`
+    /// anywhere, and `FATAL -> ERR -> MSG -> output` had a hole in the middle
+    /// where only the ends were visible.  On criu 2193 of 12704 macro
+    /// definitions (17%) name another macro, so the hole is the common case,
+    /// not an edge case.
+    void linkMacroBodies(CXTranslationUnit tu);
     static CXChildVisitResult macroVisitor(CXCursor cursor, CXCursor parent, CXClientData data);
 
     static CXChildVisitResult visitor(CXCursor cursor, CXCursor parent, CXClientData data);

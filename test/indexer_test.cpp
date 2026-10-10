@@ -15,8 +15,8 @@
 #include <fstream>
 #include <map>
 #include <set>
-#include <string>
 #include <tuple>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -489,13 +489,19 @@ INSTANTIATE_TEST_SUITE_P(
                 {"status", GLOBAL, TYPE},
             },
             {
+                // The BODY refs: each macro names these itself, in macros.h.
                 {"macros.h", "result", 321, 327},
                 {"macros.h", "S_OK", 411, 415},
-                // Expansion-site refs: clamped to macro name width
-                {"main.c", "result", 272, 278},
-                {"main.c", "result", 302, 308},
+                // The INVOCATION edges, at the macro name span in main.c.
+                // These used to name the macro's body symbols instead -- a
+                // `main.c -> result` edge for text that says `RESULT`.
+                {"main.c", "DEFINE_HANDLER", 102, 116},
+                {"main.c", "DEFINE_HANDLER", 156, 170},
+                {"main.c", "RESULT", 272, 278},
+                {"main.c", "RESULT", 302, 308},
+                {"main.c", "DEFAULT_STATUS", 325, 339},
+                // Real text in main.c, unaffected.
                 {"main.c", "result.code", 316, 322},
-                {"main.c", "S_OK", 325, 339},
             }
         },
         FixtureSpec{
@@ -516,16 +522,23 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", GLOBAL, FILETYPE},
                 {"use_any", GLOBAL, FUNCTION},
             },
-            // refs — spelling refs resolve inside ONE_TYPE body;
-            // expansion refs clamped to ALL_TYPES name at call site [398, 407)
+            // refs — the body refs resolve inside ONE_TYPE's body, and the
+            // call site at [398, 407) carries ONE invocation edge naming
+            // ALL_TYPES.  It used to carry three, one per symbol the expansion
+            // touched, all at the same offsets: three edges from `types.h` to
+            // types the text at that position never mentions.
             {
                 {"main.c", "any_type", 33, 41},
+                // ALL_TYPES's body invokes ONE_TYPE three times: three
+                // layerwise edges ALL_TYPES -> ONE_TYPE, from the body text.
+                {"types.h", "ONE_TYPE", 277, 285},
+                {"types.h", "ONE_TYPE", 300, 308},
+                {"types.h", "ONE_TYPE", 323, 331},
+                // ...and ONE_TYPE's own body names the types.
                 {"types.h", "type_a", 286, 292},
-                {"types.h", "type_a", 398, 407},
                 {"types.h", "type_b", 309, 315},
-                {"types.h", "type_b", 398, 407},
                 {"types.h", "type_c", 332, 338},
-                {"types.h", "type_c", 398, 407},
+                {"types.h", "ALL_TYPES", 398, 407},
             },
             // instances — macro symbols now have instances too
             // ALL_TYPES appears twice: once for #define, once for expansion site
@@ -573,10 +586,13 @@ INSTANTIATE_TEST_SUITE_P(
                 // Single-char ref: proves clang returns half-open [start, start+len),
                 // so 1-char token gives [289, 290) not [289, 289)
                 {"main.c", "x", 289, 290},
+                // ALL_STRUCTS's body invokes ONE_STRUCT: the layerwise edge
+                // between the two, read from the `#define` body text.
+                {"types.h", "ONE_STRUCT", 392, 402},
                 // Macro-expanded TypeRef: spelling location resolves inside ONE_STRUCT body
                 {"types.h", "alpha", 403, 408},
-                // Expansion-site ref: clamped to ALL_STRUCTS name width
-                {"types.h", "alpha", 477, 488},
+                // The invocation edge at the ALL_STRUCTS name span.
+                {"types.h", "ALL_STRUCTS", 477, 488},
             },
             {
                 {"main.c", "main.c"},
@@ -656,8 +672,10 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"log.h", "puts", 49, 53},
-                // Expansion-site ref: clamped to LOG macro name width
-                {"main.c", "puts", 36, 39},
+                // The invocation edge.  `puts` is named by LOG's body, in
+                // log.h, and appears there -- not here, where the text says
+                // `LOG`.
+                {"main.c", "LOG", 36, 39},
             }
         },
         // Nested macro chain: handler calls FATAL, which expands through ERR→MSG→output.
@@ -678,9 +696,21 @@ INSTANTIATE_TEST_SUITE_P(
                 {"output", GLOBAL, FUNCTION},
             },
             {
+                // The whole chain, one edge per layer, each read from the
+                // `#define` body that names it:
+                //
+                //     handler -> FATAL -> ERR -> MSG -> output
+                //
+                // `handler -> output` is a TRAVERSAL of those four, not a
+                // stored edge.  It used to be stored directly and the three
+                // middle hops did not exist at all: libclang reports only the
+                // OUTERMOST expansion at a use site, so `ERR` inside FATAL's
+                // body is not an expansion anywhere, and `linkMacroBodies`
+                // reads it from the text instead.
                 {"macros.h", "output", 71, 77},
-                // Expansion-site ref: clamped to FATAL macro name width
-                {"main.c", "output", 41, 46},
+                {"macros.h", "MSG", 107, 110},
+                {"macros.h", "ERR", 138, 141},
+                {"main.c", "FATAL", 41, 46},
             }
         },
         // Proves that files with only macros (no declarations/refs) still appear
@@ -697,7 +727,15 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", GLOBAL, FILETYPE},
                 {"smallest", GLOBAL, FUNCTION},
             },
-            {},
+            // Using a macro is now visible.  This fixture had NO refs at all:
+            // `MAX_SIZE` expands to a constant and `MIN` to an expression over
+            // its arguments, so neither body names a symbol and the
+            // expansion-site mechanism had nothing to attribute.  The use of
+            // the macro itself was invisible to the graph.
+            {
+                {"main.c", "MAX_SIZE", 29, 37},
+                {"main.c", "MIN", 76, 79},
+            },
             {
                 {"macros.h", "MACROS_H"},
                 {"macros.h", "MAX_SIZE"},
@@ -731,11 +769,13 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"main.c", "driver_info", 37, 48},
-                // driver_info.id: expansion-site ref clamped to register_driver name
-                {"main.c", "driver_info.id", 73, 88},
-                // my_drv: expansion-site ref clamped to register_driver name
-                {"main.c", "my_drv", 73, 88},
-                // my_drv: spelling ref in the macro argument
+                // The invocation edge at the register_driver name span.  It
+                // used to be two refs at these same offsets, naming
+                // `driver_info.id` (from the body) and `my_drv` (the ARGUMENT)
+                // -- the second an edge from a macro to text the caller wrote.
+                {"main.c", "register_driver", 73, 88},
+                // my_drv: spelling ref in the macro argument, owned by the
+                // caller because every byte at a call site is the caller's.
                 {"main.c", "my_drv", 89, 95},
                 // driver_info.id: spelling refs inside register_driver macro body
                 {"register.h", "driver_info.id", 213, 215},
@@ -873,13 +913,15 @@ INSTANTIATE_TEST_SUITE_P(
                 {"some_macro", GLOBAL, MACRO},
             },
             {
-                // Spelling refs in macro body (macros.h)
+                // The body refs, in macros.h, where some_macro names them.
                 {"macros.h", "do_something", 86, 98},
                 {"macros.h", "GLOBAL_VARIABLE", 105, 120},
-                // Expansion refs clamped to some_macro name [56, 66)
-                {"main.c", "GLOBAL_VARIABLE", 56, 66},
-                {"main.c", "bar", 56, 66},
-                {"main.c", "do_something", 56, 66},
+                // ONE invocation edge at the some_macro name span [56, 66).
+                // There used to be three here, all at these offsets: two
+                // repeating the body refs above, and `bar` -- the argument,
+                // which the caller wrote and which already has its own ref
+                // below at its real position.
+                {"main.c", "some_macro", 56, 66},
                 // Spelling ref: bar in macro argument (direct child of foo)
                 {"main.c", "bar", 67, 70},
             },
@@ -1001,6 +1043,38 @@ INSTANTIATE_TEST_SUITE_P(
                 {"ops.h", "my_write", 197, 215},              // field impl ref (positional)
                 {"ops.h", "read_func_t", 174, 185},           // TypeRef in field decl
                 {"ops.h", "write_func_t", 197, 209},          // TypeRef in field decl
+            },
+        },
+        // The layerwise model stated as a symbol and reference set.  Three
+        // references, one per layer boundary -- see
+        // `ObjectRoots.MacroEdgesAreLayerwise` for the OWNERS, which is what
+        // makes them edges.
+        FixtureSpec{
+            "macro_layerwise",
+            {"main.c"},
+            {
+                {"DEV_PRINT", GLOBAL, MACRO},
+                {"LEVEL", GLOBAL, MACRO},
+                {"LOG_H", GLOBAL, MACRO},
+                {"handler", GLOBAL, FUNCTION},
+                {"log.h", GLOBAL, FILETYPE},
+                {"main.c", GLOBAL, FILETYPE},
+                {"printk", GLOBAL, FUNCTION},
+                {"threshold", GLOBAL, DATA},
+            },
+            {
+                // The body: DEV_PRINT names printk, in log.h.
+                {"log.h", "printk", 178, 184},
+                // The invocations, at the macro name span.
+                {"main.c", "DEV_PRINT", 59, 68},
+                {"main.c", "DEV_PRINT", 85, 94},
+                // The arguments, at their own positions -- the caller wrote
+                // them, so the caller owns them, and no edge runs from
+                // DEV_PRINT to either.  `LEVEL` is the interesting one: it is
+                // a macro, so it has an expansion of its own, nested by RANGE
+                // inside DEV_PRINT's.
+                {"main.c", "threshold", 69, 78},
+                {"main.c", "LEVEL", 95, 100},
             },
         }
     ),
@@ -1549,22 +1623,32 @@ TEST(ObjectRoots, ARefMergedFromAnotherTuIsRenumbered) {
     for (const auto& f : indexer.allFiles()) {
         if (f.module_path.find("ops.h") == std::string::npos) continue;
 
-        // Both TUs contributed, so the merge path really ran.
-        ASSERT_EQ(f.refs.size(), 2u)
+        // Both TUs contributed, so the merge path really ran.  Three refs, not
+        // two: `#ifdef WANT_EXTRA` is a MacroExpansion of a macro that b.c has
+        // DEFINED, so it carries an invocation edge like any other expansion --
+        // which is the point, `macro("CONFIG_NUMA")` is a question worth
+        // answering -- and that one is not a field ref.
+        std::vector<const InstanceData*> fields;
+        for (const auto& i : f.instances)
+            if (i.instance_type == INSTTYPE_DEFINITION) fields.push_back(&i);
+        std::vector<RefData> field_refs;
+        for (const auto& r : f.refs)
+            if (r.from_offset_start > 900) field_refs.push_back(r); // struct ops, at the end
+        ASSERT_EQ(field_refs.size(), 2u)
             << "each TU attributes one synthetic ref to ops.h's field";
-        ASSERT_EQ(f.refs[0].from_offset_start, f.refs[1].from_offset_start)
+        ASSERT_EQ(field_refs[0].from_offset_start, field_refs[1].from_offset_start)
             << "and both to the SAME field declaration";
-        ASSERT_NE(f.refs[0].to_symbol_local_id, f.refs[1].to_symbol_local_id)
+        ASSERT_NE(field_refs[0].to_symbol_local_id, field_refs[1].to_symbol_local_id)
             << "pointing at different workers, which is why dedup keeps both";
 
         // One range, one owner: the numbers must agree.
-        EXPECT_EQ(f.refs[0].dfs_enter, f.refs[1].dfs_enter);
-        EXPECT_EQ(f.refs[0].nesting_level, f.refs[1].nesting_level);
-        EXPECT_EQ(f.refs[0].fold_depth, f.refs[1].fold_depth);
+        EXPECT_EQ(field_refs[0].dfs_enter, field_refs[1].dfs_enter);
+        EXPECT_EQ(field_refs[0].nesting_level, field_refs[1].nesting_level);
+        EXPECT_EQ(field_refs[0].fold_depth, field_refs[1].fold_depth);
 
         // And that owner is the field they are attributed to, in THIS file's
         // surviving instances.
-        for (const auto& r : f.refs) {
+        for (const auto& r : field_refs) {
             const InstanceData* owner = nullptr;
             for (const auto& i : f.instances)
                 if (i.dfs_enter < r.dfs_enter && r.dfs_enter < i.dfs_exit &&
@@ -1579,6 +1663,157 @@ TEST(ObjectRoots, ARefMergedFromAnotherTuIsRenumbered) {
         checked = true;
     }
     ASSERT_TRUE(checked) << "ops.h was not indexed";
+}
+
+// Macro edges are LAYERWISE: each layer owns only what its own body names.
+//
+//     log.h:  #define DEV_PRINT(x) do { printk(x); } while (0)
+//     main.c: void handler(void) { DEV_PRINT(threshold); }
+//
+// An edge is a reference plus the instance that owns it, so the edge set this
+// has to produce is exactly three:
+//
+//     handler   -> threshold    the argument, written at the call site
+//     handler   -> DEV_PRINT    the invocation
+//     DEV_PRINT -> printk       the body
+//
+// and `handler -> printk` is a TRAVERSAL of two of them, not a stored edge --
+// the same as it already is for a chain of functions.
+//
+// All three were wrong before.  The body ref `printk` lives at log.h [178,184),
+// which is inside DEV_PRINT's `#define` body [160,200), but `insertRef` took
+// its owner from `stackParent` -- the innermost open scope IN ITS OWN FILE --
+// and nothing from log.h was ever on the stack, so it landed on the header's
+// file root and the edge read `log.h -> printk`.  Meanwhile `addRef` emitted a
+// SECOND ref at the expansion site owned by the expansion, giving a duplicate
+// `DEV_PRINT -> printk`, and a third owned the same way giving
+// `DEV_PRINT -> threshold` -- an edge from a macro to text the macro never
+// contained, since the argument is typed by the caller.  And nothing referenced
+// DEV_PRINT at all, so the first hop did not exist: `unnest` was the only way
+// across.
+// An expansion contains NOTHING.
+//
+// A macro expansion owns no text, so it cannot be a parent by range either --
+// the same doctrine that keeps `DEV_PRINT -> threshold` out of the edges keeps
+// the argument out of its CONTENTS.  Before this, `DEV_PRINT(LEVEL)` spanned
+// [85,101) and `LEVEL`'s own expansion spanned [95,100), so range parentage
+// made the argument a child of the macro and `macro("ucs_unlikely") { }`
+// answered with 31 unrelated macros -- every one of them an argument at one of
+// its call sites.
+//
+// Measured on ucx: across 41,487 expansions, every child was another folded
+// expansion (2,594 of them) and not one was a DEFINITION.  So nothing is lost.
+// In particular a macro-GENERATED symbol is not a child of the expansion that
+// made it -- it is a folded DEFINITION beside it, which is why the narrow rule
+// is "an expansion is never a parent" and not "a folded instance is never a
+// parent": the latter would re-admit `__compiletime_assert_1121` into
+// `mod { func }`.
+TEST(ObjectRoots, AnExpansionContainsNothing) {
+    for (const char* fx : {"macro_layerwise", "macro_nested", "macro_arg_direct",
+                           "macro_expansion_arg", "macro_struct_in_union",
+                           "macro_zero_width", "reincluded_header"}) {
+        std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fx;
+        TempDir temp_dir = makeTempDir();
+        std::vector<std::string> srcs;
+        for (auto& e : fs::directory_iterator(fixture_dir))
+            if (e.path().extension() == ".c") srcs.push_back(e.path().filename().string());
+        std::sort(srcs.begin(), srcs.end());
+        generateCompileCommands(fixture_dir, temp_dir.path, srcs);
+        Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+        indexer.run();
+        auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                         indexer.allFiles(), 1);
+        askl::index::Project project;
+        ASSERT_TRUE(project.ParseFromString(built.project_data));
+
+        for (const auto& obj : project.objects()) {
+            for (const auto& child : obj.symbol_instances()) {
+                const askl::index::SymbolInstance* owner = nullptr;
+                for (const auto& c : obj.symbol_instances()) {
+                    if (&c == &child) continue;
+                    if (c.dfs_enter() < child.dfs_enter() &&
+                        child.dfs_enter() < c.dfs_exit() &&
+                        (!owner || c.dfs_enter() > owner->dfs_enter()))
+                        owner = &c;
+                }
+                if (!owner) continue;
+                EXPECT_NE(owner->instance_type(), askl::index::InstanceType::EXPANSION)
+                    << fx << " " << obj.module_path() << ": instance ["
+                    << child.dfs_enter() << "," << child.dfs_exit()
+                    << ") is inside an EXPANSION at [" << owner->dfs_enter() << ","
+                    << owner->dfs_exit() << ") -- an expansion owns no text";
+            }
+        }
+    }
+}
+
+static std::set<std::pair<std::string, std::string>> edgesOf(const char* fixture);static std::set<std::pair<std::string, std::string>> edgesOf(const char* fixture);
+
+TEST(ObjectRoots, MacroEdgesAreLayerwise) {
+    EXPECT_EQ(edgesOf("macro_layerwise"),
+              (std::set<std::pair<std::string, std::string>>{
+                  {"handler", "threshold"},
+                  {"handler", "DEV_PRINT"},
+                  {"DEV_PRINT", "printk"},
+                  // `DEV_PRINT(LEVEL)` -- an argument that is itself a macro.
+                  // Its expansion is a tree CHILD of DEV_PRINT's expansion,
+                  // because it is written inside that invocation's text, so
+                  // owning the invocation edge by tree parentage produced
+                  // `DEV_PRINT -> LEVEL`.  The text is the caller's.
+                  {"handler", "LEVEL"},
+              }));
+
+    // And a CHAIN: one edge per layer, so `handler -> output` is four hops.
+    // The three middle ones do not exist in anything libclang reports -- the
+    // preprocessing record carries only the outermost expansion at a use site,
+    // so `ERR` written inside FATAL's body is an expansion nowhere.
+    // `linkMacroBodies` reads them from the `#define` text.
+    EXPECT_EQ(edgesOf("macro_nested"),
+              (std::set<std::pair<std::string, std::string>>{
+                  {"handler", "FATAL"},
+                  {"FATAL", "ERR"},
+                  {"ERR", "MSG"},
+                  {"MSG", "output"},
+              }));
+}
+
+static std::set<std::pair<std::string, std::string>> edgesOf(const char* fixture) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fixture;
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"main.c"});
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+    auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                     indexer.allFiles(), 1);
+    askl::index::Project project;
+    EXPECT_TRUE(project.ParseFromString(built.project_data));
+
+    std::unordered_map<int64_t, std::string> name;
+    for (const auto& sym : project.symbols()) name[sym.local_id()] = sym.name();
+    auto leaf = [](const std::string& p) {
+        auto i = p.rfind('/');
+        return i == std::string::npos ? p : p.substr(i + 1);
+    };
+
+    // An edge is (owner of the ref) -> (target of the ref).  The owner is the
+    // instance whose interval innermost contains the ref's position, which is
+    // how the engine reads it.
+    std::set<std::pair<std::string, std::string>> edges;
+    for (const auto& obj : project.objects()) {
+        if (obj.filetype() == "directory") continue;
+        for (const auto& ref : obj.refs()) {
+            const askl::index::SymbolInstance* owner = nullptr;
+            for (const auto& i : obj.symbol_instances())
+                if (i.dfs_enter() < ref.dfs_enter() && ref.dfs_enter() < i.dfs_exit() &&
+                    (!owner || i.dfs_enter() > owner->dfs_enter()))
+                    owner = &i;
+            EXPECT_NE(owner, nullptr);
+            if (!owner) continue;
+            edges.insert({leaf(name[owner->symbol_local_id()]),
+                          leaf(name[ref.to_symbol_local_id()])});
+        }
+    }
+    return edges;
 }
 
 // A header included twice under different macro definitions.
@@ -1639,20 +1874,20 @@ TEST(ObjectRoots, ReincludedHeaderKeepsBothExpansions) {
         EXPECT_EQ(generated.count("alpha_f"), 1u);
         EXPECT_EQ(generated.count("alpha_d"), 1u);
 
-        // The point of keeping both: a ref numbered against one of them still
-        // lands inside it.  `EveryInstanceFormsAValidTree` checks this across
-        // every fixture; here it is the whole reason the instance survived.
-        for (const auto& ref : obj.refs()) {
-            bool inside = false;
-            for (const auto& i : obj.symbol_instances())
-                inside = inside || (i.dfs_enter() < ref.dfs_enter() &&
-                                    ref.dfs_enter() < i.dfs_exit() &&
-                                    i.instance_type() ==
-                                        askl::index::InstanceType::EXPANSION);
-            EXPECT_TRUE(inside)
-                << "ref to " << name[ref.to_symbol_local_id()] << " at dfs "
-                << ref.dfs_enter() << " is not inside any expansion";
-        }
+        // Each surviving expansion contributes an invocation edge -- a
+        // reference TO `DECL`, owned by whatever wrote the invocation.  Two
+        // expansions at one extent means two identical ranges, which
+        // ProtoBuilder's ref dedup (correctly) collapses to one: a reference
+        // is identified by the text it occupies, and there is one such text.
+        int decl_refs = 0;
+        for (const auto& ref : obj.refs())
+            if (name[ref.to_symbol_local_id()] == "DECL") decl_refs++;
+        EXPECT_EQ(decl_refs, 1)
+            << "one invocation text, one invocation edge";
+
+        // Every ref inside some interval is checked for every fixture by
+        // `EveryInstanceFormsAValidTree`, which `reincluded_header` is in --
+        // that is the assertion the dropped expansion used to break.
     }
     ASSERT_TRUE(checked) << "multi.h was not in the built project";
 }
@@ -1721,7 +1956,10 @@ TEST(ObjectRoots, EveryInstanceFormsAValidTree) {
                            "cross_tu_field_refs",
                            // One header included twice under different macro
                            // definitions: two expansions at ONE extent.
-                           "reincluded_header"}) {
+                           "reincluded_header",
+                           // Layerwise macro edges: an invocation edge at a
+                           // call site, a body edge at the `#define`.
+                           "macro_layerwise"}) {
         std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fx;
         TempDir temp_dir = makeTempDir();
         std::vector<std::string> srcs;
@@ -1797,6 +2035,14 @@ TEST(ObjectRoots, EveryInstanceFormsAValidTree) {
             // a tree leaf whose range still contained other instances.
             for (int a = 0; a < obj.symbol_instances_size(); ++a) {
                 const auto& ia = obj.symbol_instances(a);
+                // ...with ONE exception, and it is the doctrine rather than a
+                // carve-out: an EXPANSION contains nothing by range, because a
+                // macro expansion owns no text.  `DEV_PRINT(LEVEL)` spans
+                // [85,101) and the argument's own expansion spans [95,100),
+                // so range nesting says the macro contains it -- and the
+                // caller wrote both, so the tree says they are siblings.
+                if (ia.instance_type() == askl::index::InstanceType::EXPANSION)
+                    continue;
                 for (int b = 0; b < obj.symbol_instances_size(); ++b) {
                     if (a == b) continue;
                     const auto& ib = obj.symbol_instances(b);

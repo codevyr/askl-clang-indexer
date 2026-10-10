@@ -61,6 +61,8 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         // Create MACRO symbol
         auto [sym_id, _] = self->symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_MACRO);
 
+        self->tu_macros_[sname] = sym_id;
+
         // Create instance at the #define body range
         CXFile range_file;
         unsigned start_off, end_off;
@@ -69,6 +71,9 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
             self->addInstance(
                 fi, {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), INSTTYPE_DEFINITION},
                 false);
+            // The body is read for the macros it names once every macro in
+            // this TU is known; see `linkMacroBodies`.
+            self->macro_bodies_.push_back({range_file, fi, start_off, end_off, sname});
         }
     } else if (kind == CXCursor_MacroExpansion) {
         ClangString name(clang_getCursorSpelling(cursor));
@@ -106,17 +111,9 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
             d.folded = true; // an expansion is the fold boundary itself
             d.name_start = static_cast<int32_t>(start_off);
             d.name_end = static_cast<int32_t>(name_end);
-            size_t idx = self->result_.files[fi].instances.size();
+            d.name_end = static_cast<int32_t>(name_end);
             self->addInstance(fi, d, true);
             self->closeScopesTo(self->dfs_stack_.size() - 1);
-            // Remember WHICH INSTANCE the macro is, so addRef can own an
-            // expansion-site ref to it rather than to the enclosing scope.  An
-            // index, not numbers: nothing is numbered until `numberTree`.  The
-            // NAME end is what clamps those refs, which is what keeps them out
-            // of the argument token's dedup slot.
-            uint64_t key = fileOffsetKey(fi, start_off);
-            self->macro_sites_[key] =
-                MacroSite{name_end, static_cast<int32_t>(idx)};
         }
     }
 
@@ -126,6 +123,66 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
 void Stage1::collectMacros(CXTranslationUnit tu) {
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, macroVisitor, this);
+    linkMacroBodies(tu);
+}
+
+void Stage1::linkMacroBodies(CXTranslationUnit tu) {
+    for (const MacroBody& b : macro_bodies_) {
+        CXSourceLocation begin = clang_getLocationForOffset(tu, b.file, b.start);
+        CXSourceLocation end = clang_getLocationForOffset(tu, b.file, b.end);
+        CXSourceRange range = clang_getRange(begin, end);
+
+        CXToken* toks = nullptr;
+        unsigned n = 0;
+        clang_tokenize(tu, range, &toks, &n);
+        if (!toks) continue;
+
+        // Parameter names are NOT macros, whatever else in the project shares
+        // their spelling -- `#define WRAP(x) FOO(x)` must not gain an edge to
+        // some unrelated `#define x`.  A macro is function-like exactly when
+        // the `(` abuts the name with no space, so compare offsets rather than
+        // guessing from the text.
+        std::unordered_set<std::string> params;
+        unsigned name_end_off = b.start + static_cast<unsigned>(b.name.size());
+        bool in_params = false;
+        for (unsigned i = 0; i < n; ++i) {
+            CXSourceLocation tl = clang_getTokenLocation(tu, toks[i]);
+            unsigned off = 0;
+            clang_getSpellingLocation(tl, nullptr, nullptr, nullptr, &off);
+            ClangString spell(clang_getTokenSpelling(tu, toks[i]));
+            std::string tok = spell.to_string();
+            if (i == 1 && tok == "(" && off == name_end_off) {
+                in_params = true;
+                continue;
+            }
+            if (in_params) {
+                if (tok == ")") break;
+                if (clang_getTokenKind(toks[i]) == CXToken_Identifier) params.insert(tok);
+                continue;
+            }
+            break; // object-like macro: no parameter list to skip
+        }
+
+        for (unsigned i = 0; i < n; ++i) {
+            if (clang_getTokenKind(toks[i]) != CXToken_Identifier) continue;
+            ClangString spell(clang_getTokenSpelling(tu, toks[i]));
+            std::string tok = spell.to_string();
+            if (tok == b.name) continue;        // the macro being defined
+            if (params.count(tok)) continue;    // a parameter, not a macro
+            auto it = tu_macros_.find(tok);
+            if (it == tu_macros_.end()) continue;
+
+            CXSourceLocation tl = clang_getTokenLocation(tu, toks[i]);
+            unsigned off = 0;
+            clang_getSpellingLocation(tl, nullptr, nullptr, nullptr, &off);
+            // No owner: `numberTree` resolves it from the text, and the
+            // narrowest unfolded instance containing a token inside a
+            // `#define` body is that macro's own definition.
+            insertRef(b.file_idx, it->second, static_cast<int32_t>(off),
+                      static_cast<int32_t>(off + tok.size()));
+        }
+        clang_disposeTokens(tu, toks, n);
+    }
 }
 
 void Stage1::collectTypedefTypes(CXTranslationUnit tu) {
@@ -257,6 +314,24 @@ void Stage1::closeScopesTo(size_t mark) {
     while (dfs_stack_.size() > mark) dfs_stack_.pop_back();
 }
 
+int32_t ownerOfText(const FileData& f, int32_t start, int32_t end) {
+    int32_t best = -1;
+    int64_t best_width = 0;
+    for (size_t i = 0; i < f.instances.size(); ++i) {
+        const InstanceData& inst = f.instances[i];
+        if (inst.folded) continue; // a macro expansion owns no text
+        if (inst.start_offset > start || inst.end_offset < end) continue;
+        int64_t width = static_cast<int64_t>(inst.end_offset) - inst.start_offset;
+        // Narrowest wins; ties broken by the earlier instance, so the choice
+        // does not depend on the order cursors happened to arrive in.
+        if (best < 0 || width < best_width) {
+            best = static_cast<int32_t>(i);
+            best_width = width;
+        }
+    }
+    return best;
+}
+
 void Stage1::numberTree(FileData& f) {
     const size_t n = f.instances.size();
     if (n == 0) return;
@@ -301,6 +376,27 @@ void Stage1::numberTree(FileData& f) {
         for (size_t j = 0; j < n; ++j) {
             if (j == i) continue;
             const InstanceData& c = f.instances[j];
+            // AN EXPANSION IS NEVER A PARENT BY RANGE, because a macro
+            // expansion owns no text: every byte at the call site of `foo(a)`
+            // was typed by the caller.  Without this, a macro passed as an
+            // ARGUMENT nests under the outer invocation it was written inside
+            // -- `ucs_unlikely(kh_end(x))` made `kh_end`'s expansion a child
+            // of `ucs_unlikely`'s, so `macro("ucs_unlikely") { }` reported 31
+            // unrelated macros as its contents.  They are the caller's, and
+            // they become siblings of the outer expansion under it.
+            //
+            // Measured on ucx: across 41,487 expansions every single child
+            // was another folded expansion -- 2,594 of them, and not one
+            // DEFINITION -- so this relation carried arguments and nothing
+            // else.
+            //
+            // NOT "a folded instance is never a parent", which would be the
+            // tidier sentence and would break the fold axis where it earns its
+            // keep: a macro-GENERATED symbol is a folded DEFINITION that does
+            // own its text, and `__compiletime_assert_1121` sits inside the
+            // generated `event_show` at fold_depth 1.  That is what keeps it
+            // out of `mod { func }` while `event_show` itself stays in.
+            if (c.instance_type == INSTTYPE_EXPANSION) continue;
             if (c.start_offset > x.start_offset || c.end_offset < x.end_offset) continue;
             if (c.start_offset == x.start_offset && c.end_offset == x.end_offset)
                 continue; // equal, not strict -- only (b) may use it
@@ -311,6 +407,43 @@ void Stage1::numberTree(FileData& f) {
             }
         }
         parent[i] = best;
+    }
+
+    // --- THE INVOCATION EDGE -------------------------------------------
+    // `handler() { DEV_PRINT(x); }` must produce a reference `handler ->
+    // DEV_PRINT`, and before this nothing referenced a macro at all: the
+    // preprocessor pass creates an INSTANCE for an expansion and never a
+    // REFERENCE.  Measured on ucx, none of 231,091 references targeted any of
+    // 14,946 macro symbols, so the first hop of `handler -> DEV_PRINT ->
+    // printk` simply did not exist and containment (`unnest`, and with it the
+    // whole fold axis on references) was the only way across.
+    //
+    // Emitted HERE, not in `macroVisitor`, because that pass runs before the
+    // AST walk with an empty scope stack (`collectMacros`), so there is no
+    // open scope to attribute it to at the time the expansion is seen.
+    //
+    // The owner is left UNSET so the reference is placed by `ownerOfText`
+    // below, like every other one.  It must NOT come from `parent[]`: tree
+    // parentage of an expansion is range-derived, and a macro passed as an
+    // ARGUMENT expands inside the text of the outer invocation, so
+    // `DEV_PRINT(LEVEL)` makes LEVEL's expansion a tree child of DEV_PRINT's
+    // and produced an edge `DEV_PRINT -> LEVEL`.  That is the argument edge
+    // this whole model exists to remove -- `LEVEL` is text the CALLER wrote.
+    // Excluding folded instances, which is what `ownerOfText` does, gives
+    // `handler -> LEVEL` instead.
+    //
+    // The chain between two macros does not come from here at all: libclang
+    // never reports an expansion written inside a `#define` body, so
+    // `FATAL -> ERR` is emitted by `linkMacroBodies` from the body text, and
+    // lands inside FATAL's own unfolded DEFINITION instance.
+    for (size_t i = 0; i < n; ++i) {
+        const InstanceData& x = f.instances[i];
+        if (x.instance_type != INSTTYPE_EXPANSION) continue;
+        if (x.name_start < 0) continue;
+        RefData r{x.symbol_local_id, x.name_start, x.name_end};
+        r.full_start = x.start_offset;
+        r.full_end = x.end_offset;
+        f.refs.push_back(r);
     }
 
     // --- NUMBERING -----------------------------------------------------
@@ -371,6 +504,12 @@ void Stage1::numberTree(FileData& f) {
     // construction, instead of two independently computed numbers that agreed
     // only while a reference sat inside exactly one scope.
     for (RefData& r : f.refs) {
+        // EVERY reference is placed by TEXT, by the one rule in `ownerOfText`:
+        // the narrowest UNFOLDED instance containing it.  `insertRef` no longer
+        // guesses an owner from the AST scope -- it could not see a macro body,
+        // and the case that needed a scope (an argument token vs the macro's
+        // own expansion-site use of it) no longer exists.
+        r.owner_idx = ownerOfText(f, r.from_offset_start, r.from_offset_end);
         if (r.owner_idx < 0 || static_cast<size_t>(r.owner_idx) >= n) continue;
         const InstanceData& o = f.instances[static_cast<size_t>(r.owner_idx)];
         r.dfs_enter = o.dfs_enter + 1;
@@ -383,19 +522,16 @@ void Stage1::insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t e
                        int32_t full_start, int32_t full_end) {
     if (!file_ref_sets_[file_idx].insert({sym_id, start, end}).second)
         return;
-    // Record the OWNER; `numberTree` turns it into numbers.  A ref is a point
-    // one step inside its owner, so several refs in one scope share a number
-    // and nothing tells them apart -- ordering comes from the byte range.
-    //
-    // The owner is the enclosing AST scope, not the innermost instance by
-    // range, and that distinction is the whole `printk(foo)` doctrine: the
-    // argument token and the macro's own expansion-site use of it both lie
-    // inside the caller's text, so only the scope the walk was in can say
-    // which is which.  `addRef` overrides this for the expansion-site ref.
+    // The owner is left UNSET: `numberTree` resolves it by text, through
+    // `ownerOfText`, once every instance in the file is known.  It used to come
+    // from `stackParent(file_idx)` here, and that was wrong for exactly the
+    // references a macro body contributes -- the scope stack is consulted per
+    // FILE, and when a function in one file expands a macro defined in
+    // another, nothing from the defining file is on it, so a body reference
+    // landed on that file's root.
     RefData r{sym_id, start, end};
     r.full_start = full_start;
     r.full_end = full_end;
-    r.owner_idx = stackParent(file_idx);
     result_.files[file_idx].refs.push_back(r);
 }
 
@@ -420,52 +556,22 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
                   full_start, full_end);
     }
 
-    // Use cursor location expansion (not extent) for tight expansion-site refs.
-    // This gives a single point at the macro call start, which we clamp to the
-    // macro name width using the lookup map populated during collectMacros.
-    // Triggers for both cross-file refs (macro body) and same-file-different-offset
-    // refs (macro arguments).
-    CXSourceLocation exp_loc = clang_getCursorLocation(cursor);
-    CXFile expansion_file = nullptr;
-    unsigned exp_off;
-    clang_getExpansionLocation(exp_loc, &expansion_file, nullptr, nullptr, &exp_off);
-    if (expansion_file) {
-        bool diff_file = !spelling_file || !clang_File_isEqual(spelling_file, expansion_file);
-        // For same-file macro arguments: check if cursor location's spelling
-        // differs from its expansion (i.e., cursor is inside a macro expansion).
-        bool same_file_macro = false;
-        if (!diff_file) {
-            CXFile spell_loc_file = nullptr;
-            unsigned spell_loc_off;
-            clang_getSpellingLocation(exp_loc, &spell_loc_file, nullptr, nullptr, &spell_loc_off);
-            same_file_macro = spell_loc_file &&
-                (spell_loc_off != exp_off || !clang_File_isEqual(spell_loc_file, expansion_file));
-        }
-        if (diff_file || same_file_macro) {
-            size_t fi = getOrCreateFile(expansion_file);
-            // Clamp to the enclosing macro's name width, and place the ref
-            // inside that macro: one fold level deeper, so it is out of reach
-            // of `mod { func }` and reached by `mod { macro { func } }`.
-            uint64_t key = fileOffsetKey(fi, exp_off);
-            auto it = macro_sites_.find(key);
-            int32_t exp_end = (it != macro_sites_.end())
-                ? static_cast<int32_t>(it->second.name_end)
-                : static_cast<int32_t>(exp_off + 1);  // fallback
-            insertRef(fi, sym_id, static_cast<int32_t>(exp_off), exp_end);
-            // Own it to the MACRO, overriding the enclosing scope `insertRef`
-            // recorded.  `numberTree` then places it one step inside the macro
-            // and one fold level deeper, which is what puts it out of reach of
-            // `mod { func }` and within reach of `mod { macro { func } }`.
-            // Guarded on `refs.back()` because insertRef dedups and may not
-            // have pushed anything.
-            if (it != macro_sites_.end() && !result_.files[fi].refs.empty()) {
-                RefData& r = result_.files[fi].refs.back();
-                if (r.to_symbol_local_id == sym_id &&
-                    r.from_offset_start == static_cast<int32_t>(exp_off))
-                    r.owner_idx = it->second.instance_idx;
-            }
-        }
-    }
+    // NO EXPANSION-SITE REFERENCE.  There used to be a second reference here,
+    // emitted at the macro call site and owned by the expansion instance, for
+    // every symbol an expansion touched.  Macro edges are layerwise now: each
+    // layer records only what its OWN body names, and the body reference --
+    // the one `insertRef` above already emitted, at the text the macro author
+    // wrote -- is that record.  `handler -> printk` is a traversal of
+    // `handler -> DEV_PRINT -> printk`, not a stored edge, exactly as it
+    // already is for a chain of functions.
+    //
+    // Deleting it removes two wrongs and one duplicate.  On ucx it was 71,833
+    // references collapsing to 14,753 distinct (macro, target) pairs, so the
+    // same edge was materialised once per call site.  It also produced
+    // `DEV_PRINT -> threshold` for `DEV_PRINT(threshold)` -- an edge from a
+    // macro to an argument the macro never contained, since every byte at a
+    // call site is the caller's.  And the hop it was standing in for,
+    // `handler -> DEV_PRINT`, never existed; `numberTree` emits it now.
 }
 
 void Stage1::addDocComment(CXCursor cursor, int64_t sym_id, size_t /*file_idx*/) {

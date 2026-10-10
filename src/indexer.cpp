@@ -11,8 +11,9 @@ namespace {
 /// Assign a ref its DFS position from the instance that contains it, for refs
 /// produced outside the numbering walk.  Narrowest containing extent wins;
 /// ties go to the greatest depth, then the latest dfs_enter.
-/// Place a reference that arrived without a usable scope, from the text it sits
-/// in.  Two callers need this:
+/// Place a reference from the text it sits in, by the same rule
+/// `Stage1::numberTree` uses -- `ownerOfText`, the narrowest UNFOLDED instance
+/// containing it.  Two callers need it after numbering has already run:
 ///
 ///   * Stage2 runs as its own pass and has no DFS stack, so its synthetic refs
 ///     arrive unnumbered;
@@ -22,62 +23,23 @@ namespace {
 ///     numbers must be recomputed against the instances it will actually live
 ///     with, or they describe a numbering that no longer exists.
 ///
-/// Scope-based placement is more precise and is what `Stage1::numberTree` does
-/// for refs it owns; this is the faithful reconstruction for refs that have no
-/// scope to consult.  The one thing text alone cannot tell -- an argument token
-/// versus the macro's own expansion-site use of it, both lying inside the
-/// caller -- is recovered from the expansion's NAME span, which is exactly what
-/// an expansion-site ref is clamped to.
+/// This used to carry its own first step -- match an EXPANSION whose name span
+/// equals the ref's range, and own the ref to that expansion -- to recover the
+/// one distinction text alone could not make: a macro argument token versus the
+/// macro's own expansion-site use of it, both lying inside the caller.  There
+/// are no expansion-site refs any more, so there is nothing to disambiguate
+/// and nothing to special-case: one rule, one implementation, shared with the
+/// numbering pass so the two cannot drift.
 void placeRefByText(const FileData& file, RefData& ref) {
-    // (1) An expansion-site ref is clamped to the macro's name, so the
-    //     EXPANSION whose name span equals this ref's range is its owner.  At
-    //     one offset there is at most one expansion, so this is unambiguous.
-    for (const auto& inst : file.instances) {
-        if (inst.instance_type != INSTTYPE_EXPANSION) continue;
-        if (inst.name_start != ref.from_offset_start || inst.name_end != ref.from_offset_end)
-            continue;
-        ref.dfs_enter = inst.dfs_enter + 1;
-        ref.nesting_level = inst.nesting_level + 1;
-        // One fold level deeper, which is what keeps an expanded use out of
-        // reach of `mod { func }` and within reach of `mod { macro { func } }`.
-        ref.fold_depth = inst.fold_depth + (inst.folded ? 1 : 0);
-        return;
-    }
-
-    // (2) Otherwise the instance that owns the text.
-    const InstanceData* best = nullptr;
-    int64_t best_width = 0;
-    for (const auto& inst : file.instances) {
-        // A macro expansion owns no text: every byte at the call site of
-        // `foo(a)` was typed by the caller, so a folded instance is never the
-        // owner of a reference written there.  This used to be implicit --
-        // an expansion's extent was clamped to its own name, so an argument
-        // token fell outside it -- and the clamp is gone, so the rule has to
-        // be stated.
-        //
-        // NOT pinned by a test, and here is why: a Stage2 synthetic ref is
-        // placed at the FIELD's declaration site (`stage2.cpp`), not at the
-        // assignment, so it sits inside a folded instance only when a struct
-        // field is itself declared inside a macro body -- the glibc
-        // `__SOCKADDR_ALLTYPES` shape.  No fixture has that.  Without the
-        // exclusion such a ref is attributed to the expansion and drops a fold
-        // level out of reach of the enclosing scope.
-        if (inst.folded) continue;
-        if (inst.start_offset > ref.from_offset_start || inst.end_offset < ref.from_offset_end)
-            continue;
-        int64_t width = static_cast<int64_t>(inst.end_offset) - inst.start_offset;
-        if (!best || width < best_width ||
-            (width == best_width && inst.dfs_enter < best->dfs_enter)) {
-            best = &inst;
-            best_width = width;
-        }
-    }
-    if (!best) return; // leave at the object root
-    ref.nesting_level = best->nesting_level + 1;
-    ref.dfs_enter = best->dfs_enter + 1;
-    // `best` is unfolded by the filter above, so its fold depth carries
-    // straight over -- a ref is a child of its owner on every axis.
-    ref.fold_depth = best->fold_depth;
+    int32_t idx = ownerOfText(file, ref.from_offset_start, ref.from_offset_end);
+    if (idx < 0) return; // leave at the object root
+    const InstanceData& owner = file.instances[static_cast<size_t>(idx)];
+    ref.owner_idx = idx;
+    ref.nesting_level = owner.nesting_level + 1;
+    ref.dfs_enter = owner.dfs_enter + 1;
+    // `owner` is unfolded by the rule above, so its fold depth carries straight
+    // over -- a ref is a child of its owner on every axis.
+    ref.fold_depth = owner.fold_depth;
 }
 } // namespace
 
