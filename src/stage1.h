@@ -125,6 +125,43 @@ struct FileData {
 /// with them.
 int32_t ownerOfText(const FileData& f, int32_t start, int32_t end);
 
+/// A SYMBOL'S PLACE IN THE CANONICAL ORDER, indexed by its local id.
+///
+/// The local id itself cannot be used: ids are handed out by `getOrCreate` in
+/// the order symbols are first SEEN, which is translation-unit arrival order.
+/// The name and the scope come from the source, so they are the same whatever
+/// order the index was built in.
+struct SymbolOrder {
+    std::string name;
+    int scope = 0;
+};
+
+/// Put a file's instances in a canonical order, so that everything downstream
+/// of them is a function of the SET rather than of the order translation units
+/// happened to contribute.
+///
+/// Two things read the vector's order and would otherwise inherit the merge's:
+/// `numberTree` builds each node's child list by walking it, which fixes the
+/// preorder sequence and therefore every DFS number; and `ownerOfText` breaks
+/// ties between equally narrow candidates by taking the earlier one.
+///
+/// Measured before this existed: reversing criu's 211 translation units moved
+/// 2,953 instances and 3,006 references to different numbers. The TREE was
+/// identical -- not one of 34,018 instances changed `nesting_level`,
+/// `fold_depth` or `folded` -- so nothing was wrong with the graph; it simply
+/// could not be reproduced, which rules out comparing two indices or
+/// addressing a row by position across a reindex.
+///
+/// The order is `(start, end, instance_type, symbol name, symbol scope)`, and
+/// it is TOTAL because of instance dedup: `InstKey` makes
+/// `(symbol, type, extent)` unique per file, so two instances can only tie here
+/// if they share a symbol, and they cannot. Every component is needed --
+/// measured on criu, `(start, end, type)` alone collides 49 times on
+/// co-extensive macro-generated symbols whose name spans are both absent, and
+/// adding the name still leaves one collision, a `static`/`extern` pair of the
+/// same declaration that is its own open defect.
+void canonicaliseInstanceOrder(FileData& f, const std::vector<SymbolOrder>& order);
+
 struct Stage1Result {
     std::vector<FileData> files;
     std::unordered_map<std::string, size_t> file_index; // filesystem_path -> index in files

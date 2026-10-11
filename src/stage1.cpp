@@ -1,3 +1,4 @@
+#include <tuple>
 #include <algorithm>
 #include "stage1.h"
 #include "clang_raii.h"
@@ -366,6 +367,64 @@ int32_t ownerOfText(const FileData& f, int32_t start, int32_t end) {
         }
     }
     return best;
+}
+
+void canonicaliseInstanceOrder(FileData& f, const std::vector<SymbolOrder>& order) {
+    const size_t n = f.instances.size();
+    if (n < 2) return;
+
+    auto key = [&](size_t i) {
+        const InstanceData& d = f.instances[i];
+        const SymbolOrder* so =
+            (d.symbol_local_id >= 0 && static_cast<size_t>(d.symbol_local_id) < order.size())
+                ? &order[static_cast<size_t>(d.symbol_local_id)]
+                : nullptr;
+        return std::tuple<int32_t, int32_t, int32_t, const std::string*, int>(
+            d.start_offset, d.end_offset, d.instance_type,
+            so ? &so->name : nullptr, so ? so->scope : 0);
+    };
+
+    std::vector<size_t> perm(n);
+    for (size_t i = 0; i < n; ++i) perm[i] = i;
+    std::sort(perm.begin(), perm.end(), [&](size_t a, size_t b) {
+        auto ka = key(a), kb = key(b);
+        if (std::get<0>(ka) != std::get<0>(kb)) return std::get<0>(ka) < std::get<0>(kb);
+        if (std::get<1>(ka) != std::get<1>(kb)) return std::get<1>(ka) < std::get<1>(kb);
+        if (std::get<2>(ka) != std::get<2>(kb)) return std::get<2>(ka) < std::get<2>(kb);
+        const std::string* na = std::get<3>(ka);
+        const std::string* nb = std::get<3>(kb);
+        if (na && nb && *na != *nb) return *na < *nb;
+        if (static_cast<bool>(na) != static_cast<bool>(nb)) return nb != nullptr;
+        return std::get<4>(ka) < std::get<4>(kb);
+    });
+
+    // instances[0] must stay the file's own instance: every root-numbering path
+    // assumes it, and `ProtoBuilder::ensureObjectRoot` numbers exactly that row
+    // for a file nothing walked.  Its extent is [0, content size), so the sort
+    // already puts it first unless another instance starts at 0 and ends no
+    // later -- a file whose first declaration spans the whole text.  Pin it
+    // rather than rely on that.
+    auto zero = std::find(perm.begin(), perm.end(), size_t{0});
+    if (zero != perm.end()) {
+        perm.erase(zero);
+        perm.insert(perm.begin(), size_t{0});
+    }
+
+    std::vector<size_t> rank(n);
+    for (size_t newpos = 0; newpos < n; ++newpos) rank[perm[newpos]] = newpos;
+
+    std::vector<InstanceData> sorted;
+    sorted.reserve(n);
+    for (size_t i = 0; i < n; ++i) sorted.push_back(f.instances[perm[i]]);
+    // `stack_parent` is an index into the vector being reordered, so it has to
+    // move with it.  A ref's owner_idx is assigned later, by `numberTree`.
+    for (InstanceData& d : sorted) {
+        if (d.stack_parent >= 0 && static_cast<size_t>(d.stack_parent) < n)
+            d.stack_parent = static_cast<int32_t>(rank[static_cast<size_t>(d.stack_parent)]);
+        else
+            d.stack_parent = -1;
+    }
+    f.instances.swap(sorted);
 }
 
 void Stage1::numberTree(FileData& f) {

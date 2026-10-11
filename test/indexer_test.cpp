@@ -1637,6 +1637,70 @@ TEST(ObjectRoots, AMacroInvocationIsInsideItsEnclosingFunction) {
 // on one range and must resolve to one owner.  Un-renumbered, b.c's ref came
 // out at dfs 11265 against a.c's numbering -- outside the field entirely --
 // while a.c's sat correctly at 5121.
+// THE NUMBERING IS A FUNCTION OF WHAT WAS FOUND, NOT OF THE ORDER IT ARRIVED.
+//
+// The union made the instance SET order-independent; it did not make the
+// numbers so.  `numberTree` builds each node's child list by walking the
+// instance vector, so the preorder sequence -- and therefore every dfs_enter in
+// the object -- followed whichever translation unit contributed each row first.
+// Measured on criu before `canonicaliseInstanceOrder`: reversing 211
+// translation units moved 2,953 instances and 3,006 references to different
+// numbers, while not one of 34,018 instances changed `nesting_level`,
+// `fold_depth` or `folded`.  Nothing was wrong with the graph; it just could
+// not be reproduced, which rules out diffing two indices or addressing a row by
+// position across a reindex.
+//
+// Keyed by symbol NAME and SCOPE rather than local_id on purpose: ids are
+// handed out in the order symbols are first seen, so they legitimately permute
+// between runs.  This test is about the graph, not its labels.
+TEST(ObjectRoots, NumberingDoesNotDependOnTuOrder) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/cross_tu_field_refs";
+    using InstKeyT = std::tuple<std::string, std::string, int, int, int32_t, int32_t>;
+    using RefKeyT = std::tuple<std::string, std::string, int, int32_t, int32_t>;
+    std::map<InstKeyT, std::tuple<int64_t, int64_t, int32_t, int32_t, bool>> inst_of[2];
+    std::map<RefKeyT, std::tuple<int64_t, int32_t, int32_t>> ref_of[2];
+
+    std::vector<std::string> orders[2] = {{"a.c", "b.c"}, {"b.c", "a.c"}};
+    for (int run = 0; run < 2; ++run) {
+        TempDir temp_dir = makeTempDir();
+        generateCompileCommands(fixture_dir, temp_dir.path, orders[run]);
+        Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+        indexer.run();
+
+        std::unordered_map<int64_t, std::pair<std::string, int>> sym;
+        for (const auto& si : indexer.symbolTable().allSymbols())
+            sym[si.local_id] = {si.name, si.scope};
+
+        for (const auto& f : indexer.allFiles()) {
+            for (const auto& i : f.instances) {
+                auto& s = sym[i.symbol_local_id];
+                inst_of[run][{f.module_path, s.first, s.second, i.instance_type,
+                              i.start_offset, i.end_offset}] =
+                    {i.dfs_enter, i.dfs_exit, i.nesting_level, i.fold_depth, i.folded};
+            }
+            for (const auto& r : f.refs) {
+                auto& s = sym[r.to_symbol_local_id];
+                ref_of[run][{f.module_path, s.first, s.second,
+                             r.from_offset_start, r.from_offset_end}] =
+                    {r.dfs_enter, r.nesting_level, r.fold_depth};
+            }
+        }
+    }
+
+    ASSERT_FALSE(inst_of[0].empty());
+    ASSERT_FALSE(ref_of[0].empty());
+    EXPECT_EQ(inst_of[0].size(), inst_of[1].size())
+        << "the two orders must find the same declarations";
+    EXPECT_EQ(ref_of[0].size(), ref_of[1].size());
+    // Whole-map equality, so a differing NUMBER fails just as loudly as a
+    // missing declaration -- the two failures this is guarding are distinct and
+    // the second is the one that was silent.
+    EXPECT_EQ(inst_of[0], inst_of[1])
+        << "same declarations must get the same intervals in either TU order";
+    EXPECT_EQ(ref_of[0], ref_of[1])
+        << "same references must get the same positions in either TU order";
+}
+
 // A SHARED HEADER'S INSTANCES ARE THE UNION OF EVERY TU'S VIEW, NOT THE FIRST
 // TU'S -- codevyr/askl-clang-indexer#7.
 //

@@ -438,13 +438,25 @@ void Indexer::run() {
     // no walk, so they keep `dfs_exit == 0`, which is exactly how
     // `ProtoBuilder::ensureObjectRoot` recognises "never numbered".
     {
+        // A canonical instance order first, so the numbers below are a function
+        // of what was found rather than of the order it arrived in.  Indexed by
+        // local id, which is dense from 1.
+        std::vector<SymbolOrder> order;
+        for (const SymbolInfo& si : symbol_table_.allSymbols()) {
+            if (si.local_id < 0) continue;
+            if (static_cast<size_t>(si.local_id) >= order.size())
+                order.resize(static_cast<size_t>(si.local_id) + 1);
+            order[static_cast<size_t>(si.local_id)] = SymbolOrder{si.name, si.scope};
+        }
+
         std::atomic<size_t> next_file{0};
         std::vector<std::thread> numberers;
         for (int t = 0; t < threads_; t++) {
-            numberers.emplace_back([this, &next_file]() {
+            numberers.emplace_back([this, &next_file, &order]() {
                 while (true) {
                     size_t idx = next_file.fetch_add(1);
                     if (idx >= all_files_.size()) break;
+                    canonicaliseInstanceOrder(all_files_[idx], order);
                     Stage1::numberTree(all_files_[idx]);
                 }
             });
