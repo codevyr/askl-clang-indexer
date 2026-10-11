@@ -907,6 +907,13 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (kind != CXCursor_TypedefDecl && typedef_type_names_.count(sname))
             skip_type = true;
 
+        // ONE RECORD, ONE NAME.  A record with no tag is named by clang after
+        // where it is written, using the path the `#include` resolved to, so
+        // the same declaration reached two ways got two names.  Done after the
+        // typedef check above, which compares against identifiers a generated
+        // name can never equal.
+        sname = canonicaliseEmbeddedPaths(sname, cursor);
+
         if (!skip_type) {
             auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
             int inst_type = clang_isCursorDefinition(cursor) ? INSTTYPE_DEFINITION : INSTTYPE_DECLARATION;
@@ -1027,6 +1034,12 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         ClangString ref_name(clang_getCursorSpelling(referenced));
         std::string sname = ref_name.to_string();
         if (sname.empty()) break;
+
+        // Canonicalised against `referenced`, the DECLARATION, not against the
+        // reference site: the name has to come out identical to the one the
+        // declaration registered, and it is the declaration's file the path
+        // names.
+        sname = canonicaliseEmbeddedPaths(sname, referenced);
 
         auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
         // Note: clang visits TypeRef children of anonymous types through both

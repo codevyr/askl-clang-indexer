@@ -110,14 +110,16 @@ void PrintTo(const ExpectedInstance& i, std::ostream* os) {
 
 void generateCompileCommands(const std::string& fixture_dir,
                              const std::string& output_dir,
-                             const std::vector<std::string>& sources) {
+                             const std::vector<std::string>& sources,
+                             const std::string& extra_flags = "") {
     std::ofstream out(output_dir + "/compile_commands.json");
     out << "[\n";
     for (size_t i = 0; i < sources.size(); i++) {
         if (i > 0) out << ",\n";
         out << "  {\n"
             << "    \"directory\": \"" << fixture_dir << "\",\n"
-            << "    \"command\": \"cc -c -I. " << sources[i] << " -o "
+            << "    \"command\": \"cc -c -I. "
+            << (extra_flags.empty() ? "" : extra_flags + " ") << sources[i] << " -o "
             << sources[i].substr(0, sources[i].rfind('.')) << ".o\",\n"
             << "    \"file\": \"" << fixture_dir << "/" << sources[i] << "\"\n"
             << "  }";
@@ -1637,6 +1639,46 @@ TEST(ObjectRoots, AMacroInvocationIsInsideItsEnclosingFunction) {
 // on one range and must resolve to one owner.  Un-renumbered, b.c's ref came
 // out at dfs 11265 against a.c's numbering -- outside the field entirely --
 // while a.c's sat correctly at 5121.
+// ONE RECORD REACHED TWO WAYS IS ONE SYMBOL.
+//
+// A record with no tag has no name of its own, so clang names it after where it
+// is written -- `struct (anonymous at inc/types.h:7:5)` -- using the PRESUMED
+// path, i.e. whatever the `#include` resolved to.  `inc/self -> .` here makes
+// one header reachable as `types.h` and as `self/types.h`, which is the shape
+// criu has as `compel/include/uapi/compel -> .`.
+//
+// File identity was never fooled by this: objects are keyed on
+// `getCanonicalPath`, so the header is one object either way.  Only the NAMES
+// bypassed it, and on criu that produced 23 redundant symbols across 18
+// records, one union appearing under four names.
+TEST(ObjectRoots, OneRecordReachedTwoWaysIsOneSymbol) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/symlinked_header";
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"a.c", "b.c"}, "-Iinc");
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+
+    std::vector<std::string> anon;
+    for (const auto& si : indexer.symbolTable().allSymbols())
+        if (si.name.find("anonymous at ") != std::string::npos ||
+            si.name.find("unnamed at ") != std::string::npos)
+            anon.push_back(si.name);
+
+    // The fixture is only testing what it claims if both TUs were indexed and
+    // the union is actually anonymous.
+    ASSERT_FALSE(anon.empty()) << "fixture must declare an anonymous record";
+    std::set<std::string> distinct(anon.begin(), anon.end());
+    EXPECT_EQ(distinct.size(), 1u)
+        << "one record, one symbol -- got " << distinct.size() << ": "
+        << [&] { std::string j; for (auto& n : distinct) j += "\n    " + n; return j; }();
+
+    // And the surviving name is canonical: the symlinked spelling must not be
+    // the one that won.
+    for (const auto& n : distinct)
+        EXPECT_EQ(n.find("/self/"), std::string::npos)
+            << "the name kept a symlinked spelling: " << n;
+}
+
 // THE NUMBERING IS A FUNCTION OF WHAT WAS FOUND, NOT OF THE ORDER IT ARRIVED.
 //
 // The union made the instance SET order-independent; it did not make the
