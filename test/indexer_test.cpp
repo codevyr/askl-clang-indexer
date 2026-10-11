@@ -540,12 +540,11 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "type_c", 332, 338},
                 {"types.h", "ALL_TYPES", 398, 407},
             },
-            // instances — macro symbols now have instances too
-            // ALL_TYPES appears twice: once for #define, once for expansion site
+            // instances — a macro has ONE instance, its `#define`.  Using it
+            // is a reference, so ALL_TYPES appears once, not once per use.
             {
                 {"main.c", "main.c"},
                 {"main.c", "use_any"},
-                {"types.h", "ALL_TYPES"},
                 {"types.h", "ALL_TYPES"},
                 {"types.h", "ONE_TYPE"},
                 {"types.h", "TYPES_H"},
@@ -599,8 +598,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "use_types"},
                 {"main.c", "x"},
                 // beta instance present — source-level struct, proper range
-                // ALL_STRUCTS appears twice: #define + expansion site
-                {"types.h", "ALL_STRUCTS"},
+                // ALL_STRUCTS once: the `#define`.  Its use is a reference.
                 {"types.h", "ALL_STRUCTS"},
                 {"types.h", "ONE_STRUCT"},
                 {"types.h", "TYPES_H"},
@@ -741,9 +739,8 @@ INSTANTIATE_TEST_SUITE_P(
                 {"macros.h", "MAX_SIZE"},
                 {"macros.h", "MIN"},
                 {"macros.h", "macros.h"},
-                // MAX_SIZE and MIN also get instances at expansion sites
-                {"main.c", "MAX_SIZE"},
-                {"main.c", "MIN"},
+                // No MAX_SIZE / MIN here: main.c USES them, and a use is a
+                // reference.  Both are still reachable from main.c through it.
                 {"main.c", "buf"},
                 {"main.c", "main.c"},
                 {"main.c", "smallest"},
@@ -786,8 +783,8 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "__init"},
                 {"main.c", "main.c"},
                 {"main.c", "my_drv"},
-                // register_driver: #define instance + expansion site instance
-                {"main.c", "register_driver"},
+                // register_driver's only instance is its `#define`, below in
+                // register.h; the invocation here is a reference.
                 {"register.h", "REGISTER_H"},
                 {"register.h", "driver_info"},
                 {"register.h", "driver_info.id"},
@@ -941,7 +938,6 @@ INSTANTIATE_TEST_SUITE_P(
                 // interval now, so the clamp only discarded the span that
                 // records what the author wrote.  What keeps `bar`'s text the
                 // caller's is that a folded instance owns no text.
-                {"main.c", "some_macro", 3, 56, 71},
             }
         },
         // Validates fallback logic for anonymous/typedef enums vs named enums.
@@ -1553,7 +1549,16 @@ TEST(ObjectRoots, EveryObjectInARealProjectIsNumbered) {
 // only `mod { macro { func } }` did, because that route goes mod -> file ->
 // macro.  Deriving parentage from ranges fixes it; this pins that it stays
 // fixed, since the cause (a pre-pass with no stack) is still there.
-TEST(ObjectRoots, AMacroExpansionIsInsideItsEnclosingFunction) {
+// `func { macro }` and `mod("amdgpu") { macro }` must keep working now that a
+// macro use is a REFERENCE rather than an instance -- which means the
+// invocation reference has to land inside the enclosing function, at one level
+// down, exactly where the expansion instance used to be numbered.
+//
+// This is the same mechanism as `func("main") { "printk" }`: printk has no
+// instance in main either.  Containment reaches a symbol through a reference
+// sitting inside the scope, so the deleted instance was never what made the
+// query work.
+TEST(ObjectRoots, AMacroInvocationIsInsideItsEnclosingFunction) {
     std::string fixture_dir = std::string(FIXTURE_DIR) + "/macro_nested";
     TempDir temp_dir = makeTempDir();
     generateCompileCommands(fixture_dir, temp_dir.path, {"main.c"});
@@ -1564,37 +1569,52 @@ TEST(ObjectRoots, AMacroExpansionIsInsideItsEnclosingFunction) {
     askl::index::Project project;
     ASSERT_TRUE(project.ParseFromString(built.project_data));
 
+    // Every MACRO symbol, by local id, so a reference can be identified as an
+    // invocation rather than by guessing from its range.
+    std::set<int64_t> macro_ids;
+    for (const auto& sym : project.symbols())
+        if (sym.type() == askl::index::SymbolType::MACRO)
+            macro_ids.insert(sym.local_id());
+    ASSERT_FALSE(macro_ids.empty()) << "fixture must define a macro";
+
     bool checked = false;
     for (const auto& obj : project.objects()) {
         if (obj.module_path().find("main.c") == std::string::npos) continue;
-        const askl::index::SymbolInstance* func = nullptr;
-        const askl::index::SymbolInstance* expansion = nullptr;
-        for (const auto& i : obj.symbol_instances()) {
-            if (i.instance_type() == askl::index::InstanceType::EXPANSION)
-                expansion = &i;
-            else if (i.instance_type() == askl::index::InstanceType::DEFINITION)
-                func = &i;
-        }
-        ASSERT_NE(func, nullptr) << "fixture must define a function";
-        ASSERT_NE(expansion, nullptr) << "fixture must expand a macro inside it";
-        ASSERT_LT(func->start_offset(), expansion->start_offset())
-            << "and the expansion must sit textually inside it";
 
-        EXPECT_TRUE(func->dfs_enter() < expansion->dfs_enter() &&
-                    expansion->dfs_enter() < func->dfs_exit())
-            << "the expansion at [" << expansion->dfs_enter() << ","
-            << expansion->dfs_exit() << ") must be inside the function at ["
-            << func->dfs_enter() << "," << func->dfs_exit() << ")";
-        EXPECT_EQ(expansion->nesting_level(), func->nesting_level() + 1)
-            << "one level down, not a sibling";
-        // And it is still a fold boundary at the function's fold depth, which
-        // is what keeps the function itself in `mod { func }` while what the
-        // macro GENERATES stays one level out of reach.
-        EXPECT_TRUE(expansion->folded());
-        EXPECT_EQ(expansion->fold_depth(), func->fold_depth());
-        checked = true;
+        // No expansion instance survives anywhere.
+        for (const auto& i : obj.symbol_instances())
+            EXPECT_NE(i.instance_type(), askl::index::InstanceType::EXPANSION)
+                << "a macro use is a reference, not an instance";
+
+        const askl::index::SymbolInstance* func = nullptr;
+        for (const auto& i : obj.symbol_instances())
+            if (i.instance_type() == askl::index::InstanceType::DEFINITION)
+                func = &i;
+        ASSERT_NE(func, nullptr) << "fixture must define a function";
+
+        for (const auto& ref : obj.refs()) {
+            if (!macro_ids.count(ref.to_symbol_local_id())) continue;
+            ASSERT_LT(func->start_offset(), ref.from_offset_start())
+                << "the invocation must sit textually inside the function";
+            EXPECT_TRUE(func->dfs_enter() < ref.dfs_enter() &&
+                        ref.dfs_enter() < func->dfs_exit())
+                << "the invocation at " << ref.dfs_enter()
+                << " must be inside the function at [" << func->dfs_enter()
+                << "," << func->dfs_exit() << ")";
+            EXPECT_EQ(ref.nesting_level(), func->nesting_level() + 1)
+                << "one level down, not a sibling";
+            // At the FUNCTION's fold depth, not one past it: the caller wrote
+            // this invocation, so it is not behind a fold.  What the macro
+            // GENERATES is what stays one level out of reach.
+            EXPECT_EQ(ref.fold_depth(), func->fold_depth());
+            // The full span is the whole invocation `some_macro(bar)`, while
+            // the reference's own range is just the name.
+            EXPECT_GT(ref.full().end(), ref.from_offset_end())
+                << "the full span must cover the argument list";
+            checked = true;
+        }
     }
-    ASSERT_TRUE(checked) << "main.c was not in the built project";
+    ASSERT_TRUE(checked) << "no macro invocation reference in main.c";
 }
 
 // A ref merged from a LATER translation unit is renumbered against the
@@ -1926,7 +1946,7 @@ static std::set<std::pair<std::string, std::string>> edgesOf(const char* fixture
 // expansion-site refs; the dedup kept the FIRST.  So the surviving instance was
 // never the one the refs had been numbered against, and every such ref pointed
 // into the stride the dropped instance used to occupy.
-TEST(ObjectRoots, ReincludedHeaderKeepsBothExpansions) {
+TEST(ObjectRoots, ReincludedHeaderKeepsBothResults) {
     std::string fixture_dir = std::string(FIXTURE_DIR) + "/reincluded_header";
     TempDir temp_dir = makeTempDir();
     generateCompileCommands(fixture_dir, temp_dir.path, {"a.c"});
@@ -1945,41 +1965,41 @@ TEST(ObjectRoots, ReincludedHeaderKeepsBothExpansions) {
         if (obj.module_path().find("multi.h") == std::string::npos) continue;
         checked = true;
 
-        std::vector<const askl::index::SymbolInstance*> decls;
-        std::set<std::string> generated;
+        // One `DECL(alpha)` line, included twice, declares two different
+        // functions AT ONE EXTENT.  Nothing about their ranges tells them
+        // apart; the DFS position does, which is why instance identity is the
+        // position and not `(symbol, extent)`.
+        std::map<std::string, const askl::index::SymbolInstance*> generated;
         for (const auto& i : obj.symbol_instances()) {
-            if (i.instance_type() == askl::index::InstanceType::EXPANSION &&
-                name[i.symbol_local_id()] == "DECL")
-                decls.push_back(&i);
+            EXPECT_NE(i.instance_type(), askl::index::InstanceType::EXPANSION)
+                << "a macro use is a reference, not an instance";
             if (i.instance_type() == askl::index::InstanceType::DEFINITION)
-                generated.insert(name[i.symbol_local_id()]);
+                generated[name[i.symbol_local_id()]] = &i;
         }
 
-        ASSERT_EQ(decls.size(), 2u)
-            << "one source line expanded twice must give two expansions";
-        EXPECT_EQ(decls[0]->start_offset(), decls[1]->start_offset())
-            << "and they must share an extent -- otherwise the fixture is not "
+        ASSERT_EQ(generated.count("alpha_f"), 1u) << "first inclusion lost";
+        ASSERT_EQ(generated.count("alpha_d"), 1u) << "second inclusion lost";
+        const auto* f = generated["alpha_f"];
+        const auto* d = generated["alpha_d"];
+        EXPECT_EQ(f->start_offset(), d->start_offset())
+            << "they must share an extent -- otherwise the fixture is not "
                "testing what it claims";
-        EXPECT_NE(decls[0]->dfs_enter(), decls[1]->dfs_enter())
+        EXPECT_EQ(f->end_offset(), d->end_offset());
+        EXPECT_NE(f->dfs_enter(), d->dfs_enter())
             << "the DFS position is what tells them apart, so it must differ";
 
-        EXPECT_EQ(generated.count("alpha_f"), 1u);
-        EXPECT_EQ(generated.count("alpha_d"), 1u);
-
-        // Each surviving expansion contributes an invocation edge -- a
-        // reference TO `DECL`, owned by whatever wrote the invocation.  Two
-        // expansions at one extent means two identical ranges, which
-        // ProtoBuilder's ref dedup (correctly) collapses to one: a reference
-        // is identified by the text it occupies, and there is one such text.
+        // Two expansions of one invocation TEXT give one invocation edge: a
+        // reference is identified by the text it occupies, and there is one
+        // such text.  (It used to be two instances here, which is the pair
+        // this fixture was built to keep; the generated symbols above carry
+        // that claim now.)
         int decl_refs = 0;
         for (const auto& ref : obj.refs())
             if (name[ref.to_symbol_local_id()] == "DECL") decl_refs++;
-        EXPECT_EQ(decl_refs, 1)
-            << "one invocation text, one invocation edge";
+        EXPECT_EQ(decl_refs, 1) << "one invocation text, one invocation edge";
 
         // Every ref inside some interval is checked for every fixture by
-        // `EveryInstanceFormsAValidTree`, which `reincluded_header` is in --
-        // that is the assertion the dropped expansion used to break.
+        // `EveryInstanceFormsAValidTree`, which `reincluded_header` is in.
     }
     ASSERT_TRUE(checked) << "multi.h was not in the built project";
 }

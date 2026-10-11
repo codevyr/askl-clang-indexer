@@ -121,10 +121,12 @@ message SymbolInstance {
 message SymbolRef {
   int64 to_symbol_local_id = 1; // References Symbol.local_id (unique within project)
 
-  // The NAME span: the referencing token itself.  For `printk(foo)` the
-  // argument ref spans `foo` and the expansion-site ref spans `printk`, which
-  // is what keeps the two occurrences of `foo` apart -- the argument belongs
-  // to the enclosing scope, each expanded use to the expansion.
+  // The NAME span: the referencing token itself, where it is SPELLED.  For
+  // `printk(foo)` the argument ref spans `foo` and the invocation ref spans
+  // `printk`.  Spelling is what attributes each token to whoever typed it: a
+  // token substituted from a macro ARGUMENT is spelled at the call site and so
+  // belongs to the caller, while one written in the `#define` body is spelled
+  // in the header and belongs to the macro.
   int32 from_offset_start = 2;
   int32 from_offset_end = 3;
 
@@ -143,11 +145,15 @@ message SymbolRef {
   // [dfs_enter, dfs_exit] contains this number at depth - 1.
   int64 dfs_enter = 8;
 
-  // Fold state of the owning scope.  This is what separates the two
-  // occurrences of `foo` in `printk(foo)`: the argument token stays at the
-  // caller's fold depth, while each expanded use sits one deeper and is
+  // Fold state of the owning scope -- the instance whose interval contains
+  // this ref.  A reference at a call site is the caller's, at the caller's
+  // fold depth; one inside macro-GENERATED code sits a level deeper and is
   // therefore hidden from `mod { func }` but reachable via
   // `mod { macro { func } }`.
+  //
+  // References across macro layers do not need a fold level at all: they are
+  // layerwise, one edge per `#define`, so `handler -> DEV_PRINT -> printk` is
+  // a chain of ordinary edges.
   bool folded = 9;
   int32 fold_depth = 10;
 }
@@ -174,6 +180,9 @@ enum InstanceType {
   INSTANCE_TYPE_UNSPECIFIED = 0;
   DEFINITION = 1;
   DECLARATION = 2;
+  // No producer emits EXPANSION any more: a macro USE is a SymbolRef naming
+  // the macro, so a macro's only instance is its `#define`.  Kept so that an
+  // index produced before that change still parses.
   EXPANSION = 3;
   SENTINEL = 4;
   CONTAINMENT = 5;

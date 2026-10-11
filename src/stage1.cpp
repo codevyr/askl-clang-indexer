@@ -84,37 +84,47 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         // Look up the MACRO symbol (should have been created by MacroDefinition)
         auto [sym_id, _] = self->symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_MACRO);
 
-        // Create an instance at the expansion site spanning the WHOLE
-        // invocation -- `some_macro(bar)`, not just `some_macro`.
+        // USING a macro is a REFERENCE, not an instance.
         //
-        // This used to be clamped to the name, so that macro arguments like
-        // `bar` fell OUTSIDE the macro's range and became children of the
-        // enclosing scope.  That reasoning was range-based parentage, and
-        // parentage no longer comes from ranges: refs are placed by scope (see
-        // `insertRef`) and instances by the DFS interval.  So the clamp only
-        // threw away the one span that records what the author actually wrote.
+        // A macro is declared once -- at its `#define` -- and that line is its
+        // only instance.  Every use is one site naming it, which is what a
+        // reference is, and recording a use as an instance says a second time
+        // what the reference already says.  It used to be the only record, so
+        // the duplication was invisible; the invocation reference below was
+        // derived from this instance in `numberTree`, both lived at the same
+        // position, and the engine's own renderer dropped the instances again
+        // on the way out ("a widely-used macro has hundreds of them").
         //
-        // What keeps the argument text the CALLER's is a rule where ownership
-        // is decided, not a narrowed span: a folded instance owns no text.  A
-        // macro expansion owns the symbols it generates, through the interval,
-        // and no bytes at all -- every byte at the call site was typed by the
-        // caller.  The name span below is what identifies the macro itself.
+        // What the deletion costs: nothing on either axis the instance looked
+        // like it carried.
+        //
+        //   - CONTAINMENT.  `func { macro }` and `mod("amdgpu") { macro }`
+        //     keep working, through the reference, exactly as
+        //     `func("main") { "printk" }` does -- printk has no instance in
+        //     main either.  `ownerOfText` puts the reference in the enclosing
+        //     function, which is where the expansion instance was nested by
+        //     range, at the same `nesting_level` and the same `fold_depth`.
+        //   - FOLDING.  A macro-generated symbol is folded on its own merit
+        //     (`isMacroGenerated`), never by inheritance, and an expansion was
+        //     already barred from being a parent -- measured on ucx, across
+        //     41,487 expansions not one DEFINITION was a child.  So no
+        //     `fold_depth` anywhere is computed through an expansion.
+        //
+        // What it buys: 41,490 of ucx's ~97,664 instances were expansions, 42%
+        // of the index, and 3,204 of the 3,483 instances at `fold_depth > 0`.
+        //
+        // The reference's own range is the macro's NAME; its `full` range is
+        // the whole invocation `some_macro(bar)`, the span a reader wants.  The
+        // argument `bar` stays the caller's because `ownerOfText` ignores
+        // folded instances -- and now because there is no instance here at all.
         CXFile range_file;
         unsigned start_off, end_off;
         if (getSpellingRange(cursor, range_file, start_off, end_off)) {
-            const unsigned name_end = start_off + sname.size();
             size_t fi = self->getOrCreateFile(range_file);
-            // Opens a scope so the expansion-site refs addRef emits land inside
-            // its interval; closed immediately below, since a MacroExpansion
-            // cursor has no AST children of its own.
-            InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off),
-                           INSTTYPE_EXPANSION};
-            d.folded = true; // an expansion is the fold boundary itself
-            d.name_start = static_cast<int32_t>(start_off);
-            d.name_end = static_cast<int32_t>(name_end);
-            d.name_end = static_cast<int32_t>(name_end);
-            self->addInstance(fi, d, true);
-            self->closeScopesTo(self->dfs_stack_.size() - 1);
+            self->insertRef(fi, sym_id, sname, static_cast<int32_t>(start_off),
+                            static_cast<int32_t>(start_off + sname.size()),
+                            static_cast<int32_t>(start_off),
+                            static_cast<int32_t>(end_off));
         }
     }
 
@@ -377,27 +387,19 @@ void Stage1::numberTree(FileData& f) {
         for (size_t j = 0; j < n; ++j) {
             if (j == i) continue;
             const InstanceData& c = f.instances[j];
-            // AN EXPANSION IS NEVER A PARENT BY RANGE, because a macro
-            // expansion owns no text: every byte at the call site of `foo(a)`
-            // was typed by the caller.  Without this, a macro passed as an
-            // ARGUMENT nests under the outer invocation it was written inside
-            // -- `ucs_unlikely(kh_end(x))` made `kh_end`'s expansion a child
-            // of `ucs_unlikely`'s, so `macro("ucs_unlikely") { }` reported 31
-            // unrelated macros as its contents.  They are the caller's, and
-            // they become siblings of the outer expansion under it.
+            // A FOLDED INSTANCE IS STILL A PARENT, and must be: a
+            // macro-GENERATED symbol is a folded DEFINITION that does own its
+            // text, and `__compiletime_assert_1121` sits inside the generated
+            // `event_show` at fold_depth 1.  That is what keeps the assert out
+            // of `mod { func }` while `event_show` itself stays in.
             //
-            // Measured on ucx: across 41,487 expansions every single child
-            // was another folded expansion -- 2,594 of them, and not one
-            // DEFINITION -- so this relation carried arguments and nothing
-            // else.
-            //
-            // NOT "a folded instance is never a parent", which would be the
-            // tidier sentence and would break the fold axis where it earns its
-            // keep: a macro-GENERATED symbol is a folded DEFINITION that does
-            // own its text, and `__compiletime_assert_1121` sits inside the
-            // generated `event_show` at fold_depth 1.  That is what keeps it
-            // out of `mod { func }` while `event_show` itself stays in.
-            if (c.instance_type == INSTTYPE_EXPANSION) continue;
+            // There used to be an exception here -- an EXPANSION was barred
+            // from being a parent by range, because a macro passed as an
+            // ARGUMENT nests inside the text of the outer invocation and
+            // `ucs_unlikely(kh_end(x))` reported 31 unrelated macros as
+            // `ucs_unlikely`'s contents.  A macro use is a reference now
+            // (`macroVisitor`), so there is no expansion instance to exclude
+            // and no range to nest it by.
             if (c.start_offset > x.start_offset || c.end_offset < x.end_offset) continue;
             if (c.start_offset == x.start_offset && c.end_offset == x.end_offset)
                 continue; // equal, not strict -- only (b) may use it
@@ -408,43 +410,6 @@ void Stage1::numberTree(FileData& f) {
             }
         }
         parent[i] = best;
-    }
-
-    // --- THE INVOCATION EDGE -------------------------------------------
-    // `handler() { DEV_PRINT(x); }` must produce a reference `handler ->
-    // DEV_PRINT`, and before this nothing referenced a macro at all: the
-    // preprocessor pass creates an INSTANCE for an expansion and never a
-    // REFERENCE.  Measured on ucx, none of 231,091 references targeted any of
-    // 14,946 macro symbols, so the first hop of `handler -> DEV_PRINT ->
-    // printk` simply did not exist and containment (`unnest`, and with it the
-    // whole fold axis on references) was the only way across.
-    //
-    // Emitted HERE, not in `macroVisitor`, because that pass runs before the
-    // AST walk with an empty scope stack (`collectMacros`), so there is no
-    // open scope to attribute it to at the time the expansion is seen.
-    //
-    // The owner is left UNSET so the reference is placed by `ownerOfText`
-    // below, like every other one.  It must NOT come from `parent[]`: tree
-    // parentage of an expansion is range-derived, and a macro passed as an
-    // ARGUMENT expands inside the text of the outer invocation, so
-    // `DEV_PRINT(LEVEL)` makes LEVEL's expansion a tree child of DEV_PRINT's
-    // and produced an edge `DEV_PRINT -> LEVEL`.  That is the argument edge
-    // this whole model exists to remove -- `LEVEL` is text the CALLER wrote.
-    // Excluding folded instances, which is what `ownerOfText` does, gives
-    // `handler -> LEVEL` instead.
-    //
-    // The chain between two macros does not come from here at all: libclang
-    // never reports an expansion written inside a `#define` body, so
-    // `FATAL -> ERR` is emitted by `linkMacroBodies` from the body text, and
-    // lands inside FATAL's own unfolded DEFINITION instance.
-    for (size_t i = 0; i < n; ++i) {
-        const InstanceData& x = f.instances[i];
-        if (x.instance_type != INSTTYPE_EXPANSION) continue;
-        if (x.name_start < 0) continue;
-        RefData r{x.symbol_local_id, x.name_start, x.name_end};
-        r.full_start = x.start_offset;
-        r.full_end = x.end_offset;
-        f.refs.push_back(r);
     }
 
     // --- NUMBERING -----------------------------------------------------
