@@ -137,6 +137,15 @@ public:
     void process(CXTranslationUnit tu, const std::string& tu_filename);
     Stage1Result takeResults();
 
+    /// Derive one file's containment tree from the ranges the walk collected,
+    /// and number it.  See the definition for the parentage rule.
+    ///
+    /// Public, and called from OUTSIDE Stage1 -- by `Indexer::run`, once every
+    /// translation unit has contributed to the file. It is a function of the
+    /// file alone, which is the point: a containment tree is a property of the
+    /// text, and no single TU holds more than one view of it.
+    static void numberTree(FileData& f);
+
 private:
     SymbolTable& symbols_;
     std::atomic<int64_t>& next_object_id_;
@@ -196,10 +205,6 @@ private:
     /// files are skipped: one TU walk descends into headers, and each file has
     /// its own tree.
     int32_t stackParent(size_t fi) const;
-
-    /// Derive the containment tree from the ranges the walk collected, then
-    /// number it.  See the definition for the parentage rule.
-    static void numberTree(FileData& f);
 
     /// True when the cursor exists only because of a macro expansion -- its
     /// spelling location (where the text is) differs from its expansion

@@ -586,9 +586,10 @@ void Stage1::insertRef(size_t file_idx, int64_t sym_id, const std::string& sym_n
     //
     // Checked here rather than in `addRef` so it also covers the references
     // `linkMacroBodies` inserts directly.  Stage2's synthetic references do not
-    // pass through `insertRef` at all -- they are placed by `placeRefByText`
-    // after being merged in `indexer.cpp` -- so the ones it deliberately parks
-    // at a field's declaration site stay exempt by construction.
+    // pass through `insertRef` at all -- they are merged in `indexer.cpp` and
+    // numbered with everything else after the merge -- so the ones it
+    // deliberately parks at a field's declaration site stay exempt by
+    // construction.
     if (!refTextNamesSymbol(file_idx, sym_name, start, end, /*warn=*/true)) return;
 
     RefData r{sym_id, start, end};
@@ -1016,11 +1017,11 @@ void Stage1::process(CXTranslationUnit tu, const std::string& tu_filename) {
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, visitor, this);
     closeScopesTo(0);
-    // Every instance and ref now carries its structure; derive the tree and
-    // number it.  Per TU, which is where it has to stay: the Indexer merges a
-    // second TU's REFS into a file whose instances came from the first, so a
-    // ref's numbers must be computed against the instances it shipped with.
-    for (auto& f : result_.files) numberTree(f);
+    // Structure only.  NUMBERING HAPPENS AFTER THE MERGE, in `Indexer::run`,
+    // because a file's instances are a property of its TEXT and this TU holds
+    // only one view of it: numbering here meant a second TU's refs had to be
+    // renumbered against instances they never shipped with, which is what
+    // `placeRefByText` existed to do.  One file, one numbering, once.
 }
 
 Stage1Result Stage1::takeResults() {

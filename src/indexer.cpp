@@ -7,41 +7,6 @@
 #include "stage2.h"
 #include "symbol_types.h"
 
-namespace {
-/// Assign a ref its DFS position from the instance that contains it, for refs
-/// produced outside the numbering walk.  Narrowest containing extent wins;
-/// ties go to the greatest depth, then the latest dfs_enter.
-/// Place a reference from the text it sits in, by the same rule
-/// `Stage1::numberTree` uses -- `ownerOfText`, the narrowest UNFOLDED instance
-/// containing it.  Two callers need it after numbering has already run:
-///
-///   * Stage2 runs as its own pass and has no DFS stack, so its synthetic refs
-///     arrive unnumbered;
-///   * a ref merged from a LATER translation unit carries numbers computed
-///     against that TU's instances for the file, and those were discarded --
-///     `processTU` keeps the first TU's instances and merges only refs.  Its
-///     numbers must be recomputed against the instances it will actually live
-///     with, or they describe a numbering that no longer exists.
-///
-/// This used to carry its own first step -- match an EXPANSION whose name span
-/// equals the ref's range, and own the ref to that expansion -- to recover the
-/// one distinction text alone could not make: a macro argument token versus the
-/// macro's own expansion-site use of it, both lying inside the caller.  There
-/// are no expansion-site refs any more, so there is nothing to disambiguate
-/// and nothing to special-case: one rule, one implementation, shared with the
-/// numbering pass so the two cannot drift.
-void placeRefByText(const FileData& file, RefData& ref) {
-    int32_t idx = ownerOfText(file, ref.from_offset_start, ref.from_offset_end);
-    if (idx < 0) return; // leave at the object root
-    const InstanceData& owner = file.instances[static_cast<size_t>(idx)];
-    ref.owner_idx = idx;
-    ref.nesting_level = owner.nesting_level + 1;
-    ref.dfs_enter = owner.dfs_enter + 1;
-    // `owner` is unfolded by the rule above, so its fold depth carries straight
-    // over -- a ref is a child of its owner on every axis.
-    ref.fold_depth = owner.fold_depth;
-}
-} // namespace
 
 #include <algorithm>
 #include <tuple>
@@ -176,10 +141,8 @@ void Indexer::processTU(const CompileCommand& cmd) {
                        r.from_offset_end == ref.data.from_offset_end;
             });
             if (!dup) {
-                // Stage2 runs as its own pass and has no DFS scope stack, so
-                // its refs arrive unnumbered; `placeRefByText` places each
-                // one by the text it sits in.
-                placeRefByText(results.files[it->second], ref.data);
+                // Left unnumbered, like every other ref: the post-merge
+                // numbering pass places all of them by the text they sit in.
                 ref.data.synthetic = true;
                 file_refs.push_back(ref.data);
             }
@@ -207,13 +170,12 @@ void Indexer::processTU(const CompileCommand& cmd) {
                     seen.insert({ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end});
                 for (auto& ref : file.refs) {
                     if (seen.insert({ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end}).second) {
-                        // This ref's numbers were computed against THIS TU's
-                        // instances for the file, and those are about to be
-                        // dropped -- `existing` keeps the first TU's.  Recompute
-                        // against the instances it will live with, so the
-                        // numbering is an invariant rather than a coincidence of
-                        // two TUs happening to walk the header identically.
-                        placeRefByText(existing, ref);
+                        // No renumbering: nothing is numbered yet.  A ref used
+                        // to arrive carrying numbers computed against this TU's
+                        // instances for the file, which were then discarded,
+                        // so it had to be recomputed against the set it would
+                        // actually live with.  Numbering the merged file once
+                        // removes the problem instead of correcting it.
                         existing.refs.push_back(ref);
                     }
                 }
@@ -389,6 +351,36 @@ void Indexer::run() {
     }
     for (auto& w : workers) w.join();
     if (show_progress_) fprintf(stderr, "\n");
+
+    // NUMBER EACH FILE ONCE, now that every TU has contributed to it.
+    //
+    // This used to run per TU, inside `Stage1::process`, and that is what made
+    // a merged ref's numbers describe a numbering that no longer existed --
+    // `placeRefByText` was the correction. A file's containment tree is a
+    // property of its TEXT, so it can only be derived once the text's
+    // contributors are all in.
+    //
+    // Files are independent -- containment never crosses an object -- so this
+    // parallelises with no locking, and it is strictly less work than before:
+    // a header included by K translation units was numbered K times.
+    //
+    // BEFORE `addGitTrackedFiles` on purpose. Those files get one instance and
+    // no walk, so they keep `dfs_exit == 0`, which is exactly how
+    // `ProtoBuilder::ensureObjectRoot` recognises "never numbered".
+    {
+        std::atomic<size_t> next_file{0};
+        std::vector<std::thread> numberers;
+        for (int t = 0; t < threads_; t++) {
+            numberers.emplace_back([this, &next_file]() {
+                while (true) {
+                    size_t idx = next_file.fetch_add(1);
+                    if (idx >= all_files_.size()) break;
+                    Stage1::numberTree(all_files_[idx]);
+                }
+            });
+        }
+        for (auto& w : numberers) w.join();
+    }
 
     if (!git_root_.empty()) {
         addGitTrackedFiles();
