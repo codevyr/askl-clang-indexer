@@ -162,8 +162,78 @@ void Indexer::processTU(const CompileCommand& cmd) {
         for (auto& file : results.files) {
             auto it = file_index_.find(file.filesystem_path);
             if (it != file_index_.end()) {
-                // Merge refs into existing FileData, deduplicating against what's already there
                 auto& existing = all_files_[it->second];
+
+                // UNION THE INSTANCES, do not truncate them.
+                //
+                // A file's declarations are a property of its TEXT, not of any
+                // translation unit, so the union over every TU that compiled it
+                // is bounded by the text -- identical declarations from two TUs
+                // are one declaration, which `InstKey` is what decides. Keeping
+                // only the first TU's set discarded the rest by arrival order,
+                // and because the SYMBOL table unions across TUs while this
+                // truncated, the two halves of one index disagreed: a symbol
+                // could be nameable and never locatable. Measured on criu, 129
+                // such orphans with no macro explanation (issue #7).
+                //
+                // Two passes, because a child can arrive before its parent.
+                // Pass one maps every incoming index to a merged one, inserting
+                // what is missing; pass two rewrites `stack_parent` through
+                // that map for the rows just inserted -- it is an index into
+                // the INCOMING vector and would otherwise point at a stranger.
+                std::unordered_map<InstKey, size_t, InstKeyHash> have;
+                have.reserve(existing.instances.size());
+                for (size_t i = 0; i < existing.instances.size(); ++i) {
+                    const InstanceData& e = existing.instances[i];
+                    have.emplace(InstKey{e.symbol_local_id, e.instance_type,
+                                         e.start_offset, e.end_offset}, i);
+                }
+
+                std::vector<size_t> remap(file.instances.size(), 0);
+                std::vector<size_t> inserted;
+                for (size_t i = 0; i < file.instances.size(); ++i) {
+                    const InstanceData& in = file.instances[i];
+                    InstKey k{in.symbol_local_id, in.instance_type,
+                              in.start_offset, in.end_offset};
+                    auto [slot, fresh] = have.try_emplace(k, existing.instances.size());
+                    if (fresh) {
+                        existing.instances.push_back(in);
+                        inserted.push_back(i);
+                    } else {
+                        // Same declaration, seen twice. First writer wins for
+                        // every field -- except a span this TU knows and the
+                        // other did not: -1 means "the indexer does not know
+                        // one", and learning it is strictly better than
+                        // keeping the absence.
+                        InstanceData& e = existing.instances[slot->second];
+                        if (e.name_start < 0 && in.name_start >= 0) {
+                            e.name_start = in.name_start;
+                            e.name_end = in.name_end;
+                        }
+                        if (e.sig_start < 0 && in.sig_start >= 0) {
+                            e.sig_start = in.sig_start;
+                            e.sig_end = in.sig_end;
+                        }
+                        if (e.content_start < 0 && in.content_start >= 0) {
+                            e.content_start = in.content_start;
+                            e.content_end = in.content_end;
+                        }
+                    }
+                    remap[i] = slot->second;
+                }
+                for (size_t i : inserted) {
+                    int32_t sp = file.instances[i].stack_parent;
+                    existing.instances[remap[i]].stack_parent =
+                        (sp >= 0 && static_cast<size_t>(sp) < remap.size())
+                            ? static_cast<int32_t>(remap[static_cast<size_t>(sp)])
+                            : -1;
+                }
+                if (!inserted.empty()) {
+                    files_with_late_instances_.insert(it->second);
+                    late_instance_count_ += inserted.size();
+                }
+
+                // Merge refs, deduplicating against what's already there
                 std::unordered_set<EntryKey, EntryKeyHash> seen;
                 seen.reserve(existing.refs.size());
                 for (auto& ref : existing.refs)
@@ -392,6 +462,17 @@ void Indexer::run() {
 
     fprintf(stderr, "Files: %zu\n", all_files_.size());
     fprintf(stderr, "Symbols: %zu\n", symbol_table_.allSymbols().size());
+
+    // What the cross-TU union contributed. Always on, because the interesting
+    // number is a SURPRISING one: a file two TUs saw differently is usually an
+    // `#ifdef` only some of them satisfied, and both arms now co-exist in the
+    // index with nothing saying which build each belongs to. That is the
+    // accepted cost of describing the text rather than one configuration, and
+    // it is worth being able to see how much of it there is.
+    if (late_instance_count_ > 0)
+        fprintf(stderr, "Cross-TU: %zu files seen differently by 2+ TUs, "
+                        "%zu instances contributed by a later TU\n",
+                files_with_late_instances_.size(), late_instance_count_);
 }
 
 static void write_file(const std::string& path, const std::string& data) {

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class Indexer {
@@ -40,6 +41,13 @@ private:
     std::mutex files_mutex_;
     std::vector<FileData> all_files_;
     std::unordered_map<std::string, size_t> file_index_; // guarded by files_mutex_
+
+    /// How much the cross-TU union actually contributed, for the summary line.
+    /// A file counted here was seen DIFFERENTLY by two or more translation
+    /// units -- usually an `#ifdef` that only some of them satisfied. Both are
+    /// guarded by files_mutex_.
+    std::unordered_set<size_t> files_with_late_instances_;
+    size_t late_instance_count_ = 0;
 
     void processTU(const CompileCommand& cmd);
     void addGitTrackedFiles();

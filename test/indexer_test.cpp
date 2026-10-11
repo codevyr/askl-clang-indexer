@@ -1637,6 +1637,61 @@ TEST(ObjectRoots, AMacroInvocationIsInsideItsEnclosingFunction) {
 // on one range and must resolve to one owner.  Un-renumbered, b.c's ref came
 // out at dfs 11265 against a.c's numbering -- outside the field entirely --
 // while a.c's sat correctly at 5121.
+// A SHARED HEADER'S INSTANCES ARE THE UNION OF EVERY TU'S VIEW, NOT THE FIRST
+// TU'S -- codevyr/askl-clang-indexer#7.
+//
+// `ops.h` declares `struct extra_decl` under `#ifdef WANT_EXTRA`, which only
+// `b.c` defines. The merge used to keep the first TU's instances and discard
+// the rest, so in TU order (a.c, b.c) the declaration had NO instance in any
+// object while the project-global symbol table named it anyway: an orphan
+// symbol the engine can name and never locate. In order (b.c, a.c) it had one.
+// The answer depended on `compile_commands.json` order, and alphabetical --
+// what a real build system emits -- was the losing one.
+//
+// Both orders are run here because one order passes for the wrong reason.
+TEST(ObjectRoots, ASharedHeaderUnionsEveryTusView) {
+    for (std::vector<std::string> order :
+         {std::vector<std::string>{"a.c", "b.c"}, std::vector<std::string>{"b.c", "a.c"}}) {
+        SCOPED_TRACE("TU order: " + order[0] + ", " + order[1]);
+        std::string fixture_dir = std::string(FIXTURE_DIR) + "/cross_tu_field_refs";
+        TempDir temp_dir = makeTempDir();
+        generateCompileCommands(fixture_dir, temp_dir.path, order);
+        Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+        indexer.run();
+
+        std::unordered_map<int64_t, std::string> name;
+        for (const auto& sym : indexer.symbolTable().allSymbols())
+            name[sym.local_id] = sym.name;
+
+        // Every symbol that has an instance ANYWHERE, so this is the invariant
+        // issue #7 asked for rather than a claim about one file.
+        std::set<std::string> located;
+        for (const auto& f : indexer.allFiles())
+            for (const auto& i : f.instances)
+                located.insert(name[i.symbol_local_id]);
+
+        EXPECT_EQ(located.count("extra_decl"), 1u)
+            << "the #ifdef'd declaration only b.c sees must still be locatable";
+        EXPECT_EQ(located.count("extra_decl.pad"), 1u)
+            << "and so must its field";
+        // The control: what both TUs see was never in doubt, and must not have
+        // been disturbed by unioning.
+        EXPECT_EQ(located.count("ops"), 1u);
+        EXPECT_EQ(located.count("worker_a"), 1u);
+        EXPECT_EQ(located.count("worker_b"), 1u);
+
+        // The union must not duplicate what both TUs saw: `struct ops` is one
+        // declaration in the text however many TUs compiled the header.
+        for (const auto& f : indexer.allFiles()) {
+            if (f.module_path.find("ops.h") == std::string::npos) continue;
+            std::map<std::string, int> seen;
+            for (const auto& i : f.instances) seen[name[i.symbol_local_id]]++;
+            EXPECT_EQ(seen["ops"], 1) << "one declaration, one instance";
+            EXPECT_EQ(seen["extra_decl"], 1);
+        }
+    }
+}
+
 TEST(ObjectRoots, ARefMergedFromAnotherTuIsRenumbered) {
     std::string fixture_dir = std::string(FIXTURE_DIR) + "/cross_tu_field_refs";
     TempDir temp_dir = makeTempDir();
