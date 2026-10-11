@@ -36,11 +36,21 @@ size_t Stage1::getOrCreateFile(CXFile file) {
     // Create FILE symbol
     auto [file_sym_id, _] = symbols_.getOrCreate(
         fd.module_path, SCOPE_GLOBAL, SYMTYPE_FILE);
-    fd.instances.push_back({file_sym_id, 0, static_cast<int32_t>(fd.content.size()), filetypeToInstType(fd.filetype)});
+    const int32_t file_inst_type = filetypeToInstType(fd.filetype);
+    fd.instances.push_back(
+        {file_sym_id, 0, static_cast<int32_t>(fd.content.size()), file_inst_type});
 
     size_t idx = result_.files.size();
     result_.files.push_back(std::move(fd));
     file_index_[path] = idx;
+    // The file's own instance is pushed here rather than through `addInstance`
+    // -- there is no scope stack yet, and it must be instances[0], which every
+    // root-numbering path assumes.  Register it in the index anyway, so "the
+    // index names every instance in the vector" holds without exception.
+    file_inst_index_[idx].emplace(
+        InstKey{file_sym_id, file_inst_type, 0,
+                static_cast<int32_t>(result_.files[idx].content.size())},
+        size_t{0});
     return idx;
 }
 
@@ -312,11 +322,26 @@ void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
     // instances ended up with dfs_exit == dfs_enter, able to contain nothing.
     d.stack_parent = stackParent(fi);
 
-    size_t idx = result_.files[fi].instances.size();
-    result_.files[fi].instances.push_back(d);
+    // ONE DECLARATION IN THE TEXT IS ONE INSTANCE, however many times the text
+    // is parsed.  A header without an include guard is parsed once per
+    // inclusion, and each parse used to record the same declaration again (see
+    // `InstKey`).
+    //
+    // On a repeat the SURVIVOR's index goes on the scope stack, not the one a
+    // push would have produced, so the second parse's children nest under the
+    // instance that stayed.  Nothing points at an instance yet -- numbering and
+    // refs both come later -- which is the whole difference from the dedup this
+    // reinstates: that one ran in `ProtoBuilder` AFTER numbering and orphaned
+    // the refs already stamped against the rows it dropped.
+    auto& index = file_inst_index_[fi];
+    auto& instances = result_.files[fi].instances;
+    auto [it, fresh] = index.try_emplace(
+        InstKey{d.symbol_local_id, d.instance_type, d.start_offset, d.end_offset},
+        instances.size());
+    if (fresh) instances.push_back(d);
     // `opens_scope` now means only "later cursors nest inside this one", which
     // is all it ever should have meant.
-    if (opens_scope) dfs_stack_.push_back({fi, idx});
+    if (opens_scope) dfs_stack_.push_back({fi, it->second});
 }
 
 void Stage1::closeScopesTo(size_t mark) {

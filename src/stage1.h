@@ -145,6 +145,16 @@ private:
     // Per-TU state
     std::unordered_map<std::string, size_t> file_index_; // filepath -> index in result_.files
     std::unordered_map<size_t, std::unordered_set<EntryKey, EntryKeyHash>> file_ref_sets_; // per-file ref dedup
+    /// Per-file instance index, key -> position in that file's `instances`.
+    ///
+    /// A set would be enough to drop a repeat, but `addInstance` needs the
+    /// SURVIVOR'S INDEX: the second parse of a header must push that onto
+    /// `dfs_stack_`, so its children nest under the instance that stayed
+    /// instead of under one that was never appended.
+    ///
+    /// Within a file this makes the key a primary key, which is what lets the
+    /// cross-TU merge be a set union (see `Indexer::processTU`).
+    std::unordered_map<size_t, std::unordered_map<InstKey, size_t, InstKeyHash>> file_inst_index_;
     /// Every macro this TU defined, by name.  Scoped to the TU on purpose: a
     /// macro body can only name a macro visible in the same TU, so resolving
     /// against this rather than the project-global symbol table is both
@@ -190,6 +200,7 @@ private:
     /// Derive the containment tree from the ranges the walk collected, then
     /// number it.  See the definition for the parentage rule.
     static void numberTree(FileData& f);
+
     /// True when the cursor exists only because of a macro expansion -- its
     /// spelling location (where the text is) differs from its expansion
     /// location (where the code lands).

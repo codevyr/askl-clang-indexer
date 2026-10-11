@@ -841,8 +841,13 @@ INSTANTIATE_TEST_SUITE_P(
                 {"api.h", "API_H", 1},
                 {"api.h", "api.h", 7},
                 {"api.h", "do_work", 2},       // declaration
-                {"api.h", "do_work", 10},      // documentation — from declaration visit
-                {"api.h", "do_work", 10},      // documentation — from definition visit (comment is in header)
+                // ONE doc comment in the text, so one instance -- and it is in
+                // api.h, which is the claim: a definition in impl.c carries the
+                // documentation its declaration was given in the header.
+                // Both the declaration visit and the definition visit find this
+                // same comment, and recording it per VISIT rather than per text
+                // listed it twice.
+                {"api.h", "do_work", 10},      // documentation
                 {"impl.c", "do_work", 1},      // definition — no documentation here
                 {"impl.c", "impl.c", 6},
             }
@@ -1970,12 +1975,23 @@ TEST(ObjectRoots, ReincludedHeaderKeepsBothResults) {
         // apart; the DFS position does, which is why instance identity is the
         // position and not `(symbol, extent)`.
         std::map<std::string, const askl::index::SymbolInstance*> generated;
+        std::map<std::string, int> seen;
         for (const auto& i : obj.symbol_instances()) {
             EXPECT_NE(i.instance_type(), askl::index::InstanceType::EXPANSION)
                 << "a macro use is a reference, not an instance";
+            seen[name[i.symbol_local_id()]]++;
             if (i.instance_type() == askl::index::InstanceType::DEFINITION)
                 generated[name[i.symbol_local_id()]] = &i;
         }
+
+        // The other half of instance identity, and the reason the key carries
+        // the SYMBOL: `int plain(int v);` does not depend on SUFFIX, so both
+        // inclusions parse one declaration of one symbol at one extent.  One
+        // declaration in the text is one instance, however many times the text
+        // is parsed.  glibc's `libc-header-start.h` is this at scale -- 146
+        // keys carrying 366 extra instances on criu before this held.
+        EXPECT_EQ(seen["plain"], 1)
+            << "a declaration parsed twice is still one declaration";
 
         ASSERT_EQ(generated.count("alpha_f"), 1u) << "first inclusion lost";
         ASSERT_EQ(generated.count("alpha_d"), 1u) << "second inclusion lost";
