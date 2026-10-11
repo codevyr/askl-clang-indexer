@@ -68,6 +68,15 @@ struct RefData {
     bool folded = false;
     int32_t fold_depth = 0;
 
+    // TRANSIENT, never on the wire: this reference was SYNTHESISED by Stage2
+    // at a declaration site rather than read from a use site, so its range
+    // deliberately does not spell its symbol -- a function-pointer field's
+    // declaration claims the function assigned to it.  Stage2 does not go
+    // through `insertRef`, so the producer's range check never sees these;
+    // the flag lets a test state the same exemption instead of listing
+    // fixtures.
+    bool synthetic = false;
+
     // TRANSIENT, never on the wire: the instance that owns this reference.
     // Set from the AST scope for an ordinary ref and from the enclosing macro
     // for an expansion-site ref -- a distinction ranges cannot make, since both
@@ -211,8 +220,24 @@ private:
     static void inclusionCallback(CXFile included_file, CXSourceLocation* stack,
                                   unsigned len, CXClientData data);
     void visitCursor(CXCursor cursor, CXCursor parent);
-    void addRef(CXCursor cursor, int64_t sym_id, unsigned name_len);
-    void insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t end,
+    /// The spelling range of the token that NAMES this reference's symbol --
+    /// which is what a reference's range means.  Its start comes from
+    /// `clang_Cursor_getSpellingNameRange`; its end is measured in the file's
+    /// own text, because clang reports the name range's end at the EXPANSION
+    /// point for a token spelled inside a macro body.
+    bool refNameRange(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
+                      int32_t& out_start, int32_t& out_end);
+    /// The name range when it names the symbol, else the cursor's extent.
+    bool refRange(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
+                  int32_t& out_start, int32_t& out_end);
+    void addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name);
+    /// Does the text at a reference's range actually spell the symbol it
+    /// references?  A range that does not is describing a position it does not
+    /// occupy, which is worse than the reference being absent.
+    bool refTextNamesSymbol(size_t file_idx, const std::string& sym_name,
+                            int32_t start, int32_t end, bool warn) const;
+    void insertRef(size_t file_idx, int64_t sym_id, const std::string& sym_name,
+                   int32_t start, int32_t end,
                    int32_t full_start = -1, int32_t full_end = -1);
     void addDocComment(CXCursor cursor, int64_t sym_id, size_t file_idx);
     void indexChildField(CXCursor child);

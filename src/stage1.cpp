@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "stage1.h"
 #include "clang_raii.h"
 #include "clang_utils.h"
@@ -178,7 +179,7 @@ void Stage1::linkMacroBodies(CXTranslationUnit tu) {
             // No owner: `numberTree` resolves it from the text, and the
             // narrowest unfolded instance containing a token inside a
             // `#define` body is that macro's own definition.
-            insertRef(b.file_idx, it->second, static_cast<int32_t>(off),
+            insertRef(b.file_idx, it->second, tok, static_cast<int32_t>(off),
                       static_cast<int32_t>(off + tok.size()));
         }
         clang_disposeTokens(tu, toks, n);
@@ -518,8 +519,61 @@ void Stage1::numberTree(FileData& f) {
     }
 }
 
-void Stage1::insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t end,
-                       int32_t full_start, int32_t full_end) {
+bool Stage1::refTextNamesSymbol(size_t file_idx, const std::string& sym_name,
+                                int32_t start, int32_t end, bool warn) const {
+    const std::vector<uint8_t>& content = result_.files[file_idx].content;
+    if (content.empty() || start < 0 || end <= start ||
+        static_cast<size_t>(end) > content.size())
+        return true; // nothing to check against; not a reason to drop a ref
+
+    // The name comes from the caller rather than from a `symbols_` lookup: it
+    // is already in hand at every call site, and looking it up would take the
+    // symbol table's mutex once per reference on the hot path.
+    //
+    // A compound name is spelled by its leaf: `ucs_list_link.next` is written
+    // `next`.  But not every name is compound-or-identifier: clang names an
+    // anonymous struct by its source location, so
+    // `(anonymous struct at /path/infect.h:122:2)` splits on the `.` in `.h`
+    // and leaves `h:122:2)`, which matches nothing and dropped 234 good
+    // references on criu.
+    //
+    // So only check when the leaf is a plain identifier.  The guard exists to
+    // catch a range that spells no text; where it cannot tell, it must stay
+    // out of the way rather than guess.
+    std::string name = sym_name;
+    auto cut = name.find_last_of("./");
+    if (cut != std::string::npos) name = name.substr(cut + 1);
+    if (name.empty()) return true;
+    auto ident = [](unsigned char c) {
+        return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9');
+    };
+    for (unsigned char c : name)
+        if (!ident(c)) return true;
+
+    std::string text(reinterpret_cast<const char*>(content.data()) + start,
+                     static_cast<size_t>(end - start));
+    // Either may contain the other.  A symbol's name is sometimes a DECORATED
+    // form of what the source writes: clang resolves `__sync_and_and_fetch` to
+    // the sized builtin `__sync_and_and_fetch_1`, so the text is a prefix of
+    // the name and "text contains name" rejected 1048 good references on ucx.
+    // What this is for is a range that spells nothing related at all --
+    // `((_type*)0)-` claiming `hugetlb_mode`.
+    if (text.find(name) != std::string::npos || name.find(text) != std::string::npos)
+        return true;
+
+    // Silent when a caller is merely CHOOSING a range -- only the final
+    // decision in `insertRef` is worth a warning.
+    if (warn)
+        fprintf(stderr,
+                "Warning: dropping ref to '%s' at %s[%d,%d): that text reads '%s'\n",
+                name.c_str(), result_.files[file_idx].module_path.c_str(), start, end,
+                text.c_str());
+    return false;
+}
+
+void Stage1::insertRef(size_t file_idx, int64_t sym_id, const std::string& sym_name,
+                       int32_t start, int32_t end, int32_t full_start, int32_t full_end) {
     if (!file_ref_sets_[file_idx].insert({sym_id, start, end}).second)
         return;
     // The owner is left UNSET: `numberTree` resolves it by text, through
@@ -529,17 +583,158 @@ void Stage1::insertRef(size_t file_idx, int64_t sym_id, int32_t start, int32_t e
     // FILE, and when a function in one file expands a macro defined in
     // another, nothing from the defining file is on it, so a body reference
     // landed on that file's root.
+    // A REFERENCE'S RANGE MUST SPELL ITS SYMBOL.  The range is the naming
+    // token's own spelling now, so the text there is that token -- and when it
+    // is not, the reference is describing a position it does not occupy and is
+    // worse than absent: `ucs_offsetof`'s 427 field references read
+    // `((_type*)0)-` in compiler_def.h and sent "who uses this field" to a
+    // subsystem that never touched it.
+    //
+    // CONTAINS, not equals: a symbol's name may be compound (`struct.field`)
+    // while the token spells only the leaf, and a few constructs legitimately
+    // carry a wider range.  Containment is enough to catch a chimera.
+    //
+    // Checked here rather than in `addRef` so it also covers the references
+    // `linkMacroBodies` inserts directly.  Stage2's synthetic references do not
+    // pass through `insertRef` at all -- they are placed by `placeRefByText`
+    // after being merged in `indexer.cpp` -- so the ones it deliberately parks
+    // at a field's declaration site stay exempt by construction.
+    if (!refTextNamesSymbol(file_idx, sym_name, start, end, /*warn=*/true)) return;
+
     RefData r{sym_id, start, end};
     r.full_start = full_start;
     r.full_end = full_end;
     result_.files[file_idx].refs.push_back(r);
 }
 
-void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
-    CXFile spelling_file;
-    unsigned spelling_start, spelling_end;
-    if (getSpellingRange(cursor, spelling_file, spelling_start, spelling_end, name_len)) {
-        size_t fi = getOrCreateFile(spelling_file);
+bool Stage1::refNameRange(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
+                          int32_t& out_start, int32_t& out_end) {
+    // A REFERENCE'S RANGE IS THE SPELLING OF THE TOKEN THAT NAMES IT.
+    //
+    // Not the cursor's extent, which is the whole construct: for
+    // `((_t*)0)->_m` the extent STARTS at the base expression, and that is in
+    // the macro BODY whenever `_m` came from an argument.  The old code took
+    // the extent's endpoints and, when they landed in different files, pasted
+    // the body's start onto the symbol name's length -- a range that spells no
+    // text in either file.  `ucs_offsetof(uct_mm_md_config_t, hugetlb_mode)`
+    // recorded `uct_mm_md_config.hugetlb_mode` at compiler_def.h [3757,3769),
+    // which reads `((_type*)0)-`.
+    //
+    // `clang_Cursor_getSpellingNameRange` gives the name instead, and its
+    // START is reliably the identifier's first byte -- at the call site when
+    // the author wrote it there, in the `#define` body when the macro did.
+    // That one distinction places every case with no discriminator.
+    CXSourceRange nr = clang_Cursor_getSpellingNameRange(cursor, 0, 0);
+    if (clang_Range_isNull(nr)) return false;
+
+    CXFile start_file = nullptr;
+    unsigned start_off = 0;
+    clang_getSpellingLocation(clang_getRangeStart(nr), &start_file, nullptr, nullptr,
+                              &start_off);
+    if (!start_file) return false;
+
+    out_fi = getOrCreateFile(start_file);
+    out_start = static_cast<int32_t>(start_off);
+
+    // THE END.  Prefer clang's own name range, which is a proper half-open
+    // span -- `mode` at a call site comes back [103,107) and `std::min` covers
+    // the whole qualified name, both exact.  It has two failure modes, both
+    // measured:
+    //
+    //   * it STRADDLES.  For a token spelled in a macro body the start
+    //     resolves into the body while the end is a plain location at the
+    //     invocation, so `MODE_OFF`'s `mode` is [m.h:481 .. main.c:159] --
+    //     two endpoints in different coordinate systems, not a range.
+    //   * it RUNS AWAY.  Even within one file it can be 2669 bytes:
+    //     `atomic.h[766,3435)` for a reference to `__sync_and_and_fetch`.
+    //
+    // A name sits on one line, which separates the good case from the runaway
+    // one without a magic width.
+    CXFile end_file = nullptr;
+    unsigned end_off = 0;
+    clang_getSpellingLocation(clang_getRangeEnd(nr), &end_file, nullptr, nullptr, &end_off);
+    const std::vector<uint8_t>& content = result_.files[out_fi].content;
+    if (end_file && clang_File_isEqual(start_file, end_file) && end_off > start_off &&
+        static_cast<size_t>(end_off) <= content.size() &&
+        std::find(content.begin() + start_off, content.begin() + end_off,
+                  static_cast<uint8_t>('\n')) == content.begin() + end_off) {
+        out_end = static_cast<int32_t>(end_off);
+        return true;
+    }
+
+    // Otherwise the name is one token, so ask clang for the token AT that
+    // position rather than re-lexing it here: `clang_getToken` runs the same
+    // lexer that produced the cursor, so the bounds cannot disagree with it.
+    // Measured on criu, this beats a hand-rolled identifier scan -- 73,950
+    // exact ranges against 73,748, and an imprecise bucket 8x smaller.
+    CXTranslationUnit tu = clang_Cursor_getTranslationUnit(cursor);
+    CXSourceLocation at = clang_getLocationForOffset(tu, start_file, start_off);
+    if (CXToken* tok = clang_getToken(tu, at)) {
+        CXSourceRange te = clang_getTokenExtent(tu, *tok);
+        CXFile tf = nullptr;
+        unsigned ts = 0, tend = 0;
+        clang_getSpellingLocation(clang_getRangeStart(te), &tf, nullptr, nullptr, &ts);
+        clang_getSpellingLocation(clang_getRangeEnd(te), nullptr, nullptr, nullptr, &tend);
+        clang_disposeTokens(tu, tok, 1);
+        if (tf && clang_File_isEqual(tf, start_file) && ts == start_off &&
+            tend > start_off) {
+            out_end = static_cast<int32_t>(tend);
+            return true;
+        }
+    }
+
+    // If clang will not lex there, give up rather than re-lex it ourselves.
+    // `refRange` then falls through to the cursor's EXTENT, which is also
+    // clang's answer and is validated by the same predicate -- so every range
+    // this produces comes from clang, and there is no second lexer to disagree
+    // with the one that built the AST.
+    //
+    // Never observed to fire: zero times across criu's 74,737 references, a
+    // C++ reproduction, and all 55 fixtures.  An earlier shape of this
+    // function had no name-range tier, and `clang_getToken` then returned null
+    // 3375 times on criu -- but those are exactly the positions the name-range
+    // tier now handles first, so they no longer reach here.
+    return false;
+}
+
+/// Take the name range, but only if the text there actually names the symbol;
+/// otherwise fall back to the cursor's EXTENT.
+///
+/// The name range is not always the name.  For a qualified C++ callee it is the
+/// nested-name-specifier: `std::min(a, b)` comes back as `std`, a single piece
+/// (there is no second piece to ask for -- pieceIndex 1 is NULL).  Narrowing to
+/// that would be a regression, because the extent at least contains `min`.
+///
+/// So the same predicate that guards `insertRef` picks the range here, which
+/// also makes the choice self-correcting for cases nobody has met yet.  Order
+/// matters: the name range is PREFERRED, because for
+/// `ucs_offsetof(T, hugetlb_mode)` it is the only one that is right -- the
+/// extent is the chimera this whole change exists to remove.
+bool Stage1::refRange(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
+                      int32_t& out_start, int32_t& out_end) {
+    if (refNameRange(cursor, sym_name, out_fi, out_start, out_end) &&
+        refTextNamesSymbol(out_fi, sym_name, out_start, out_end, /*warn=*/false))
+        return true;
+
+    CXFile ef = nullptr;
+    unsigned es = 0, ee = 0;
+    if (!getSpellingRange(cursor, ef, es, ee)) return out_start >= 0;
+    size_t efi = getOrCreateFile(ef);
+    if (!refTextNamesSymbol(efi, sym_name, static_cast<int32_t>(es),
+                            static_cast<int32_t>(ee), /*warn=*/false))
+        return out_start >= 0;  // neither names it; keep the name range and let
+                                // `insertRef` warn about the one we chose
+    out_fi = efi;
+    out_start = static_cast<int32_t>(es);
+    out_end = static_cast<int32_t>(ee);
+    return true;
+}
+
+void Stage1::addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name) {
+    size_t fi;
+    int32_t spelling_start, spelling_end;
+    spelling_start = -1;
+    if (refRange(cursor, sym_name, fi, spelling_start, spelling_end)) {
         // The FULL span is the whole referencing construct -- `foo(a, b)` where
         // the name span covers only `foo`.  Display only; ownership comes from
         // the DFS position.  Absent when the construct straddles files, which
@@ -547,13 +742,16 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, unsigned name_len) {
         int32_t full_start = -1, full_end = -1;
         CXFile full_file = nullptr;
         unsigned fs = 0, fe = 0;
-        if (getExpansionRange(cursor, full_file, fs, fe) && full_file &&
-            clang_File_isEqual(full_file, spelling_file)) {
+        CXFile name_file = clang_getFile(
+            clang_Cursor_getTranslationUnit(cursor),
+            result_.files[fi].filesystem_path.c_str());
+        if (getExpansionRange(cursor, full_file, fs, fe) && full_file && name_file &&
+            clang_File_isEqual(full_file, name_file)) {
             full_start = static_cast<int32_t>(fs);
             full_end = static_cast<int32_t>(fe);
         }
-        insertRef(fi, sym_id, static_cast<int32_t>(spelling_start), static_cast<int32_t>(spelling_end),
-                  full_start, full_end);
+        insertRef(fi, sym_id, sym_name, spelling_start, spelling_end, full_start,
+                  full_end);
     }
 
     // NO EXPANSION-SITE REFERENCE.  There used to be a second reference here,
@@ -743,7 +941,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_FUNCTION);
-        addRef(cursor, sym_id, sname.size());
+        addRef(cursor, sym_id, sname);
         break;
     }
     case CXCursor_DeclRefExpr: {
@@ -758,7 +956,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             if (sname.empty()) break;
 
             auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_DATA);
-            addRef(cursor, sym_id, sname.size());
+            addRef(cursor, sym_id, sname);
         } else if (ref_kind == CXCursor_VarDecl) {
             CXCursor ref_parent = clang_getCursorSemanticParent(referenced);
             if (clang_getCursorKind(ref_parent) != CXCursor_TranslationUnit) break;
@@ -768,7 +966,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             if (sname.empty()) break;
 
             int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_DATA);
-            addRef(cursor, sym_id, sname.size());
+            addRef(cursor, sym_id, sname);
         }
         break;
     }
@@ -784,7 +982,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         // Note: clang visits TypeRef children of anonymous types through both
         // the TypedefDecl and the underlying type (UnionDecl/StructDecl),
         // producing duplicate refs. Deduplicated in addRef via file_ref_sets_.
-        addRef(cursor, sym_id, sname.size());
+        addRef(cursor, sym_id, sname);
         break;
     }
     case CXCursor_MemberRefExpr: {
@@ -795,13 +993,8 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         std::string compound_name = resolveFieldCompoundName(referenced);
         if (compound_name.empty()) break;
 
-        // Extract just the field name for the ref span length
-        std::string::size_type dot = compound_name.rfind('.');
-        unsigned name_len = (dot != std::string::npos)
-            ? compound_name.size() - dot - 1 : compound_name.size();
-
         auto [field_sym_id, _] = symbols_.getOrCreate(compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
-        addRef(cursor, field_sym_id, name_len);
+        addRef(cursor, field_sym_id, compound_name);
         break;
     }
     default:

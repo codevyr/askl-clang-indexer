@@ -297,15 +297,15 @@ INSTANTIATE_TEST_SUITE_P(
             {
                 {"main.c", "file_ops", 43, 51},
                 {"main.c", "file_ops", 88, 96},
-                {"main.c", "setup", 106, 117},
-                {"main.c", "file_ops.read", 123, 131},     // MemberRefExpr: ops.read(0,0,0)
+                {"main.c", "setup", 106, 111},
+                {"main.c", "file_ops.read", 127, 131},     // MemberRefExpr: ops.read(0,0,0)
                 {"ops.c", "file_ops", 207, 215},
                 {"ops.c", "my_read", 236, 251},
                 {"ops.c", "my_write", 257, 274},
                 {"ops.c", "file_ops", 330, 338},
-                {"ops.c", "file_ops.read", 351, 360},      // MemberRefExpr: ops->read = ...
+                {"ops.c", "file_ops.read", 356, 360},      // MemberRefExpr: ops->read = ...
                 {"ops.c", "my_read", 351, 370},
-                {"ops.c", "file_ops.write", 376, 386},     // MemberRefExpr: ops->write = ...
+                {"ops.c", "file_ops.write", 381, 386},     // MemberRefExpr: ops->write = ...
                 {"ops.c", "my_write", 376, 397},
                 {"ops.c", "container", 442, 451},
                 {"ops.c", "my_read", 482, 497},
@@ -360,8 +360,8 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"main.c", "handle", 38, 44},
-                {"main.c", "point.x", 69, 72},
-                {"main.c", "point.y", 82, 85},
+                {"main.c", "point.x", 71, 72},
+                {"main.c", "point.y", 84, 85},
                 {"main.c", "point_t", 19, 26},
                 {"main.c", "point_t", 54, 61},
                 {"types.h", "point", 79, 84},
@@ -379,7 +379,7 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"main.c", "value", 52, 57},
-                {"main.c", "value.i", 71, 75},
+                {"main.c", "value.i", 74, 75},
             }
         },
         FixtureSpec{
@@ -414,9 +414,9 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"a.c", "count", 56, 61},
-                {"a.c", "helper", 90, 98},
+                {"a.c", "helper", 90, 96},
                 {"b.c", "count", 56, 61},
-                {"b.c", "helper", 90, 98},
+                {"b.c", "helper", 90, 96},
             }
         },
         FixtureSpec{
@@ -501,7 +501,7 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "RESULT", 302, 308},
                 {"main.c", "DEFAULT_STATUS", 325, 339},
                 // Real text in main.c, unaffected.
-                {"main.c", "result.code", 316, 322},
+                {"main.c", "result.code", 318, 322},
             }
         },
         FixtureSpec{
@@ -632,12 +632,12 @@ INSTANTIATE_TEST_SUITE_P(
             {
                 {"a.c", "result_t", 20, 28},
                 {"a.c", "result_t", 52, 60},
-                {"a.c", "result_t.quot", 68, 74},
-                {"a.c", "result_t.rem", 88, 93},
+                {"a.c", "result_t.quot", 70, 74},
+                {"a.c", "result_t.rem", 90, 93},
                 {"b.c", "pair_t", 20, 26},
                 {"b.c", "pair_t", 57, 63},
-                {"b.c", "pair.first", 71, 78},
-                {"b.c", "pair.second", 88, 96},
+                {"b.c", "pair.first", 73, 78},
+                {"b.c", "pair.second", 90, 96},
             },
             // instances — validates dedup across 2 TUs sharing types.h
             {
@@ -778,8 +778,8 @@ INSTANTIATE_TEST_SUITE_P(
                 // caller because every byte at a call site is the caller's.
                 {"main.c", "my_drv", 89, 95},
                 // driver_info.id: spelling refs inside register_driver macro body
-                {"register.h", "driver_info.id", 213, 215},
-                {"register.h", "driver_info.id", 264, 266},
+                {"register.h", "driver_info.id", 219, 221},
+                {"register.h", "driver_info.id", 270, 272},
             },
             {
                 {"main.c", "__exit"},
@@ -810,7 +810,7 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"main.c", "counter", 305, 312},
-                {"main.c", "add", 315, 324},
+                {"main.c", "add", 315, 318},
             },
             {
                 {"main.c", "add", 1},
@@ -880,13 +880,13 @@ INSTANTIATE_TEST_SUITE_P(
                 {"errors.h", "config", 570, 576},
                 {"main.c", "config", 28, 34},
                 {"main.c", "config", 94, 100},
-                {"main.c", "config.debug", 135, 145},
-                {"main.c", "config.verbose", 113, 125},
+                {"main.c", "config.debug", 140, 145},
+                {"main.c", "config.verbose", 118, 125},
                 {"main.c", "global_cfg", 182, 192},
                 {"main.c", "global_opts", 199, 210},
                 {"main.c", "options", 54, 61},
-                {"main.c", "options.count", 199, 216},
-                {"main.c", "setup", 175, 193},
+                {"main.c", "options.count", 211, 216},
+                {"main.c", "setup", 175, 180},
             }
         },
         // Proves that macro arguments become direct children of the enclosing
@@ -1007,8 +1007,8 @@ INSTANTIATE_TEST_SUITE_P(
             {
                 {"main.c", "iface_ops", 170, 179},
                 {"main.c", "iface_ops", 276, 285},
-                {"main.c", "iface_ops.read", 298, 307},     // MemberRefExpr: ops->read(...)
-                {"main.c", "iface_ops.write", 322, 332},    // MemberRefExpr: ops->write(...)
+                {"main.c", "iface_ops.read", 303, 307},     // MemberRefExpr: ops->read(...)
+                {"main.c", "iface_ops.write", 327, 332},    // MemberRefExpr: ops->write(...)
                 {"main.c", "my_read", 200, 215},
                 {"main.c", "my_write", 221, 238},
                 {"ops.h", "my_read", 174, 191},              // field impl ref
@@ -1747,7 +1747,99 @@ TEST(ObjectRoots, AnExpansionContainsNothing) {
     }
 }
 
-static std::set<std::pair<std::string, std::string>> edgesOf(const char* fixture);static std::set<std::pair<std::string, std::string>> edgesOf(const char* fixture);
+static std::set<std::pair<std::string, std::string>> edgesOf(const char* fixture);
+
+// A reference's range is the spelling of the token that NAMES it, and that one
+// rule places every case without a discriminator.
+//
+//   m.h:    #define FIELD_OF(_t, _m)  ((unsigned long)&(((_t*)0)->_m))
+//           #define MODE_OFF          ((unsigned long)&(((struct cfg*)0)->mode))
+//   main.c: FIELD_OF(struct cfg, mode)   and   MODE_OFF
+//
+// Both expand to byte-identical text, so the ONLY thing separating them is
+// where each token was written: FIELD_OF gets `mode` from the caller as an
+// argument, MODE_OFF spells it in its own body.  So FIELD_OF must own no field
+// edge at all, and MODE_OFF must keep one.
+//
+// Before this, a `MemberRefExpr`'s extent START was used, and that sits in the
+// macro BODY whenever the member came from an argument, with the end taken
+// from the symbol's name length.  `ucs_offsetof(uct_mm_md_config_t,
+// hugetlb_mode)` recorded the field at compiler_def.h [3757,3769), where the
+// text reads `((_type*)0)-` -- a range spelling no text in either file.
+TEST(ObjectRoots, ARefSitsWhereItsNameIsWritten) {
+    EXPECT_EQ(edgesOf("macro_arg_member"),
+              (std::set<std::pair<std::string, std::string>>{
+                  // (a) the argument case: the CALLER names the field and the
+                  // type, and FIELD_OF names nothing.
+                  {"from_arg", "FIELD_OF"},
+                  {"from_arg", "cfg.mode"},
+                  {"from_arg", "cfg"},
+                  // (c) the body case: MODE_OFF names them, reachable in two
+                  // hops.  This is the control -- a fix that relocated every
+                  // reference to the call site would empty it.
+                  {"from_body", "MODE_OFF"},
+                  {"MODE_OFF", "cfg.mode"},
+                  {"MODE_OFF", "cfg"},
+              }));
+}
+
+// Every AST reference's range spells the symbol it references.
+//
+// The invariant the chimera range broke, checked here over fixtures and at the
+// producer by `Stage1::refTextNamesSymbol`.  Stage2's synthetic references are
+// deliberately parked at a field's DECLARATION site rather than the
+// assignment, so they do not satisfy it -- and they never pass through
+// `insertRef`, which is why guarding there exempts them by construction.
+TEST(ObjectRoots, RefRangesSpellTheirSymbol) {
+    for (const char* fx : {"macro_arg_member", "macro_layerwise", "macro_nested",
+                           "macro_arg_direct", "macro_expansion_arg",
+                           "macro_struct_in_union", "reincluded_header",
+                           "small_project", "typedef_basic", "union_basic"}) {
+        std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fx;
+        TempDir temp_dir = makeTempDir();
+        std::vector<std::string> srcs;
+        for (auto& e : fs::directory_iterator(fixture_dir))
+            if (e.path().extension() == ".c") srcs.push_back(e.path().filename().string());
+        std::sort(srcs.begin(), srcs.end());
+        generateCompileCommands(fixture_dir, temp_dir.path, srcs);
+        Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+        indexer.run();
+
+        std::unordered_map<int64_t, std::string> name;
+        for (auto& sym : indexer.symbolTable().allSymbols()) name[sym.local_id] = sym.name;
+
+        for (const auto& f : indexer.allFiles()) {
+            for (const auto& r : f.refs) {
+                // Stage2 places a function-pointer assignment at the FIELD's
+                // declaration, so `int (*read)(int fd, ...)` claims `my_read`
+                // on purpose.  Those never reach `insertRef`, so the producer
+                // check never sees them either.
+                if (r.synthetic) continue;
+                if (r.from_offset_start < 0 || r.from_offset_end <= r.from_offset_start ||
+                    static_cast<size_t>(r.from_offset_end) > f.content.size())
+                    continue;
+                std::string leaf = name[r.to_symbol_local_id];
+                auto cut = leaf.find_last_of("./");
+                if (cut != std::string::npos) leaf = leaf.substr(cut + 1);
+                // Only identifiers are checkable: clang names an anonymous
+                // struct by its source location, so the "leaf" of
+                // `(anonymous struct at /p/x.h:122:2)` is not a name at all.
+                static const char* kIdent =
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+                if (leaf.empty() || leaf.find_first_not_of(kIdent) != std::string::npos)
+                    continue;
+                std::string text(
+                    reinterpret_cast<const char*>(f.content.data()) + r.from_offset_start,
+                    static_cast<size_t>(r.from_offset_end - r.from_offset_start));
+                EXPECT_NE(text.find(leaf), std::string::npos)
+                    << fx << " " << f.module_path << "[" << r.from_offset_start << ","
+                    << r.from_offset_end << ") reads \"" << text
+                    << "\" but references \"" << leaf << "\"";
+            }
+        }
+    }
+}
+
 
 TEST(ObjectRoots, MacroEdgesAreLayerwise) {
     EXPECT_EQ(edgesOf("macro_layerwise"),

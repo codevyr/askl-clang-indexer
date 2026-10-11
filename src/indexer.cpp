@@ -180,6 +180,7 @@ void Indexer::processTU(const CompileCommand& cmd) {
                 // its refs arrive unnumbered; `placeRefByText` places each
                 // one by the text it sits in.
                 placeRefByText(results.files[it->second], ref.data);
+                ref.data.synthetic = true;
                 file_refs.push_back(ref.data);
             }
         }
