@@ -1639,6 +1639,59 @@ TEST(ObjectRoots, AMacroInvocationIsInsideItsEnclosingFunction) {
 // on one range and must resolve to one owner.  Un-renumbered, b.c's ref came
 // out at dfs 11265 against a.c's numbering -- outside the field entirely --
 // while a.c's sat correctly at 5121.
+// A MACRO-BODY REFERENCE AFTER A LINE CONTINUATION STILL SPELLS ITS MACRO.
+//
+// `linkMacroBodies` tokenises a `#define` body and emits a reference for each
+// identifier naming a macro.  The range came from `clang_getTokenLocation` for
+// the start and `start + name.size()` for the end -- and for the FIRST token
+// after a `\` line splice that start lands on the backslash, so the whole range
+// slides two bytes and spells `\<newline>` plus a truncated name.
+//
+// The range guard in `insertRef` then refuses the reference, so the edge is lost
+// even though its TARGET was always right.  Measured on a full reindex:
+// 865,728 references dropped on linux, 14,654 on rdma-core, 7,741 on
+// open-gpu-kernel-modules -- and ZERO on ucx, which writes its macro bodies
+// mid-line and therefore cannot exhibit it.  That zero is what made the guard
+// look clean when it shipped.
+TEST(ObjectRoots, AMacroBodyRefAfterALineContinuationSpellsItsMacro) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/macro_continuation";
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"main.c"});
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+
+    int64_t inner = -1;
+    for (const auto& si : indexer.symbolTable().allSymbols())
+        if (si.name == "INNER") inner = si.local_id;
+    ASSERT_NE(inner, -1) << "fixture must define INNER";
+
+    bool checked = false;
+    for (const auto& f : indexer.allFiles()) {
+        if (f.module_path.find("m.h") == std::string::npos) continue;
+        std::string text(reinterpret_cast<const char*>(f.content.data()), f.content.size());
+
+        std::vector<const RefData*> to_inner;
+        for (const auto& r : f.refs)
+            if (r.to_symbol_local_id == inner) to_inner.push_back(&r);
+
+        // OUTER names INNER after a continuation, MIDLINE names it mid-line.
+        // Both are references from a macro body, so both must survive.
+        EXPECT_EQ(to_inner.size(), 2u)
+            << "both macro bodies naming INNER must produce an edge";
+        for (const auto* r : to_inner) {
+            ASSERT_GE(r->from_offset_start, 0);
+            ASSERT_LE(static_cast<size_t>(r->from_offset_end), text.size());
+            EXPECT_EQ(text.substr(r->from_offset_start,
+                                  r->from_offset_end - r->from_offset_start),
+                      "INNER")
+                << "a reference's range must spell its symbol, at ["
+                << r->from_offset_start << "," << r->from_offset_end << ")";
+            checked = true;
+        }
+    }
+    ASSERT_TRUE(checked) << "no reference to INNER was recorded at all";
+}
+
 // ONE RECORD REACHED TWO WAYS IS ONE SYMBOL.
 //
 // A record with no tag has no name of its own, so clang names it after where it

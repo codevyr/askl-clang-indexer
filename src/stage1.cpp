@@ -194,14 +194,41 @@ void Stage1::linkMacroBodies(CXTranslationUnit tu) {
             auto it = tu_macros_.find(tok);
             if (it == tu_macros_.end()) continue;
 
-            CXSourceLocation tl = clang_getTokenLocation(tu, toks[i]);
-            unsigned off = 0;
-            clang_getSpellingLocation(tl, nullptr, nullptr, nullptr, &off);
+            // ANCHOR ON THE TOKEN'S END, NOT ITS START.
+            //
+            // A line splice belongs to the token that follows it: clang reports
+            // `INNER` written at column 1 after a `\\` as extent [341,348),
+            // seven bytes wide for a five-character name, covering the
+            // backslash and the newline.  Its START is therefore not where the
+            // identifier is -- but its END is, so take the end from the extent
+            // and step back by the spelling's length.
+            //
+            // `clang_getTokenLocation` has the same offset as the inflated
+            // start, so the previous `[loc, loc + size)` slid the whole range
+            // onto the splice and spelled `\\<newline>INN`.  `insertRef`'s range
+            // guard then refused the reference and the edge was lost, though
+            // its target had always been right.  Measured on a full reindex:
+            // 865,728 references dropped on linux, 14,654 on rdma-core, 7,741
+            // on open-gpu-kernel-modules -- the kernel opens almost every
+            // multi-line macro body at column 1 -- and ZERO on ucx, which
+            // writes them mid-line, which is why the guard looked clean.
+            //
+            // An identifier spliced INTERNALLY (`IN\\<newline>NER`) is still
+            // beyond this: the spelling is shorter than the bytes it occupies,
+            // so the computed start lands inside the name and the guard drops
+            // it exactly as it does today.  No worse, and legal-but-absurd.
+            CXSourceRange extent = clang_getTokenExtent(tu, toks[i]);
+            unsigned tok_end = 0;
+            CXFile tok_file = nullptr;
+            clang_getSpellingLocation(clang_getRangeEnd(extent), &tok_file, nullptr,
+                                      nullptr, &tok_end);
+            if (!tok_file || tok_end < tok.size()) continue;
+            const unsigned tok_start = tok_end - static_cast<unsigned>(tok.size());
             // No owner: `numberTree` resolves it from the text, and the
             // narrowest unfolded instance containing a token inside a
             // `#define` body is that macro's own definition.
-            insertRef(b.file_idx, it->second, tok, static_cast<int32_t>(off),
-                      static_cast<int32_t>(off + tok.size()));
+            insertRef(b.file_idx, it->second, tok, static_cast<int32_t>(tok_start),
+                      static_cast<int32_t>(tok_end));
         }
         clang_disposeTokens(tu, toks, n);
     }
