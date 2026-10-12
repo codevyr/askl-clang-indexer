@@ -181,13 +181,10 @@ void Indexer::processTU(const CompileCommand& cmd) {
                 // what is missing; pass two rewrites `stack_parent` through
                 // that map for the rows just inserted -- it is an index into
                 // the INCOMING vector and would otherwise point at a stranger.
-                std::unordered_map<InstKey, size_t, InstKeyHash> have;
-                have.reserve(existing.instances.size());
-                for (size_t i = 0; i < existing.instances.size(); ++i) {
-                    const InstanceData& e = existing.instances[i];
-                    have.emplace(InstKey{e.symbol_local_id, e.instance_type,
-                                         e.start_offset, e.end_offset}, i);
-                }
+                // The map is KEPT across merges, not rebuilt from `existing`:
+                // rebuilding made one merge cost O(everything accumulated) and
+                // the run quadratic in how often a file is included.
+                auto& have = merged_inst_keys_[it->second];
 
                 std::vector<size_t> remap(file.instances.size(), 0);
                 std::vector<size_t> inserted;
@@ -233,11 +230,9 @@ void Indexer::processTU(const CompileCommand& cmd) {
                     late_instance_count_ += inserted.size();
                 }
 
-                // Merge refs, deduplicating against what's already there
-                std::unordered_set<EntryKey, EntryKeyHash> seen;
-                seen.reserve(existing.refs.size());
-                for (auto& ref : existing.refs)
-                    seen.insert({ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end});
+                // Merge refs, deduplicating against what's already there --
+                // again against a KEPT set, for the same reason.
+                auto& seen = merged_ref_keys_[it->second];
                 for (auto& ref : file.refs) {
                     if (seen.insert({ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end}).second) {
                         // No renumbering: nothing is numbered yet.  A ref used
@@ -250,8 +245,24 @@ void Indexer::processTU(const CompileCommand& cmd) {
                     }
                 }
             } else {
-                file_index_[file.filesystem_path] = all_files_.size();
+                const size_t idx = all_files_.size();
+                file_index_[file.filesystem_path] = idx;
                 all_files_.push_back(std::move(file));
+                // Seed this file's dedup state from what it arrived with, once.
+                merged_inst_keys_.resize(all_files_.size());
+                merged_ref_keys_.resize(all_files_.size());
+                const FileData& added = all_files_[idx];
+                auto& ik = merged_inst_keys_[idx];
+                ik.reserve(added.instances.size());
+                for (size_t i = 0; i < added.instances.size(); ++i) {
+                    const InstanceData& e = added.instances[i];
+                    ik.emplace(InstKey{e.symbol_local_id, e.instance_type,
+                                       e.start_offset, e.end_offset}, i);
+                }
+                auto& rk = merged_ref_keys_[idx];
+                rk.reserve(added.refs.size());
+                for (const RefData& r : added.refs)
+                    rk.insert({r.to_symbol_local_id, r.from_offset_start, r.from_offset_end});
             }
         }
 
@@ -352,6 +363,11 @@ void Indexer::addFile(const std::string& abs_path) {
 
     file_index_[abs_path] = all_files_.size();
     all_files_.push_back(std::move(fd));
+    // Keep the merge's per-file state the same length as `all_files_`.  These
+    // files arrive after the translation-unit loop and are never merged into,
+    // but the two must not drift apart.
+    merged_inst_keys_.resize(all_files_.size());
+    merged_ref_keys_.resize(all_files_.size());
 }
 
 void Indexer::createModuleSymbols() {
