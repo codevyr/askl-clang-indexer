@@ -85,7 +85,7 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
                 false);
             // The body is read for the macros it names once every macro in
             // this TU is known; see `linkMacroBodies`.
-            self->macro_bodies_.push_back({range_file, fi, start_off, end_off, sname});
+            self->macro_bodies_.push_back({cursor, fi, start_off, end_off, sname});
         }
     } else if (kind == CXCursor_MacroExpansion) {
         ClangString name(clang_getCursorSpelling(cursor));
@@ -150,9 +150,10 @@ void Stage1::collectMacros(CXTranslationUnit tu) {
 
 void Stage1::linkMacroBodies(CXTranslationUnit tu) {
     for (const MacroBody& b : macro_bodies_) {
-        CXSourceLocation begin = clang_getLocationForOffset(tu, b.file, b.start);
-        CXSourceLocation end = clang_getLocationForOffset(tu, b.file, b.end);
-        CXSourceRange range = clang_getRange(begin, end);
+        // Straight from the cursor.  Rebuilding this range from byte offsets
+        // cost a linear scan of every SLocEntry in the translation unit, twice
+        // per `#define` -- see `MacroBody::cursor`.
+        CXSourceRange range = clang_getCursorExtent(b.cursor);
 
         CXToken* toks = nullptr;
         unsigned n = 0;
@@ -745,20 +746,41 @@ bool Stage1::refNameRange(CXCursor cursor, const std::string& sym_name, size_t& 
     // Measured on criu, this beats a hand-rolled identifier scan -- 73,950
     // exact ranges against 73,748, and an imprecise bucket 8x smaller.
     CXTranslationUnit tu = clang_Cursor_getTranslationUnit(cursor);
-    CXSourceLocation at = clang_getLocationForOffset(tu, start_file, start_off);
-    if (CXToken* tok = clang_getToken(tu, at)) {
+
+    // The token has to begin exactly where the name does, in the same file, or
+    // it is not the token we asked about.  That test is what lets the location
+    // be GUESSED cheaply first and only computed expensively on a miss.
+    auto token_end_at = [&](CXSourceLocation at, int32_t& out) {
+        CXToken* tok = clang_getToken(tu, at);
+        if (!tok) return false;
         CXSourceRange te = clang_getTokenExtent(tu, *tok);
         CXFile tf = nullptr;
         unsigned ts = 0, tend = 0;
         clang_getSpellingLocation(clang_getRangeStart(te), &tf, nullptr, nullptr, &ts);
         clang_getSpellingLocation(clang_getRangeEnd(te), nullptr, nullptr, nullptr, &tend);
         clang_disposeTokens(tu, tok, 1);
-        if (tf && clang_File_isEqual(tf, start_file) && ts == start_off &&
-            tend > start_off) {
-            out_end = static_cast<int32_t>(tend);
-            return true;
-        }
-    }
+        if (!tf || !clang_File_isEqual(tf, start_file) || ts != start_off ||
+            tend <= start_off)
+            return false;
+        out = static_cast<int32_t>(tend);
+        return true;
+    };
+
+    // The location already in hand costs nothing.  It is a RAW location
+    // though: inside a macro it is the expansion's and lexes somewhere else
+    // entirely, which the test above then rejects -- so it is an attempt, not a
+    // replacement.
+    if (token_end_at(clang_getRangeStart(nr), out_end)) return true;
+
+    // On a miss, build the location from the offset after all.  This is the
+    // expensive way round: `clang_getLocationForOffset` linear-scans every
+    // SLocEntry in the translation unit (see `MacroBody::cursor`), and once the
+    // macro-body path stopped using it, it was still 23% of the run --
+    // `SourceManager::translateFile` 16% plus `getFileIDLocal` 6.7% underneath
+    // it, profiling a kernel slice.  Reached only when the cheap guess missed,
+    // and the answer is the same either way.
+    if (token_end_at(clang_getLocationForOffset(tu, start_file, start_off), out_end))
+        return true;
 
     // If clang will not lex there, give up rather than re-lex it ourselves.
     // `refRange` then falls through to the cursor's EXTENT, which is also

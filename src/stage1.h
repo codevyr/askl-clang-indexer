@@ -212,7 +212,25 @@ private:
     /// names.  Deferred to the end of `collectMacros` so that `tu_macros_` is
     /// complete first: `#define A B` is legal before `B` is defined.
     struct MacroBody {
-        CXFile file;
+        /// THE CURSOR, kept.  `linkMacroBodies` needs a source RANGE to
+        /// tokenise, and the only cheap way to get one is from the cursor that
+        /// already has it: `clang_getCursorExtent` is pure translation.
+        ///
+        /// Recovering the range from `(file, start, end)` instead costs
+        /// `clang_getLocationForOffset`, which is O(SLocEntries IN THE
+        /// TRANSLATION UNIT) -- `ASTUnit::getLocation` asks
+        /// `SourceManager::translateFileLineCol(File, 1, 1)`, and
+        /// `translateFile` linear-scans every entry looking for the file.  One
+        /// entry exists per inclusion AND per macro expansion, so with a
+        /// detailed preprocessing record a kernel translation unit has a very
+        /// large number of them, and this ran twice for every `#define` the
+        /// unit could see.  Measured: 81.5% of all cycles in that one scan
+        /// loop, 7.2 CPU-seconds per translation unit against under one to
+        /// parse it.
+        ///
+        /// A CXCursor is a small value valid for its translation unit's
+        /// lifetime, and `macro_bodies_` never outlives the unit it came from.
+        CXCursor cursor;
         size_t file_idx;
         unsigned start, end;   // the whole `#define` body extent
         std::string name;      // the macro being defined
