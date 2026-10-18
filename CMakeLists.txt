@@ -1,12 +1,29 @@
 cmake_minimum_required(VERSION 3.16)
 project(askl-clang-indexer LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # System dependencies
-find_package(Protobuf REQUIRED)
+#
+# CONFIG first, module mode as the fallback, because the two build environments
+# need different ones:
+#
+#   * nix provides protobuf 36.2, whose abseil dependency must be on the link
+#     line -- only the CONFIG package protobuf ships declares it, and
+#     CMake's bundled FindProtobuf builds a protobuf::libprotobuf with no
+#     interface dependencies, so linking fails on
+#     libabsl_log_internal_check_op.so.
+#
+#   * debian:trixie (docker/Dockerfile) packages a protobuf old enough not to
+#     need abseil, and ships NO protobuf-config.cmake at all -- requiring
+#     CONFIG there fails configure outright, which silently stopped every
+#     indexer image from rebuilding.
+find_package(Protobuf QUIET CONFIG)
+if(NOT Protobuf_FOUND)
+    find_package(Protobuf REQUIRED)
+endif()
 find_package(Threads REQUIRED)
 
 # Find libclang

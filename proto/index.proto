@@ -1,6 +1,8 @@
 syntax = "proto3";
 package askl.index;
 
+option go_package = "github.com/planetA/askl-golang-indexer/pkg/indexpb;indexpb";
+
 message Project {
   string project_name = 1;
   string root_path = 2;
@@ -39,17 +41,121 @@ message Symbol {
   SymbolType type = 4;          // Function, File, Module, or Directory
 }
 
+// A half-open [start, end) range within an object.  Used for the optional
+// finer spans of an instance; absence means "the indexer does not know".
+message Span {
+  int32 start = 1;
+  int32 end = 2;
+}
+
 message SymbolInstance {
   int64 symbol_local_id = 1;    // References Symbol.local_id
   InstanceType instance_type = 2;
+
+  // The EXTENT: the authoritative containment span, everything this instance
+  // owns.
   int32 start_offset = 3;
   int32 end_offset = 4;
+
+  reserved 5, 6;  // were local_id / parent_local_id
+
+  // Depth in the containment tree of this object, counting SYMBOL instances
+  // only (the intervening statements libclang shows are not symbols).  A
+  // direct child is at exactly parent + 1, which is what makes "direct
+  // children" a filter rather than a correlated NOT EXISTS over ranges.
+  //
+  // Nesting is what orders compiler-synthesised symbols, which ranges cannot:
+  // everything a macro generates shares one extent.  For
+  // `PMU_FORMAT_ATTR(event, ...)`, libclang reports `event_show` and
+  // `format_attr_event` as siblings with `__compiletime_assert_1121` inside
+  // `event_show`'s body -- identical extents, different depths.
+  //
+  int32 nesting_level = 7;
+
+  // DFS interval: the entry and exit numbers of a depth-first walk of this
+  // object's containment tree.  A descendant is exactly an instance whose
+  // dfs_enter lies strictly inside [dfs_enter, dfs_exit], which makes `unnest`
+  // one btree range scan rather than a recursive walk, and direct children the
+  // same query with `nesting_level = parent + 1` added.
+  //
+  // This is what orders compiler-synthesised symbols, which no source range
+  // can: everything a macro generates shares one extent.  Siblings get
+  // DISJOINT intervals even then -- for `PMU_FORMAT_ATTR(event, ...)`,
+  // `event_show` [2,5] contains `__compiletime_assert_1121` [3,4] while
+  // `format_attr_event` [6,7] does not.
+  //
+  // Number SPARSELY, in steps of 1024, so an ephemeral layer can insert an
+  // instance between two neighbours without renumbering anything.  That allows
+  // 10 successive inserts at one position (1024 -> 512 -> ... -> 1) before the
+  // object needs a local renumber; containment never crosses objects, so the
+  // blast radius is one file.
+  int64 dfs_enter = 11;
+  int64 dfs_exit = 12;
+
+  // FOLDING -- orthogonal to depth.  nesting_level says where a symbol sits;
+  // folding says whether a level is interesting by default.  An instance is
+  // folded when it exists only because of a macro expansion, which the indexer
+  // can tell because the spelling location differs from the expansion one.
+  //
+  // fold_depth counts the folded ancestors on the path from the object root, so
+  // `X { Y }` can be a plain equality in all three traversal modes:
+  //
+  //   direct    d.nesting_level = X.nesting_level + 1
+  //   unfolded  d.fold_depth = X.fold_depth + (X.folded ? 1 : 0)   <- default
+  //   unnest    nothing beyond the interval
+  //
+  // `folded` is carried separately from the depth because that last term needs
+  // to know whether the PARENT is a boundary -- which is what lets
+  // `mod { macro { func } }` step one level past a fold on purpose.
+  bool folded = 13;
+  int32 fold_depth = 14;
+
+  // Finer spans, each within [start_offset, end_offset).  All optional:
+  // `name` is absent for synthesised symbols that have no identifier in the
+  // source, `signature` for kinds that cannot be declared.
+  Span name = 8;
+  Span signature = 9;
+  Span content = 10;
 }
 
 message SymbolRef {
   int64 to_symbol_local_id = 1; // References Symbol.local_id (unique within project)
+
+  // The NAME span: the referencing token itself, where it is SPELLED.  For
+  // `printk(foo)` the argument ref spans `foo` and the invocation ref spans
+  // `printk`.  Spelling is what attributes each token to whoever typed it: a
+  // token substituted from a macro ARGUMENT is spelled at the call site and so
+  // belongs to the caller, while one written in the `#define` body is spelled
+  // in the header and belongs to the macro.
   int32 from_offset_start = 2;
   int32 from_offset_end = 3;
+
+  reserved 4, 5;  // were parent_local_id / an earlier nesting_level
+
+  // The FULL span: the whole referencing construct, e.g. `printk(foo)` where
+  // from_offset_* covers only `printk`.  Optional, display only.
+  Span full = 6;
+
+  // Depth of this reference, on the same scale as SymbolInstance.nesting_level:
+  // an instance owns the refs at its own depth + 1.
+  int32 nesting_level = 7;
+
+  // Position in the same DFS sequence as the instances of this object.  A ref
+  // is a point, not an interval: it is owned by the instance whose
+  // [dfs_enter, dfs_exit] contains this number at depth - 1.
+  int64 dfs_enter = 8;
+
+  // Fold state of the owning scope -- the instance whose interval contains
+  // this ref.  A reference at a call site is the caller's, at the caller's
+  // fold depth; one inside macro-GENERATED code sits a level deeper and is
+  // therefore hidden from `mod { func }` but reachable via
+  // `mod { macro { func } }`.
+  //
+  // References across macro layers do not need a fold level at all: they are
+  // layerwise, one edge per `#define`, so `handler -> DEV_PRINT -> printk` is
+  // a chain of ordinary edges.
+  bool folded = 9;
+  int32 fold_depth = 10;
 }
 
 enum SymbolScope {
@@ -74,10 +180,15 @@ enum InstanceType {
   INSTANCE_TYPE_UNSPECIFIED = 0;
   DEFINITION = 1;
   DECLARATION = 2;
+  // No producer emits EXPANSION any more: a macro USE is a SymbolRef naming
+  // the macro, so a macro's only instance is its `#define`.  Kept so that an
+  // index produced before that change still parses.
   EXPANSION = 3;
   SENTINEL = 4;
   CONTAINMENT = 5;
   SOURCE = 6;
   HEADER = 7;
   BUILD = 8;
+  INST_FILE = 9;
+  DOCUMENTATION = 10;
 }

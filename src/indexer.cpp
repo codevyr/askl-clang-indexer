@@ -7,7 +7,9 @@
 #include "stage2.h"
 #include "symbol_types.h"
 
+
 #include <algorithm>
+#include <tuple>
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -123,6 +125,8 @@ void Indexer::processTU(const CompileCommand& cmd) {
     auto results = stage1.takeResults();
     auto stage2_result = stage2.takeResults();
 
+
+
     // Merge stage2 refs into the appropriate FileData using stage1's file index,
     // deduplicating against existing refs (Stage2 can produce identical synthetic
     // refs when the same function is assigned to the same field via multiple
@@ -136,7 +140,12 @@ void Indexer::processTU(const CompileCommand& cmd) {
                        r.from_offset_start == ref.data.from_offset_start &&
                        r.from_offset_end == ref.data.from_offset_end;
             });
-            if (!dup) file_refs.push_back(ref.data);
+            if (!dup) {
+                // Left unnumbered, like every other ref: the post-merge
+                // numbering pass places all of them by the text they sit in.
+                ref.data.synthetic = true;
+                file_refs.push_back(ref.data);
+            }
         }
     }
 
@@ -153,19 +162,107 @@ void Indexer::processTU(const CompileCommand& cmd) {
         for (auto& file : results.files) {
             auto it = file_index_.find(file.filesystem_path);
             if (it != file_index_.end()) {
-                // Merge refs into existing FileData, deduplicating against what's already there
                 auto& existing = all_files_[it->second];
-                std::unordered_set<EntryKey, EntryKeyHash> seen;
-                seen.reserve(existing.refs.size());
-                for (auto& ref : existing.refs)
-                    seen.insert({ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end});
+
+                // UNION THE INSTANCES, do not truncate them.
+                //
+                // A file's declarations are a property of its TEXT, not of any
+                // translation unit, so the union over every TU that compiled it
+                // is bounded by the text -- identical declarations from two TUs
+                // are one declaration, which `InstKey` is what decides. Keeping
+                // only the first TU's set discarded the rest by arrival order,
+                // and because the SYMBOL table unions across TUs while this
+                // truncated, the two halves of one index disagreed: a symbol
+                // could be nameable and never locatable. Measured on criu, 129
+                // such orphans with no macro explanation (issue #7).
+                //
+                // Two passes, because a child can arrive before its parent.
+                // Pass one maps every incoming index to a merged one, inserting
+                // what is missing; pass two rewrites `stack_parent` through
+                // that map for the rows just inserted -- it is an index into
+                // the INCOMING vector and would otherwise point at a stranger.
+                // The map is KEPT across merges, not rebuilt from `existing`:
+                // rebuilding made one merge cost O(everything accumulated) and
+                // the run quadratic in how often a file is included.
+                auto& have = merged_inst_keys_[it->second];
+
+                std::vector<size_t> remap(file.instances.size(), 0);
+                std::vector<size_t> inserted;
+                for (size_t i = 0; i < file.instances.size(); ++i) {
+                    const InstanceData& in = file.instances[i];
+                    InstKey k{in.symbol_local_id, in.instance_type,
+                              in.start_offset, in.end_offset};
+                    auto [slot, fresh] = have.try_emplace(k, existing.instances.size());
+                    if (fresh) {
+                        existing.instances.push_back(in);
+                        inserted.push_back(i);
+                    } else {
+                        // Same declaration, seen twice. First writer wins for
+                        // every field -- except a span this TU knows and the
+                        // other did not: -1 means "the indexer does not know
+                        // one", and learning it is strictly better than
+                        // keeping the absence.
+                        InstanceData& e = existing.instances[slot->second];
+                        if (e.name_start < 0 && in.name_start >= 0) {
+                            e.name_start = in.name_start;
+                            e.name_end = in.name_end;
+                        }
+                        if (e.sig_start < 0 && in.sig_start >= 0) {
+                            e.sig_start = in.sig_start;
+                            e.sig_end = in.sig_end;
+                        }
+                        if (e.content_start < 0 && in.content_start >= 0) {
+                            e.content_start = in.content_start;
+                            e.content_end = in.content_end;
+                        }
+                    }
+                    remap[i] = slot->second;
+                }
+                for (size_t i : inserted) {
+                    int32_t sp = file.instances[i].stack_parent;
+                    existing.instances[remap[i]].stack_parent =
+                        (sp >= 0 && static_cast<size_t>(sp) < remap.size())
+                            ? static_cast<int32_t>(remap[static_cast<size_t>(sp)])
+                            : -1;
+                }
+                if (!inserted.empty()) {
+                    files_with_late_instances_.insert(it->second);
+                    late_instance_count_ += inserted.size();
+                }
+
+                // Merge refs, deduplicating against what's already there --
+                // again against a KEPT set, for the same reason.
+                auto& seen = merged_ref_keys_[it->second];
                 for (auto& ref : file.refs) {
-                    if (seen.insert({ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end}).second)
+                    if (seen.insert({ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end}).second) {
+                        // No renumbering: nothing is numbered yet.  A ref used
+                        // to arrive carrying numbers computed against this TU's
+                        // instances for the file, which were then discarded,
+                        // so it had to be recomputed against the set it would
+                        // actually live with.  Numbering the merged file once
+                        // removes the problem instead of correcting it.
                         existing.refs.push_back(ref);
+                    }
                 }
             } else {
-                file_index_[file.filesystem_path] = all_files_.size();
+                const size_t idx = all_files_.size();
+                file_index_[file.filesystem_path] = idx;
                 all_files_.push_back(std::move(file));
+                // Seed this file's dedup state from what it arrived with, once.
+                merged_inst_keys_.resize(all_files_.size());
+                merged_ref_keys_.resize(all_files_.size());
+                const FileData& added = all_files_[idx];
+                auto& ik = merged_inst_keys_[idx];
+                ik.reserve(added.instances.size());
+                for (size_t i = 0; i < added.instances.size(); ++i) {
+                    const InstanceData& e = added.instances[i];
+                    ik.emplace(InstKey{e.symbol_local_id, e.instance_type,
+                                       e.start_offset, e.end_offset}, i);
+                }
+                auto& rk = merged_ref_keys_[idx];
+                rk.reserve(added.refs.size());
+                for (const RefData& r : added.refs)
+                    rk.insert({r.to_symbol_local_id, r.from_offset_start, r.from_offset_end});
             }
         }
 
@@ -266,6 +363,11 @@ void Indexer::addFile(const std::string& abs_path) {
 
     file_index_[abs_path] = all_files_.size();
     all_files_.push_back(std::move(fd));
+    // Keep the merge's per-file state the same length as `all_files_`.  These
+    // files arrive after the translation-unit loop and are never merged into,
+    // but the two must not drift apart.
+    merged_inst_keys_.resize(all_files_.size());
+    merged_ref_keys_.resize(all_files_.size());
 }
 
 void Indexer::createModuleSymbols() {
@@ -336,6 +438,48 @@ void Indexer::run() {
     for (auto& w : workers) w.join();
     if (show_progress_) fprintf(stderr, "\n");
 
+    // NUMBER EACH FILE ONCE, now that every TU has contributed to it.
+    //
+    // This used to run per TU, inside `Stage1::process`, and that is what made
+    // a merged ref's numbers describe a numbering that no longer existed --
+    // `placeRefByText` was the correction. A file's containment tree is a
+    // property of its TEXT, so it can only be derived once the text's
+    // contributors are all in.
+    //
+    // Files are independent -- containment never crosses an object -- so this
+    // parallelises with no locking, and it is strictly less work than before:
+    // a header included by K translation units was numbered K times.
+    //
+    // BEFORE `addGitTrackedFiles` on purpose. Those files get one instance and
+    // no walk, so they keep `dfs_exit == 0`, which is exactly how
+    // `ProtoBuilder::ensureObjectRoot` recognises "never numbered".
+    {
+        // A canonical instance order first, so the numbers below are a function
+        // of what was found rather than of the order it arrived in.  Indexed by
+        // local id, which is dense from 1.
+        std::vector<SymbolOrder> order;
+        for (const SymbolInfo& si : symbol_table_.allSymbols()) {
+            if (si.local_id < 0) continue;
+            if (static_cast<size_t>(si.local_id) >= order.size())
+                order.resize(static_cast<size_t>(si.local_id) + 1);
+            order[static_cast<size_t>(si.local_id)] = SymbolOrder{si.name, si.scope};
+        }
+
+        std::atomic<size_t> next_file{0};
+        std::vector<std::thread> numberers;
+        for (int t = 0; t < threads_; t++) {
+            numberers.emplace_back([this, &next_file, &order]() {
+                while (true) {
+                    size_t idx = next_file.fetch_add(1);
+                    if (idx >= all_files_.size()) break;
+                    canonicaliseInstanceOrder(all_files_[idx], order);
+                    Stage1::numberTree(all_files_[idx]);
+                }
+            });
+        }
+        for (auto& w : numberers) w.join();
+    }
+
     if (!git_root_.empty()) {
         addGitTrackedFiles();
     }
@@ -346,6 +490,17 @@ void Indexer::run() {
 
     fprintf(stderr, "Files: %zu\n", all_files_.size());
     fprintf(stderr, "Symbols: %zu\n", symbol_table_.allSymbols().size());
+
+    // What the cross-TU union contributed. Always on, because the interesting
+    // number is a SURPRISING one: a file two TUs saw differently is usually an
+    // `#ifdef` only some of them satisfied, and both arms now co-exist in the
+    // index with nothing saying which build each belongs to. That is the
+    // accepted cost of describing the text rather than one configuration, and
+    // it is worth being able to see how much of it there is.
+    if (late_instance_count_ > 0)
+        fprintf(stderr, "Cross-TU: %zu files seen differently by 2+ TUs, "
+                        "%zu instances contributed by a later TU\n",
+                files_with_late_instances_.size(), late_instance_count_);
 }
 
 static void write_file(const std::string& path, const std::string& data) {

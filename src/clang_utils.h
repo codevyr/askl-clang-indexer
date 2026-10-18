@@ -5,6 +5,8 @@
 #include "symbol_types.h"
 
 #include <clang-c/Index.h>
+#include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <string>
 
@@ -33,21 +35,6 @@ inline std::string resolveCompoundName(CXCursor child, CXCursorKind expected_par
     return parent_name + "." + child_name;
 }
 
-// Overload for FieldDecl cursors: auto-detects struct or union parent.
-// Returns empty string when the parent is neither, is anonymous, or names are empty.
-inline std::string resolveFieldCompoundName(CXCursor field) {
-    CXCursor parent = clang_getCursorSemanticParent(field);
-    CXCursorKind pk = clang_getCursorKind(parent);
-    if (pk != CXCursor_StructDecl && pk != CXCursor_UnionDecl) return "";
-    if (clang_Cursor_isAnonymous(parent)) return "";
-    ClangString pn(clang_getCursorSpelling(parent));
-    std::string parent_name = pn.to_string();
-    if (parent_name.empty()) return "";
-    ClangString cn(clang_getCursorSpelling(field));
-    std::string child_name = cn.to_string();
-    if (child_name.empty()) return "";
-    return parent_name + "." + child_name;
-}
 
 // Canonicalize a path from clang_getFileName (resolve relative paths to absolute,
 // normalize away . and .. components in absolute paths)
@@ -78,6 +65,114 @@ inline std::string getCanonicalPath(CXFile file) {
     ClangString name(clang_getFileName(file));
     return canonicalizePath(name.to_string());
 }
+
+/// Rewrite the source paths clang embeds in a symbol's NAME so that one record
+/// has one name.
+///
+/// clang identifies a record with no tag by where it is written --
+/// `struct (anonymous at compel/include/uapi/asm/fpu.h:122:2)` -- and the path
+/// it prints is the PRESUMED one, i.e. whatever the `#include` resolved to.  A
+/// project reached through a symlink or compiled with both `-I./x` and `-Ix`
+/// therefore gets several names for one declaration.  criu has
+/// `compel/include/uapi/compel -> .`, so one union appeared under four names
+/// (`uapi/asm/sigframe.h` and `uapi/compel/asm/sigframe.h`, each with and
+/// without a `./`) -- 23 redundant symbols across 18 records.
+///
+/// File IDENTITY already avoids this: `getOrCreateFile` keys objects on
+/// `getCanonicalPath`, which is why no file is ever duplicated.  Only the names
+/// bypassed it.
+///
+/// Lexical normalisation is not enough -- measured on criu it merges 19 of the
+/// 23, missing exactly the symlinked spellings -- so the path is taken from the
+/// cursor's own `CXFile`, which costs no filesystem lookup and cannot depend on
+/// the process's working directory the way resolving a relative path would.
+///
+/// Rewrites only when the basename agrees, so a name whose presumed path names
+/// a different file than the cursor sits in is left exactly as clang gave it.
+/// Both spellings appear -- "anonymous" for a member with no name of its own,
+/// "unnamed" for a record named indirectly -- and the distinction is clang's to
+/// make, so only the path is touched.
+inline std::string canonicaliseEmbeddedPaths(const std::string& name, CXCursor cursor) {
+    static const char* kMarkers[] = {"(anonymous at ", "(unnamed at "};
+
+    size_t probe = std::string::npos;
+    for (const char* m : kMarkers) probe = std::min(probe, name.find(m));
+    if (probe == std::string::npos) return name;
+
+    CXFile cursor_file = nullptr;
+    clang_getExpansionLocation(clang_getCursorLocation(cursor), &cursor_file,
+                               nullptr, nullptr, nullptr);
+    if (!cursor_file) return name;
+    const std::string canon = getCanonicalPath(cursor_file);
+    if (canon.empty()) return name;
+    auto basename = [](const std::string& p) {
+        size_t slash = p.rfind('/');
+        return slash == std::string::npos ? p : p.substr(slash + 1);
+    };
+    const std::string canon_base = basename(canon);
+
+    std::string out;
+    size_t pos = 0;
+    while (pos < name.size()) {
+        size_t marker = std::string::npos, marker_len = 0;
+        for (const char* m : kMarkers) {
+            size_t at = name.find(m, pos);
+            if (at < marker) { marker = at; marker_len = std::strlen(m); }
+        }
+        if (marker == std::string::npos) { out += name.substr(pos); break; }
+
+        const size_t path_start = marker + marker_len;
+        const size_t close = name.find(')', path_start);
+        if (close == std::string::npos) { out += name.substr(pos); break; }
+
+        // `<path>:<line>:<column>` -- peel the two numbers off the end rather
+        // than scanning forward, so a path containing a colon stays intact.
+        const std::string seg = name.substr(path_start, close - path_start);
+        size_t c2 = seg.rfind(':');
+        size_t c1 = (c2 == std::string::npos || c2 == 0) ? std::string::npos
+                                                         : seg.rfind(':', c2 - 1);
+        auto all_digits = [](const std::string& t) {
+            if (t.empty()) return false;
+            for (unsigned char ch : t)
+                if (ch < '0' || ch > '9') return false;
+            return true;
+        };
+        const bool parsed = c1 != std::string::npos && c2 != std::string::npos &&
+                            all_digits(seg.substr(c1 + 1, c2 - c1 - 1)) &&
+                            all_digits(seg.substr(c2 + 1));
+        const std::string embedded = parsed ? seg.substr(0, c1) : std::string();
+
+        out += name.substr(pos, path_start - pos);
+        if (parsed && basename(embedded) == canon_base)
+            out += canon + seg.substr(c1);
+        else
+            out += seg;
+        out += ')';
+        pos = close + 1;
+    }
+    return out;
+}
+
+// Overload for FieldDecl cursors: auto-detects struct or union parent.
+// Returns empty string when the parent is neither, is anonymous, or names are empty.
+inline std::string resolveFieldCompoundName(CXCursor field) {
+    CXCursor parent = clang_getCursorSemanticParent(field);
+    CXCursorKind pk = clang_getCursorKind(parent);
+    if (pk != CXCursor_StructDecl && pk != CXCursor_UnionDecl) return "";
+    if (clang_Cursor_isAnonymous(parent)) return "";
+    ClangString pn(clang_getCursorSpelling(parent));
+    std::string parent_name = pn.to_string();
+    if (parent_name.empty()) return "";
+    ClangString cn(clang_getCursorSpelling(field));
+    std::string child_name = cn.to_string();
+    if (child_name.empty()) return "";
+    // An anonymous member's own spelling is its type's qualified name, so the
+    // compound name inherits a presumed path and needs the same canonicalising
+    // a bare record name does.
+    return canonicaliseEmbeddedPaths(parent_name, parent) + "." +
+           canonicaliseEmbeddedPaths(child_name, field);
+}
+
 
 // Get expansion range from a CXSourceRange. Returns false if the range spans
 // multiple files or is invalid. When clamp_zero_width is true, zero-width ranges
