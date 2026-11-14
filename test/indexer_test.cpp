@@ -554,15 +554,20 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "any_type.__type_a__"},
                 {"types.h", "any_type.__type_b__"},
                 {"types.h", "any_type.__type_c__"},
+                // The three `struct t` the list forward-declares.  Each ends
+                // on the argument `t`, so each used to collapse to zero width
+                // and be dropped; they span the invocation `ALL_TYPES`.
+                {"types.h", "type_a", 2, 398, 407},
+                {"types.h", "type_b", 2, 398, 407},
+                {"types.h", "type_c", 2, 398, 407},
                 {"types.h", "types.h"},
             }
         },
-        // Proves zero-width filtering is correct:
-        // - alpha (macro-generated StructDecl) has zero-width range → no instance
-        // - beta (source-level StructDecl) has proper range → has instance
-        // - TypeRefs to BOTH from real source code have proper ranges → both kept
-        // This shows the filter only drops macro-generated declarations,
-        // not references to macro-defined types.
+        // A declaration that ends on a macro argument:
+        // - alpha (`struct name`, generated, last token the argument) spans the
+        //   invocation `ALL_STRUCTS` -- it used to be zero-width and dropped
+        // - beta (source-level StructDecl) has its own range
+        // - TypeRefs to BOTH from real source code have proper ranges
         FixtureSpec{
             "macro_zero_width",
             {"main.c"},
@@ -604,6 +609,8 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "ALL_STRUCTS"},
                 {"types.h", "ONE_STRUCT"},
                 {"types.h", "TYPES_H"},
+                // alpha: generated, ends on the argument, spans `ALL_STRUCTS`.
+                {"types.h", "alpha", 2, 477, 488},
                 {"types.h", "beta"},
                 {"types.h", "beta.value"},
                 {"types.h", "types.h"},
@@ -2502,6 +2509,36 @@ TEST(ObjectRoots, APastedNameTheReplayCannotFollowKeepsItsWideReference) {
     using V = std::vector<std::pair<int32_t, std::string>>;
     EXPECT_EQ(uses["fn_a"], (V{{first, "MK(fn)"}})) << "the fallback, over the invocation";
     EXPECT_EQ(uses["fn_b"], (V{{second + 3, "fn"}})) << "the part the caller typed";
+}
+
+// A DECLARATION THAT ENDS ON A MACRO ARGUMENT STILL HAS AN EXTENT.
+//
+// `DEFINE_COUNTER(hits)` with `#define DEFINE_COUNTER(name) int name;`
+// declares `hits`, and the last token of that declaration is the argument.
+// libclang maps an extent's end to the END of the expansion when the last
+// token came from the macro's BODY, and leaves it alone when it came from an
+// ARGUMENT -- and an argument's expansion location is where the invocation
+// STARTS.  So the extent came out `[start, start)`, zero bytes wide, and the
+// declaration was dropped: `hits` was a symbol with no instance anywhere.
+//
+// The same thing truncated an extent that merely ended in an invocation:
+// `int plain = ID(7);` stopped at `ID`, with its initialiser outside it.
+//
+// What the declaration covers is the text through the end of that invocation.
+TEST(ObjectRoots, ADeclarationEndingOnAMacroArgumentKeepsItsExtent) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/macro_decl_ends_on_arg";
+    std::ifstream in(fixture_dir + "/main.c");
+    std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    auto result = runFixture("macro_decl_ends_on_arg", {"main.c"});
+    std::map<std::string, std::string> text;
+    for (const auto& i : result.instances)
+        if (i.file == "main.c" && i.symbol != "main.c")
+            text[i.symbol] = src.substr(i.start_offset, i.end_offset - i.start_offset);
+
+    EXPECT_EQ(text["hits"], "DEFINE_COUNTER(hits)");
+    EXPECT_EQ(text["plain"], "int plain = ID(7)");
+    EXPECT_EQ(text["box.width"], "FIELD(width)");
 }
 
 // A header included twice under different macro definitions.

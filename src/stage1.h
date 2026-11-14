@@ -373,6 +373,24 @@ private:
     /// works: libclang maps a macro end to the end of the expansion, so "the
     /// extent ends inside a macro" is never observable.
     bool isWhollyAnInvocation(size_t fi, int32_t start, int32_t end) const;
+
+    /// The extent of a declaration: where its text starts and ends in the
+    /// file it was written in.  False when it has none there.
+    ///
+    /// libclang's extent, with ONE correction.  An extent whose last token
+    /// came out of a macro's BODY already ends where the invocation ends.
+    /// One whose last token is a macro ARGUMENT does not: libclang leaves
+    /// that end inside the argument's expansion, and the expansion location
+    /// of anything in an expansion is where the invocation STARTS.  So
+    ///
+    ///     #define DEFINE_COUNTER(name) int name;
+    ///     DEFINE_COUNTER(hits)
+    ///
+    /// declared `hits` on `[start, start)` -- zero bytes, which was then
+    /// dropped as no extent at all, leaving a symbol with no instance -- and
+    /// `int plain = ID(7);` ended at `ID`, its initialiser outside it.  The
+    /// declaration ends where that invocation ends.
+    bool declExtent(CXCursor cursor, CXFile& out_file, unsigned& out_start, unsigned& out_end);
     /// Append `d` to `fi`, numbering it into the enclosing scope.  When
     /// `opens_scope`, it becomes the parent of whatever is created next until
     /// the matching closeScopesTo.

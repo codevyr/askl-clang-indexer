@@ -270,7 +270,7 @@ void Stage1::indexChildField(CXCursor child) {
 
     CXFile file;
     unsigned start, end;
-    if (getExpansionRange(child, file, start, end)) {
+    if (declExtent(child, file, start, end)) {
         size_t fi = getOrCreateFile(file);
         InstanceData d{sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION};
         fillSpans(child, file, d);
@@ -352,6 +352,36 @@ bool Stage1::isWhollyAnInvocation(size_t fi, int32_t start, int32_t end) const {
     auto next = file->second.upper_bound(start);
     if (next == file->second.begin()) return false;
     return std::prev(next)->second.end >= end;
+}
+
+bool Stage1::declExtent(CXCursor cursor, CXFile& out_file, unsigned& out_start,
+                        unsigned& out_end) {
+    CXSourceRange range = clang_getCursorExtent(cursor);
+    CXSourceLocation end = clang_getRangeEnd(range);
+    CXFile start_file = nullptr, end_file = nullptr;
+    clang_getExpansionLocation(clang_getRangeStart(range), &start_file, nullptr, nullptr,
+                               &out_start);
+    clang_getExpansionLocation(end, &end_file, nullptr, nullptr, &out_end);
+    if (!start_file || !end_file || !clang_File_isEqual(start_file, end_file)) return false;
+
+    // An end that is still inside an expansion is spelled somewhere other
+    // than where it expands: at the argument, or nowhere (a pasted token).
+    // Then `out_end` is the START of the outermost invocation it came from,
+    // and the declaration really ends where that invocation does.
+    CXFile spelled_file = nullptr;
+    unsigned spelled_at = 0;
+    clang_getSpellingLocation(end, &spelled_file, nullptr, nullptr, &spelled_at);
+    if (!spelled_file || !clang_File_isEqual(spelled_file, end_file) || spelled_at != out_end) {
+        auto file = invocation_spans_.find(getOrCreateFile(end_file));
+        if (file != invocation_spans_.end()) {
+            auto inv = file->second.find(static_cast<int32_t>(out_end));
+            if (inv != file->second.end()) out_end = static_cast<unsigned>(inv->second.end);
+        }
+    }
+
+    if (out_start >= out_end) return false;
+    out_file = start_file;
+    return true;
 }
 
 void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
@@ -1133,7 +1163,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         CXFile range_file;
         unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off)) {
+        if (declExtent(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
             InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
             fillSpans(cursor, range_file, d);
@@ -1184,7 +1214,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
             CXFile range_file;
             unsigned start_off, end_off;
-            if (getExpansionRange(cursor, range_file, start_off, end_off)) {
+            if (declExtent(cursor, range_file, start_off, end_off)) {
                 size_t fi = getOrCreateFile(range_file);
                 InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
                 fillSpans(cursor, range_file, d);
@@ -1215,7 +1245,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
                 auto [sym_id, _] = self->symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_DATA);
                 CXFile file;
                 unsigned start, end;
-                if (getExpansionRange(child, file, start, end)) {
+                if (self->declExtent(child, file, start, end)) {
                     size_t fi = self->getOrCreateFile(file);
                     self->addInstance(
                         fi, {sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION},
@@ -1239,7 +1269,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         CXFile range_file;
         unsigned start_off, end_off;
-        if (getExpansionRange(cursor, range_file, start_off, end_off)) {
+        if (declExtent(cursor, range_file, start_off, end_off)) {
             size_t fi = getOrCreateFile(range_file);
             InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
             fillSpans(cursor, range_file, d);
