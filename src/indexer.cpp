@@ -70,6 +70,31 @@ std::string Indexer::computeCommonAncestor(const std::vector<CompileCommand>& cm
     return common;
 }
 
+/// Two translation units saw the same reference; make one view of it that
+/// does not depend on which of them arrived first.
+///
+/// `pasted` and `typed_in_define` are each a reason the reference does NOT
+/// count towards unfolding its target, so a unit that saw it without one
+/// lifts it -- evidence that the symbol was written down wins, as for an
+/// instance.
+///
+/// The scope is where the reference was parsed, and breaks a tie between
+/// declarations with one extent (`Stage1::numberTree`).  Units normally agree
+/// on it.  When they do not -- one file compiled twice under different macros
+/// declares two functions on the same bytes, and each unit parsed the call
+/// inside its own -- neither is wrong and only one can have the reference, so
+/// the disagreement is recorded as no information and the tie falls back to
+/// the order of the tree.
+static void mergeRefView(RefData& kept, const RefData& in) {
+    kept.pasted = kept.pasted && in.pasted;
+    kept.typed_in_define = kept.typed_in_define && in.typed_in_define;
+    if (in.scope_idx < 0 || kept.scope_idx == RefData::kScopeDisputed) return;
+    if (kept.scope_idx == RefData::kNoScope)
+        kept.scope_idx = in.scope_idx;
+    else if (kept.scope_idx != in.scope_idx)
+        kept.scope_idx = RefData::kScopeDisputed;
+}
+
 void Indexer::processTU(const CompileCommand& cmd) {
     ClangIndex index;
 
@@ -207,6 +232,12 @@ void Indexer::processTU(const CompileCommand& cmd) {
                         // one", and learning it is strictly better than
                         // keeping the absence.
                         InstanceData& e = existing.instances[slot->second];
+                        // And except what folding is decided from, where
+                        // "first" would make the answer depend on arrival
+                        // order: evidence that the symbol was written down
+                        // wins, whichever unit holds it.
+                        e.generated = e.generated && in.generated;
+                        e.name_typed = e.name_typed || in.name_typed;
                         if (e.name_start < 0 && in.name_start >= 0) {
                             e.name_start = in.name_start;
                             e.name_end = in.name_end;
@@ -238,7 +269,18 @@ void Indexer::processTU(const CompileCommand& cmd) {
                 // again against a KEPT set, for the same reason.
                 auto& seen = merged_ref_keys_[it->second];
                 for (auto& ref : file.refs) {
-                    if (seen.insert({ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end}).second) {
+                    const EntryKey key{ref.to_symbol_local_id, ref.from_offset_start,
+                                       ref.from_offset_end};
+                    // Its scope is an index into the INCOMING instances, like
+                    // `stack_parent`, and moves the same way.
+                    if (ref.scope_idx >= 0)
+                        ref.scope_idx =
+                            static_cast<size_t>(ref.scope_idx) < remap.size()
+                                ? static_cast<int32_t>(remap[static_cast<size_t>(ref.scope_idx)])
+                                : RefData::kNoScope;
+                    auto [slot, fresh] =
+                        seen.try_emplace(key, static_cast<uint32_t>(existing.refs.size()));
+                    if (fresh) {
                         // No renumbering: nothing is numbered yet.  A ref used
                         // to arrive carrying numbers computed against this TU's
                         // instances for the file, which were then discarded,
@@ -246,6 +288,8 @@ void Indexer::processTU(const CompileCommand& cmd) {
                         // actually live with.  Numbering the merged file once
                         // removes the problem instead of correcting it.
                         existing.refs.push_back(ref);
+                    } else {
+                        mergeRefView(existing.refs[slot->second], ref);
                     }
                 }
             } else {
@@ -265,8 +309,12 @@ void Indexer::processTU(const CompileCommand& cmd) {
                 }
                 auto& rk = merged_ref_keys_[idx];
                 rk.reserve(added.refs.size());
-                for (const RefData& r : added.refs)
-                    rk.insert({r.to_symbol_local_id, r.from_offset_start, r.from_offset_end});
+                for (size_t i = 0; i < added.refs.size(); ++i) {
+                    const RefData& r = added.refs[i];
+                    rk.emplace(EntryKey{r.to_symbol_local_id, r.from_offset_start,
+                                        r.from_offset_end},
+                               static_cast<uint32_t>(i));
+                }
             }
         }
 
@@ -407,6 +455,69 @@ void Indexer::createDirectorySymbols() {
     }
 }
 
+void Indexer::foldSymbols() {
+    const std::vector<SymbolInfo> symbols = symbol_table_.allSymbols();
+    size_t n = 0;
+    for (const SymbolInfo& si : symbols)
+        if (si.local_id >= 0) n = std::max(n, static_cast<size_t>(si.local_id) + 1);
+    std::vector<int> type(n, 0);
+    for (const SymbolInfo& si : symbols)
+        if (si.local_id >= 0) type[static_cast<size_t>(si.local_id)] = si.type;
+
+    // WRITTEN DOWN IN NORMAL CODE, by any of the three ways there are.
+    std::vector<char> written(n, 0);
+    auto mark = [&](int64_t id) {
+        if (id >= 0 && static_cast<size_t>(id) < n) written[static_cast<size_t>(id)] = 1;
+    };
+    for (const FileData& f : all_files_) {
+        // 1. Declared with text of its own, or 2. its whole name typed where
+        //    a macro declares it.  A doc comment is text, but it is not a
+        //    declaration.
+        for (const InstanceData& d : f.instances) {
+            if (d.instance_type != INSTTYPE_DEFINITION &&
+                d.instance_type != INSTTYPE_DECLARATION)
+                continue;
+            if (!d.generated || d.name_typed) mark(d.symbol_local_id);
+        }
+        // 3. Its name typed in a reference.
+        for (const RefData& r : f.refs) {
+            // Stage2 parks a reference at a field's declaration to say which
+            // function the field holds.  Nobody typed the function there.
+            if (r.synthetic) continue;
+            if (r.typed_in_define) continue;
+            if (r.owner_idx < 0 || static_cast<size_t>(r.owner_idx) >= f.instances.size())
+                continue;
+            const InstanceData& in = f.instances[static_cast<size_t>(r.owner_idx)];
+            // The reference itself is in a `#define` body: the innermost
+            // thing around a token there is that macro's definition.
+            if (in.symbol_local_id >= 0 && static_cast<size_t>(in.symbol_local_id) < n &&
+                type[static_cast<size_t>(in.symbol_local_id)] == SYMTYPE_MACRO)
+                continue;
+            // A caller's part of a pasted name, inside a declaration that
+            // was itself generated: the generator referring to its own
+            // output, on the one argument it was given.
+            if (r.pasted && in.generated) continue;
+            mark(r.to_symbol_local_id);
+        }
+    }
+
+    // Only what code declares can be folded.  A macro is its `#define`, which
+    // is text by definition; files, directories and modules are containers.
+    std::vector<char> folded(n, 0);
+    size_t count = 0;
+    for (size_t id = 0; id < n; ++id) {
+        const int t = type[id];
+        const bool foldable = t == SYMTYPE_FUNCTION || t == SYMTYPE_TYPE ||
+                              t == SYMTYPE_DATA || t == SYMTYPE_FIELD;
+        if (foldable && !written[id]) {
+            folded[id] = 1;
+            ++count;
+        }
+    }
+    symbol_table_.setFolded(folded);
+    fprintf(stderr, "Folded symbols: %zu\n", count);
+}
+
 void Indexer::run() {
     if (root_path_.empty()) {
         root_path_ = computeCommonAncestor(compile_db_.commands());
@@ -483,6 +594,12 @@ void Indexer::run() {
         }
         for (auto& w : numberers) w.join();
     }
+
+    // WHAT IS LISTED BY DEFAULT, decided here because it can be decided
+    // nowhere earlier: it needs every reference placed (the numbering above)
+    // and every translation unit's view (the merge), since one file's
+    // reference unfolds a symbol another file's macro generated.
+    foldSymbols();
 
     if (!git_root_.empty()) {
         addGitTrackedFiles();

@@ -88,6 +88,9 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
             // this TU is known; see `linkMacroBodies`.
             self->macro_bodies_.push_back({cursor, fi, start_off, end_off, sname});
             self->macro_def_index_[sname] = self->macro_bodies_.size() - 1;
+            // Where normal code stops; see `insideDefine`.
+            self->define_spans_[fi][static_cast<int32_t>(start_off)] =
+                static_cast<int32_t>(end_off);
         }
     } else if (kind == CXCursor_MacroExpansion) {
         ClangString name(clang_getCursorSpelling(cursor));
@@ -116,27 +119,26 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         //     `func("main") { "printk" }` does -- printk has no instance in
         //     main either.  `ownerOfText` puts the reference in the enclosing
         //     function, which is where the expansion instance was nested by
-        //     range, at the same `nesting_level` and the same `fold_depth`.
-        //   - FOLDING.  A macro-generated symbol is folded on its own merit
-        //     (`isWhollyAnInvocation`), never by inheritance, and an expansion was
+        //     range.
+        //   - FOLDING.  Whether a generated symbol is listed is decided for
+        //     the symbol (`Indexer::foldSymbols`), and an expansion was
         //     already barred from being a parent -- measured on ucx, across
-        //     41,487 expansions not one DEFINITION was a child.  So no
-        //     `fold_depth` anywhere is computed through an expansion.
+        //     41,487 expansions not one DEFINITION was a child.
         //
         // What it buys: 41,490 of ucx's ~97,664 instances were expansions, 42%
-        // of the index, and 3,204 of the 3,483 instances at `fold_depth > 0`.
+        // of the index.
         //
         // The reference's own range is the macro's NAME; its `full` range is
-        // the whole invocation `some_macro(bar)`, the span a reader wants.  The
-        // argument `bar` stays the caller's because `ownerOfText` ignores
-        // folded instances -- and now because there is no instance here at all.
+        // the whole invocation `some_macro(bar)`, the span a reader wants.
         CXFile range_file;
         unsigned start_off, end_off;
         if (getSpellingRange(cursor, range_file, start_off, end_off)) {
             size_t fi = self->getOrCreateFile(range_file);
-            self->insertRef(fi, sym_id, sname, static_cast<int32_t>(start_off),
-                            static_cast<int32_t>(start_off + sname.size()),
-                            static_cast<int32_t>(start_off),
+            RefPlace at;
+            at.fi = fi;
+            at.start = static_cast<int32_t>(start_off);
+            at.end = static_cast<int32_t>(start_off + sname.size());
+            self->insertRef(at, sym_id, sname, static_cast<int32_t>(start_off),
                             static_cast<int32_t>(end_off));
             // The same span is what later decides whether a declaration has
             // any text of its own; see `isWhollyAnInvocation`.
@@ -232,10 +234,13 @@ void Stage1::linkMacroBodies(CXTranslationUnit tu) {
             if (!tok_file || tok_end < tok.size()) continue;
             const unsigned tok_start = tok_end - static_cast<unsigned>(tok.size());
             // No owner: `numberTree` resolves it from the text, and the
-            // narrowest unfolded instance containing a token inside a
-            // `#define` body is that macro's own definition.
-            insertRef(b.file_idx, it->second, tok, static_cast<int32_t>(tok_start),
-                      static_cast<int32_t>(tok_end));
+            // innermost instance containing a token inside a `#define` body
+            // is that macro's own definition.
+            RefPlace at;
+            at.fi = b.file_idx;
+            at.start = static_cast<int32_t>(tok_start);
+            at.end = static_cast<int32_t>(tok_end);
+            insertRef(at, it->second, tok);
         }
         clang_disposeTokens(tu, toks, n);
     }
@@ -274,7 +279,7 @@ void Stage1::indexChildField(CXCursor child) {
         size_t fi = getOrCreateFile(file);
         InstanceData d{sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION};
         fillSpans(child, file, d);
-        d.folded = isWhollyAnInvocation(fi, d.start_offset, d.end_offset);
+        markOrigin(child, fi, d);
         addInstance(fi, d, true);
         closeScopesTo(dfs_stack_.size() - 1);
     }
@@ -384,11 +389,84 @@ bool Stage1::declExtent(CXCursor cursor, CXFile& out_file, unsigned& out_start,
     return true;
 }
 
+bool Stage1::continuesAsInvocation(CXCursor cursor, size_t fi, int32_t start,
+                                   int32_t end) const {
+    auto file = invocation_spans_.find(fi);
+    if (file == invocation_spans_.end()) return false;
+    auto inv = file->second.find(start);
+    if (inv == file->second.end() || inv->second.end >= end) return false;
+
+    const std::vector<uint8_t>& content = result_.files[fi].content;
+    if (end <= 0 || static_cast<size_t>(end) > content.size()) return false;
+    int32_t open = inv->second.end;
+    while (open < end && (content[open] == ' ' || content[open] == '\t' ||
+                          content[open] == '\n' || content[open] == '\r'))
+        ++open;
+    if (open >= end || content[open] != '(' || content[end - 1] != ')') return false;
+
+    // Now ask clang whether `(` ... `)` is ONE list: the parenthesis that
+    // opens it is closed by the last token and not before.  A string or a
+    // comment holding a parenthesis is clang's to recognise, not ours.
+    CXTranslationUnit tu = clang_Cursor_getTranslationUnit(cursor);
+    CXFile cxfile = clang_getFile(tu, result_.files[fi].filesystem_path.c_str());
+    if (!cxfile) return false;
+    CXSourceRange range =
+        clang_getRange(clang_getLocationForOffset(tu, cxfile, static_cast<unsigned>(open)),
+                       clang_getLocationForOffset(tu, cxfile, static_cast<unsigned>(end)));
+    CXToken* toks = nullptr;
+    unsigned n = 0;
+    clang_tokenize(tu, range, &toks, &n);
+    if (!toks) return false;
+    int depth = 0;
+    bool one_list = n > 0;
+    for (unsigned i = 0; i < n && one_list; ++i) {
+        if (clang_getTokenKind(toks[i]) != CXToken_Punctuation) continue;
+        ClangString spell(clang_getTokenSpelling(tu, toks[i]));
+        const std::string t = spell.to_string();
+        if (t == "(") {
+            ++depth;
+        } else if (t == ")") {
+            --depth;
+            if (depth < 0 || (depth == 0 && i + 1 != n)) one_list = false;
+        }
+    }
+    clang_disposeTokens(tu, toks, n);
+    return one_list && depth == 0;
+}
+
+bool Stage1::insideDefine(size_t fi, int32_t offset) const {
+    auto file = define_spans_.find(fi);
+    if (file == define_spans_.end()) return false;
+    auto next = file->second.upper_bound(offset);
+    if (next == file->second.begin()) return false;
+    return std::prev(next)->second > offset;
+}
+
+bool Stage1::nameTypedInNormalCode(CXCursor cursor) {
+    CXSourceRange nr = clang_Cursor_getSpellingNameRange(cursor, 0, 0);
+    if (clang_Range_isNull(nr)) return false;
+    CXFile file = nullptr;
+    unsigned offset = 0;
+    clang_getSpellingLocation(clang_getRangeStart(nr), &file, nullptr, nullptr, &offset);
+    // No spelling file: the name was pasted together and lives in clang's
+    // scratch buffer.  Nobody typed it anywhere.
+    if (!file) return false;
+    return !insideDefine(getOrCreateFile(file), static_cast<int32_t>(offset));
+}
+
+void Stage1::markOrigin(CXCursor cursor, size_t fi, InstanceData& d) {
+    d.generated = isWhollyAnInvocation(fi, d.start_offset, d.end_offset) ||
+                  continuesAsInvocation(cursor, fi, d.start_offset, d.end_offset);
+    // A declaration with text of its own has been written down already; the
+    // name only decides anything for one that has none.
+    d.name_typed = d.generated && nameTypedInNormalCode(cursor);
+}
+
 void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
     // Record structure, number later.  `numberTree` assigns dfs_enter,
-    // dfs_exit, nesting_level and fold_depth together, so none of them can be
-    // set while another is forgotten -- which is exactly how non-scope
-    // instances ended up with dfs_exit == dfs_enter, able to contain nothing.
+    // dfs_exit and nesting_level together, so none of them can be set while
+    // another is forgotten -- which is exactly how non-scope instances ended
+    // up with dfs_exit == dfs_enter, able to contain nothing.
     d.stack_parent = stackParent(fi);
 
     // ONE DECLARATION IN THE TEXT IS ONE INSTANCE, however many times the text
@@ -407,7 +485,17 @@ void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
     auto [it, fresh] = index.try_emplace(
         InstKey{d.symbol_local_id, d.instance_type, d.start_offset, d.end_offset},
         instances.size());
-    if (fresh) instances.push_back(d);
+    if (fresh) {
+        instances.push_back(d);
+    } else {
+        // The same declaration parsed again may have been seen differently
+        // (a header re-included under other macros).  Evidence that it was
+        // written down wins, whichever parse brought it -- the same rule the
+        // cross-TU merge applies, so the answer does not depend on order.
+        InstanceData& kept = instances[it->second];
+        kept.generated = kept.generated && d.generated;
+        kept.name_typed = kept.name_typed || d.name_typed;
+    }
     // `opens_scope` now means only "later cursors nest inside this one", which
     // is all it ever should have meant.
     if (opens_scope) dfs_stack_.push_back({fi, it->second});
@@ -421,18 +509,26 @@ void Stage1::closeScopesTo(size_t mark) {
 
 int32_t ownerOfText(const FileData& f, int32_t start, int32_t end) {
     int32_t best = -1;
-    int64_t best_width = 0;
+    auto width = [](const InstanceData& d) {
+        return static_cast<int64_t>(d.end_offset) - d.start_offset;
+    };
     for (size_t i = 0; i < f.instances.size(); ++i) {
         const InstanceData& inst = f.instances[i];
-        if (inst.folded) continue; // a macro expansion owns no text
         if (inst.start_offset > start || inst.end_offset < end) continue;
-        int64_t width = static_cast<int64_t>(inst.end_offset) - inst.start_offset;
-        // Narrowest wins; ties broken by the earlier instance, so the choice
-        // does not depend on the order cursors happened to arrive in.
-        if (best < 0 || width < best_width) {
-            best = static_cast<int32_t>(i);
-            best_width = width;
+        bool better = best < 0;
+        if (!better) {
+            const InstanceData& b = f.instances[static_cast<size_t>(best)];
+            // Narrowest, then deepest, then earliest.  Every component is a
+            // property of the numbered tree, so the choice does not depend on
+            // the order cursors happened to arrive in.
+            if (width(inst) != width(b))
+                better = width(inst) < width(b);
+            else if (inst.nesting_level != b.nesting_level)
+                better = inst.nesting_level > b.nesting_level;
+            else
+                better = inst.dfs_enter < b.dfs_enter;
         }
+        if (better) best = static_cast<int32_t>(i);
     }
     return best;
 }
@@ -485,12 +581,19 @@ void canonicaliseInstanceOrder(FileData& f, const std::vector<SymbolOrder>& orde
     sorted.reserve(n);
     for (size_t i = 0; i < n; ++i) sorted.push_back(f.instances[perm[i]]);
     // `stack_parent` is an index into the vector being reordered, so it has to
-    // move with it.  A ref's owner_idx is assigned later, by `numberTree`.
+    // move with it, and so does a ref's `scope_idx`.  A ref's owner_idx is
+    // assigned later, by `numberTree`.
     for (InstanceData& d : sorted) {
         if (d.stack_parent >= 0 && static_cast<size_t>(d.stack_parent) < n)
             d.stack_parent = static_cast<int32_t>(rank[static_cast<size_t>(d.stack_parent)]);
         else
             d.stack_parent = -1;
+    }
+    for (RefData& r : f.refs) {
+        if (r.scope_idx < 0) continue; // none, or disputed: nothing to move
+        r.scope_idx = static_cast<size_t>(r.scope_idx) < n
+                          ? static_cast<int32_t>(rank[static_cast<size_t>(r.scope_idx)])
+                          : RefData::kNoScope;
     }
     f.instances.swap(sorted);
 }
@@ -519,8 +622,7 @@ void Stage1::numberTree(FileData& f) {
     // while `format_attr_event` is beside it.  An equal range is narrower than
     // any strict container, so (b) outranks (a) -- but ONLY for a stack
     // ancestor, which is what keeps `event_show` a child of the enclosing
-    // function at fold depth 0 instead of sliding under the macro and
-    // disappearing from `mod { func }`.
+    // function rather than of whatever else the invocation generated.
     std::vector<int32_t> parent(n, -1);
     for (size_t i = 0; i < n; ++i) {
         const InstanceData& x = f.instances[i];
@@ -539,11 +641,8 @@ void Stage1::numberTree(FileData& f) {
         for (size_t j = 0; j < n; ++j) {
             if (j == i) continue;
             const InstanceData& c = f.instances[j];
-            // A FOLDED INSTANCE IS STILL A PARENT, and must be: a
-            // macro-GENERATED symbol is a folded DEFINITION that does own its
-            // text, and `__compiletime_assert_1121` sits inside the generated
-            // `event_show` at fold_depth 1.  That is what keeps the assert out
-            // of `mod { func }` while `event_show` itself stays in.
+            // A GENERATED INSTANCE IS A PARENT LIKE ANY OTHER: containment is
+            // decided by extent and never by where the text came from.
             //
             // There used to be an exception here -- an EXPANSION was barred
             // from being a parent by range, because a macro passed as an
@@ -582,7 +681,6 @@ void Stage1::numberTree(FileData& f) {
         counter += kDfsStride;
         f.instances[static_cast<size_t>(r)].dfs_enter = counter;
         f.instances[static_cast<size_t>(r)].nesting_level = 0;
-        f.instances[static_cast<size_t>(r)].fold_depth = 0;
         ++numbered;
         st.push_back({r, 0});
         while (!st.empty()) {
@@ -596,7 +694,6 @@ void Stage1::numberTree(FileData& f) {
                 InstanceData& ci = f.instances[static_cast<size_t>(c)];
                 ci.dfs_enter = counter;
                 ci.nesting_level = p.nesting_level + 1;
-                ci.fold_depth = p.fold_depth + (p.folded ? 1 : 0);
                 ++numbered;
                 st.push_back({c, 0});
             } else {
@@ -623,16 +720,35 @@ void Stage1::numberTree(FileData& f) {
     // only while a reference sat inside exactly one scope.
     for (RefData& r : f.refs) {
         // EVERY reference is placed by TEXT, by the one rule in `ownerOfText`:
-        // the narrowest UNFOLDED instance containing it.  `insertRef` no longer
-        // guesses an owner from the AST scope -- it could not see a macro body,
-        // and the case that needed a scope (an argument token vs the macro's
-        // own expansion-site use of it) no longer exists.
+        // the innermost instance containing it.  `insertRef` no longer guesses
+        // an owner from the AST scope -- it could not see a macro body, and the
+        // case that needed a scope (an argument token vs the macro's own
+        // expansion-site use of it) no longer exists.
         r.owner_idx = ownerOfText(f, r.from_offset_start, r.from_offset_end);
         if (r.owner_idx < 0 || static_cast<size_t>(r.owner_idx) >= n) continue;
+        // ...EXCEPT AMONG IDENTICAL EXTENTS, which text cannot tell apart and
+        // the walk can -- rule (b) above, for a reference.  `DEFINE_PAIR(p)`
+        // generates `p_first` and `p_second` on one extent, and the call to
+        // `p_first` that `p_second` makes sits on the `p` both were made
+        // from.  It was parsed inside `p_second`, so that is where it sits.
+        //
+        // Only among equals: a scope with a DIFFERENT extent is never
+        // consulted, so this cannot move a reference out of the innermost
+        // extent that contains it.
+        if (r.scope_idx >= 0 && static_cast<size_t>(r.scope_idx) < n) {
+            const InstanceData& found = f.instances[static_cast<size_t>(r.owner_idx)];
+            for (int32_t s = r.scope_idx; s >= 0;
+                 s = f.instances[static_cast<size_t>(s)].stack_parent) {
+                const InstanceData& a = f.instances[static_cast<size_t>(s)];
+                if (a.start_offset == found.start_offset && a.end_offset == found.end_offset) {
+                    r.owner_idx = s;
+                    break;
+                }
+            }
+        }
         const InstanceData& o = f.instances[static_cast<size_t>(r.owner_idx)];
         r.dfs_enter = o.dfs_enter + 1;
         r.nesting_level = o.nesting_level + 1;
-        r.fold_depth = o.fold_depth + (o.folded ? 1 : 0);
     }
 }
 
@@ -772,8 +888,7 @@ const std::unordered_map<PasteStrings::Id, PasteSite>* Stage1::pastesAt(size_t f
     return &pastes;
 }
 
-bool Stage1::pastedNameSite(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
-                            int32_t& out_start, int32_t& out_end, bool& out_unspelled) {
+bool Stage1::pastedNameSite(CXCursor cursor, const std::string& sym_name, RefPlace& out) {
     CXSourceRange nr = clang_Cursor_getSpellingNameRange(cursor, 0, 0);
     if (clang_Range_isNull(nr)) return false;
     CXSourceLocation at = clang_getRangeStart(nr);
@@ -806,13 +921,16 @@ bool Stage1::pastedNameSite(CXCursor cursor, const std::string& sym_name, size_t
 
     // WHERE IT SITS, not where its part was typed.  The two differ for a name
     // completed by a macro passed as an argument (`PasteSite`); `typed` is
-    // then in a `#define` body and is what will say the name was never
+    // then in a `#define` body, which is what says the name was never
     // written in normal code.
     const PasteSite& found = it->second;
-    out_fi = found.site.file_idx;
-    out_start = found.site.start;
-    out_end = found.site.end;
-    out_unspelled = found.by_callback;
+    out.fi = found.site.file_idx;
+    out.start = found.site.start;
+    out.end = found.site.end;
+    out.unspelled = found.by_callback;
+    out.pasted = true;
+    out.typed_in_define =
+        found.typed.valid() && insideDefine(found.typed.file_idx, found.typed.start);
     return true;
 }
 
@@ -869,9 +987,10 @@ bool Stage1::refTextNamesSymbol(size_t file_idx, const std::string& sym_name,
     return false;
 }
 
-void Stage1::insertRef(size_t file_idx, int64_t sym_id, const std::string& sym_name,
-                       int32_t start, int32_t end, int32_t full_start, int32_t full_end,
-                       bool spelled) {
+void Stage1::insertRef(const RefPlace& at, int64_t sym_id, const std::string& sym_name,
+                       int32_t full_start, int32_t full_end) {
+    const size_t file_idx = at.fi;
+    const int32_t start = at.start, end = at.end;
     if (!file_ref_sets_[file_idx].insert({sym_id, start, end}).second)
         return;
     // The owner is left UNSET: `numberTree` resolves it by text, through
@@ -903,9 +1022,13 @@ void Stage1::insertRef(size_t file_idx, int64_t sym_id, const std::string& sym_n
     // builds a pasted name, `ENTRY` in `EACH(ENTRY)`.  The replay has already
     // shown that this token, applied to the list, produces the name -- which
     // is a stronger statement than the text resembling it.
-    if (spelled && !refTextNamesSymbol(file_idx, sym_name, start, end, /*warn=*/true)) return;
+    if (!at.unspelled && !refTextNamesSymbol(file_idx, sym_name, start, end, /*warn=*/true))
+        return;
 
     RefData r{sym_id, start, end};
+    r.scope_idx = stackParent(file_idx);
+    r.pasted = at.pasted;
+    r.typed_in_define = at.typed_in_define;
     r.full_start = full_start;
     r.full_end = full_end;
     result_.files[file_idx].refs.push_back(r);
@@ -1035,48 +1158,46 @@ bool Stage1::refNameRange(CXCursor cursor, const std::string& sym_name, size_t& 
 /// matters: the name range is PREFERRED, because for
 /// `ucs_offsetof(T, hugetlb_mode)` it is the only one that is right -- the
 /// extent is the chimera this whole change exists to remove.
-bool Stage1::refRange(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
-                      int32_t& out_start, int32_t& out_end, bool& out_unspelled) {
-    out_unspelled = false;
-    if (refNameRange(cursor, sym_name, out_fi, out_start, out_end) &&
-        refTextNamesSymbol(out_fi, sym_name, out_start, out_end, /*warn=*/false))
+bool Stage1::refRange(CXCursor cursor, const std::string& sym_name, RefPlace& out) {
+    out = RefPlace{};
+    if (refNameRange(cursor, sym_name, out.fi, out.start, out.end) &&
+        refTextNamesSymbol(out.fi, sym_name, out.start, out.end, /*warn=*/false))
         return true;
 
     // No token spells the name: a macro pasted it together.  Then the
     // reference sits on the part its caller typed, when a caller typed one.
     // Before the extent fallback below, which for such a name is the start of
     // an expression in some `#define` body and names nothing.
-    if (pastedNameSite(cursor, sym_name, out_fi, out_start, out_end, out_unspelled))
+    RefPlace pasted;
+    if (pastedNameSite(cursor, sym_name, pasted)) {
+        out = pasted;
         return true;
+    }
 
     CXFile ef = nullptr;
     unsigned es = 0, ee = 0;
-    if (!getSpellingRange(cursor, ef, es, ee)) return out_start >= 0;
+    if (!getSpellingRange(cursor, ef, es, ee)) return out.start >= 0;
     size_t efi = getOrCreateFile(ef);
     if (!refTextNamesSymbol(efi, sym_name, static_cast<int32_t>(es),
                             static_cast<int32_t>(ee), /*warn=*/false))
-        return out_start >= 0;  // neither names it; keep the name range and let
+        return out.start >= 0;  // neither names it; keep the name range and let
                                 // `insertRef` warn about the one we chose
-    out_fi = efi;
-    out_start = static_cast<int32_t>(es);
-    out_end = static_cast<int32_t>(ee);
+    out.fi = efi;
+    out.start = static_cast<int32_t>(es);
+    out.end = static_cast<int32_t>(ee);
     return true;
 }
 
 bool Stage1::placesReference(CXCursor cursor, const std::string& name) {
-    size_t fi = 0;
-    int32_t start = -1, end = -1;
-    bool unspelled = false;
-    return refRange(cursor, name, fi, start, end, unspelled) &&
-           (unspelled || refTextNamesSymbol(fi, name, start, end, /*warn=*/false));
+    RefPlace at;
+    return refRange(cursor, name, at) &&
+           (at.unspelled || refTextNamesSymbol(at.fi, name, at.start, at.end, /*warn=*/false));
 }
 
 void Stage1::addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name) {
-    size_t fi;
-    int32_t spelling_start, spelling_end;
-    spelling_start = -1;
-    bool unspelled = false;
-    if (refRange(cursor, sym_name, fi, spelling_start, spelling_end, unspelled)) {
+    RefPlace at;
+    if (refRange(cursor, sym_name, at)) {
+        const size_t fi = at.fi;
         // The FULL span is the whole referencing construct -- `foo(a, b)` where
         // the name span covers only `foo`.  Display only; ownership comes from
         // the DFS position.  Absent when the construct straddles files, which
@@ -1092,8 +1213,7 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name
             full_start = static_cast<int32_t>(fs);
             full_end = static_cast<int32_t>(fe);
         }
-        insertRef(fi, sym_id, sym_name, spelling_start, spelling_end, full_start,
-                  full_end, /*spelled=*/!unspelled);
+        insertRef(at, sym_id, sym_name, full_start, full_end);
     }
 
     // NO EXPANSION-SITE REFERENCE.  There used to be a second reference here,
@@ -1167,10 +1287,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             size_t fi = getOrCreateFile(range_file);
             InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
             fillSpans(cursor, range_file, d);
-            // A declaration the preprocessor produced is a fold boundary: it is
-            // still a real symbol of this module, but what IT contains is macro
-            // plumbing and stays out of reach by default.
-            d.folded = isWhollyAnInvocation(fi, d.start_offset, d.end_offset);
+            markOrigin(cursor, fi, d);
             addInstance(fi, d, true);
             addDocComment(cursor, sym_id, fi);
         }
@@ -1218,7 +1335,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
                 size_t fi = getOrCreateFile(range_file);
                 InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
                 fillSpans(cursor, range_file, d);
-                d.folded = isWhollyAnInvocation(fi, d.start_offset, d.end_offset);
+                markOrigin(cursor, fi, d);
                 addInstance(fi, d, true);
                 addDocComment(cursor, sym_id, fi);
             }
@@ -1247,9 +1364,10 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
                 unsigned start, end;
                 if (self->declExtent(child, file, start, end)) {
                     size_t fi = self->getOrCreateFile(file);
-                    self->addInstance(
-                        fi, {sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION},
-                        false);
+                    InstanceData d{sym_id, static_cast<int32_t>(start),
+                                   static_cast<int32_t>(end), INSTTYPE_DEFINITION};
+                    self->markOrigin(child, fi, d);
+                    self->addInstance(fi, d, false);
                 }
                 return CXChildVisit_Continue;
             }, this);
@@ -1273,10 +1391,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             size_t fi = getOrCreateFile(range_file);
             InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
             fillSpans(cursor, range_file, d);
-            // A declaration the preprocessor produced is a fold boundary: it is
-            // still a real symbol of this module, but what IT contains is macro
-            // plumbing and stays out of reach by default.
-            d.folded = isWhollyAnInvocation(fi, d.start_offset, d.end_offset);
+            markOrigin(cursor, fi, d);
             addInstance(fi, d, true);
             addDocComment(cursor, sym_id, fi);
         }

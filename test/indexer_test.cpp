@@ -1747,8 +1747,8 @@ TEST(ObjectRoots, OneRecordReachedTwoWaysIsOneSymbol) {
 // the object -- followed whichever translation unit contributed each row first.
 // Measured on criu before `canonicaliseInstanceOrder`: reversing 211
 // translation units moved 2,953 instances and 3,006 references to different
-// numbers, while not one of 34,018 instances changed `nesting_level`,
-// `fold_depth` or `folded`.  Nothing was wrong with the graph; it just could
+// numbers, while not one of 34,018 instances changed `nesting_level`.
+// Nothing was wrong with the graph; it just could
 // not be reproduced, which rules out diffing two indices or addressing a row by
 // position across a reindex.
 //
@@ -1778,13 +1778,13 @@ TEST(ObjectRoots, NumberingDoesNotDependOnTuOrder) {
                 auto& s = sym[i.symbol_local_id];
                 inst_of[run][{f.module_path, s.first, s.second, i.instance_type,
                               i.start_offset, i.end_offset}] =
-                    {i.dfs_enter, i.dfs_exit, i.nesting_level, i.fold_depth, i.folded};
+                    {i.dfs_enter, i.dfs_exit, i.nesting_level, i.generated, i.name_typed};
             }
             for (const auto& r : f.refs) {
                 auto& s = sym[r.to_symbol_local_id];
                 ref_of[run][{f.module_path, s.first, s.second,
                              r.from_offset_start, r.from_offset_end}] =
-                    {r.dfs_enter, r.nesting_level, r.fold_depth};
+                    {r.dfs_enter, r.nesting_level, r.pasted};
             }
         }
     }
@@ -1890,7 +1890,6 @@ TEST(ObjectRoots, ARefMergedFromAnotherTuIsRenumbered) {
         // One range, one owner: the numbers must agree.
         EXPECT_EQ(field_refs[0].dfs_enter, field_refs[1].dfs_enter);
         EXPECT_EQ(field_refs[0].nesting_level, field_refs[1].nesting_level);
-        EXPECT_EQ(field_refs[0].fold_depth, field_refs[1].fold_depth);
 
         // And that owner is the field they are attributed to, in THIS file's
         // surviving instances.
@@ -1994,6 +1993,97 @@ TEST(ObjectRoots, AnExpansionContainsNothing) {
 }
 
 static std::set<std::pair<std::string, std::string>> edgesOf(const char* fixture);
+
+namespace {
+/// One fixture, indexed and read back from the proto it would ship as.
+struct BuiltFixture {
+    askl::index::Project project;
+    std::unordered_map<int64_t, std::string> name;
+
+    /// (source, extra flags), one translation unit each, in this order -- for
+    /// a file compiled more than once.
+    struct Units {
+        std::vector<std::pair<std::string, std::string>> list;
+    };
+
+    BuiltFixture(const char* fixture, const Units& units) {
+        const auto& commands = units.list;
+        std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fixture;
+        TempDir temp_dir = makeTempDir();
+        {
+            std::ofstream out(temp_dir.path + "/compile_commands.json");
+            out << "[\n";
+            for (size_t i = 0; i < commands.size(); i++) {
+                out << (i ? ",\n" : "") << "  {\"directory\": \"" << fixture_dir
+                    << "\", \"command\": \"cc -c -I. " << commands[i].second << " "
+                    << commands[i].first << " -o u" << i << ".o\", \"file\": \""
+                    << fixture_dir << "/" << commands[i].first << "\"}";
+            }
+            out << "\n]\n";
+        }
+        build(fixture_dir, temp_dir.path);
+    }
+
+    BuiltFixture(const char* fixture, const std::vector<std::string>& sources) {
+        std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fixture;
+        TempDir temp_dir = makeTempDir();
+        generateCompileCommands(fixture_dir, temp_dir.path, sources);
+        build(fixture_dir, temp_dir.path);
+    }
+
+    void build(const std::string& fixture_dir, const std::string& commands_dir) {
+        Indexer indexer("test", commands_dir, fixture_dir, 1);
+        indexer.run();
+        auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                         indexer.allFiles(), 1);
+        EXPECT_TRUE(project.ParseFromString(built.project_data));
+        for (const auto& sym : project.symbols()) {
+            auto cut = sym.name().rfind('/');
+            name[sym.local_id()] =
+                cut == std::string::npos ? sym.name() : sym.name().substr(cut + 1);
+        }
+    }
+
+    /// The names of the symbols the index says are not listed by default.
+    std::set<std::string> folded() const {
+        std::set<std::string> out;
+        for (const auto& sym : project.symbols())
+            if (sym.folded()) out.insert(name.at(sym.local_id()));
+        return out;
+    }
+
+    /// (instance, target) for EVERY instance whose interval contains the
+    /// reference, not only the innermost: what `X { Y }` can reach.
+    std::set<std::pair<std::string, std::string>> reach() const {
+        std::set<std::pair<std::string, std::string>> out;
+        for (const auto& obj : project.objects())
+            for (const auto& ref : obj.refs())
+                for (const auto& i : obj.symbol_instances())
+                    if (i.dfs_enter() < ref.dfs_enter() && ref.dfs_enter() < i.dfs_exit())
+                        out.insert({name.at(i.symbol_local_id()),
+                                    name.at(ref.to_symbol_local_id())});
+        return out;
+    }
+
+    /// (innermost instance, target): where each reference sits.
+    std::set<std::pair<std::string, std::string>> sits() const {
+        std::set<std::pair<std::string, std::string>> out;
+        for (const auto& obj : project.objects())
+            for (const auto& ref : obj.refs()) {
+                const askl::index::SymbolInstance* owner = nullptr;
+                for (const auto& i : obj.symbol_instances())
+                    if (i.dfs_enter() < ref.dfs_enter() && ref.dfs_enter() < i.dfs_exit() &&
+                        (!owner || i.dfs_enter() > owner->dfs_enter()))
+                        owner = &i;
+                if (owner)
+                    out.insert({name.at(owner->symbol_local_id()),
+                                name.at(ref.to_symbol_local_id())});
+            }
+        return out;
+    }
+};
+} // namespace
+
 
 // A reference's range is the spelling of the token that NAMES it, and that one
 // rule places every case without a discriminator.
@@ -2154,46 +2244,21 @@ static std::set<std::pair<std::string, std::string>> edgesOf(const char* fixture
     return edges;
 }
 
-/// (symbol leaf name, instance type) -> folded, for every instance in main.c.
-static std::map<std::pair<std::string, int>, bool> foldedOf(const char* fixture) {
-    std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fixture;
-    TempDir temp_dir = makeTempDir();
-    generateCompileCommands(fixture_dir, temp_dir.path, {"main.c"});
-    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
-    indexer.run();
-    auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
-                                     indexer.allFiles(), 1);
-    askl::index::Project project;
-    EXPECT_TRUE(project.ParseFromString(built.project_data));
-
-    std::unordered_map<int64_t, std::string> name;
-    for (const auto& sym : project.symbols()) name[sym.local_id()] = sym.name();
-
-    std::map<std::pair<std::string, int>, bool> folded;
-    for (const auto& obj : project.objects()) {
-        const std::string& path = obj.module_path();
-        if (path.size() < 6 || path.compare(path.size() - 6, 6, "main.c") != 0) continue;
-        for (const auto& i : obj.symbol_instances())
-            folded[{name[i.symbol_local_id()], static_cast<int>(i.instance_type())}] =
-                i.folded();
-    }
-    return folded;
-}
-
 // A DEFINITION WHOSE NAME PASSES THROUGH A MACRO STILL CONTAINS ITS BODY.
 //
 // `PROFILE_FUNC(int, wrapped, (a), int a) { ... }` and `#define alias renamed`
 // / `int alias(int a) { ... }` both hand the function's NAME to the
 // preprocessor, and nothing else: the body is ordinary text the author typed.
 // Folding used to be decided by the name token alone, so both definitions came
-// out folded, a folded instance takes no reference, and every call written in
+// out folded, a folded instance took no reference, and every call written in
 // those bodies landed on the file.  On ucx that was `ucp_tag_send_nbx` with 71
 // references written inside it and none placed in it -- a call graph with the
 // function's callees hanging off `tag_send.c`.
 //
 // What a macro wholly generated is different, and is told apart by EXTENT: the
 // declaration's extent is the invocation and nothing more.  `DEFINE_SHOW(event)`
-// is that case and stays folded.
+// is that case, and `event_show`, which nobody wrote down, is the one symbol
+// here that is not listed by default.
 TEST(ObjectRoots, ADefinitionNamedThroughAMacroContainsItsBody) {
     EXPECT_EQ(edgesOf("macro_named_definition"),
               (std::set<std::pair<std::string, std::string>>{
@@ -2204,22 +2269,16 @@ TEST(ObjectRoots, ADefinitionNamedThroughAMacroContainsItsBody) {
                   // definition's own extent, so it is the definition's.
                   {"wrapped", "PROFILE_FUNC"},
                   {"renamed", "alias"},
-                  // Wholly generated: the invocation is the file's, and what
-                  // the generated body calls is named by the `#define`.
-                  {"main.c", "DEFINE_SHOW"},
+                  // Wholly generated.  The invocation is written inside the
+                  // extent of what it generates, by the same rule as above;
+                  // what the generated body calls is named by the `#define`.
+                  {"event_show", "DEFINE_SHOW"},
                   {"DEFINE_SHOW", "shown"},
               }));
 
-    auto folded = foldedOf("macro_named_definition");
-    const int def = static_cast<int>(askl::index::DEFINITION);
-    ASSERT_TRUE(folded.count({"plain", def}));
-    ASSERT_TRUE(folded.count({"wrapped", def}));
-    ASSERT_TRUE(folded.count({"renamed", def}));
-    ASSERT_TRUE(folded.count({"event_show", def}));
-    EXPECT_FALSE(folded.at(std::make_pair(std::string("plain"), def)));
-    EXPECT_FALSE(folded.at(std::make_pair(std::string("wrapped"), def))) << "its body is text the author typed";
-    EXPECT_FALSE(folded.at(std::make_pair(std::string("renamed"), def))) << "its body is text the author typed";
-    EXPECT_TRUE(folded.at(std::make_pair(std::string("event_show"), def))) << "its extent is the invocation alone";
+    BuiltFixture built("macro_named_definition", {"main.c"});
+    EXPECT_EQ(built.folded(), (std::set<std::string>{"event_show"}));
+    EXPECT_TRUE(built.reach().count({"main.c", "DEFINE_SHOW"}));
 }
 
 // ONE INVOCATION, SEVERAL DECLARATIONS, AND A BODY TYPED AFTER IT.
@@ -2233,15 +2292,9 @@ TEST(ObjectRoots, ABodyTypedAfterAGeneratingMacroBelongsToItsDeclaration) {
     EXPECT_TRUE(edges.count({"do_read", "helper"}));
     EXPECT_FALSE(edges.count({"main.c", "helper"}));
 
-    auto folded = foldedOf("macro_trailing_body");
-    const int def = static_cast<int>(askl::index::DEFINITION);
-    const int decl = static_cast<int>(askl::index::DECLARATION);
-    ASSERT_TRUE(folded.count({"do_read", def}));
-    ASSERT_TRUE(folded.count({"do_read", decl}));
-    ASSERT_TRUE(folded.count({"entry_read", def}));
-    EXPECT_FALSE(folded.at(std::make_pair(std::string("do_read"), def))) << "the body after the invocation is its own";
-    EXPECT_TRUE(folded.at(std::make_pair(std::string("do_read"), decl)));
-    EXPECT_TRUE(folded.at(std::make_pair(std::string("entry_read"), def)));
+    // `do_read` has a body the author typed; `entry_read` is the macro's.
+    BuiltFixture built("macro_trailing_body", {"main.c"});
+    EXPECT_EQ(built.folded(), (std::set<std::string>{"entry_read"}));
 }
 
 // A FUNCTION NAMED WITHOUT BEING CALLED IS STILL REFERENCED.
@@ -2265,8 +2318,11 @@ TEST(ObjectRoots, AFunctionUsedAsAValueIsReferenced) {
                   {"twice", "apply"},     // apply((void *)apply)
                   // INIT(other): `get_init` is wholly generated, so the
                   // argument is the file's, exactly as the invocation is.
-                  {"main.c", "INIT"},
-                  {"main.c", "other"},
+                  // `INIT(other)` generates `get_init`, whose extent is the
+                  // invocation: both the macro's name and its argument are
+                  // written inside it.
+                  {"get_init", "INIT"},
+                  {"get_init", "other"},
                   // The types, unchanged by any of this.
                   {"ret", "fn_t"},
                   {"addr", "fn_t"},
@@ -2539,6 +2595,147 @@ TEST(ObjectRoots, ADeclarationEndingOnAMacroArgumentKeepsItsExtent) {
     EXPECT_EQ(text["hits"], "DEFINE_COUNTER(hits)");
     EXPECT_EQ(text["plain"], "int plain = ID(7)");
     EXPECT_EQ(text["box.width"], "FIELD(width)");
+}
+
+// FOLDING IS WHAT IS LISTED BY DEFAULT, AND IT IS A PROPERTY OF THE SYMBOL.
+//
+// A symbol is listed unless nobody ever wrote it down in normal code -- text
+// outside every `#define` body.  Three things count as writing it down:
+//
+//   * declaring it with text of its own (`plain`, `struct x`, `user`);
+//   * typing its whole name where it is declared, though a macro wrote the
+//     rest (`DEFINE_COUNTER(idle)` -- which nothing refers to, so the
+//     declaration is all there is to go on);
+//   * typing its name, or the part of a pasted name a caller chooses, in a
+//     reference (`SHOW(event)` for `event_show`; `SHOW(far)` in ANOTHER
+//     translation unit for `far_show`).
+//
+// Everything else is the preprocessor's own business and is folded:
+//
+//   * `unused_show` -- pasted, and used by nobody;
+//   * `hidden_impl`, `check_failed` -- named only inside a `#define`;
+//   * `pair_first` -- referenced, but only by `pair_second`, which the same
+//     invocation generated.  The `pair` it was pasted from was typed to
+//     GENERATE, not to refer; a pasted reference inside a generated
+//     declaration is that declaration's plumbing;
+//   * `handle_alpha` -- referenced from `table` through `EACH(ENTRY)`, and the
+//     edge is there, but `alpha` was typed in the list's `#define`.  Where a
+//     reference SITS and where its name was TYPED are different facts, and
+//     folding follows the second.
+//
+// It is per symbol because the question is asked across the whole project:
+// `far_show` is unfolded by a file that neither declares nor defines it.
+TEST(ObjectRoots, ASymbolIsFoldedUnlessNormalCodeWroteItDown) {
+    BuiltFixture built("symbol_folding", {"main.c", "other.c"});
+    EXPECT_EQ(built.folded(),
+              (std::set<std::string>{"unused_show", "hidden_impl", "check_failed",
+                                     "pair_first", "pair_second", "handle_alpha",
+                                     "handle_beta"}));
+
+    // Folding hides; it does not disconnect.
+    auto reach = built.reach();
+    EXPECT_TRUE(reach.count({"table", "handle_alpha"}));
+    EXPECT_TRUE(reach.count({"pair_second", "pair_first"}));
+}
+
+// AMONG DECLARATIONS WITH ONE EXTENT, A REFERENCE SITS IN THE ONE IT WAS
+// PARSED INSIDE.
+//
+// Everything `DEFINE_PAIR(pair)` generates has the invocation as its extent,
+// and the call `pair_second` makes to `pair_first` sits on the `pair` both
+// were made from.  Text cannot say which of the two it is in.  Left to a
+// tie-break it lands in whichever sorts first -- `pair_first`, calling itself
+// -- and a family of generated functions that call each other (`KHASH_INIT`)
+// turns into one function calling all of them.
+//
+// The walk knows, exactly as it knows for an instance (`numberTree`, rule b).
+TEST(ObjectRoots, AReferenceAmongEqualExtentsSitsWhereItWasParsed) {
+    BuiltFixture built("symbol_folding", {"main.c", "other.c"});
+    auto sits = built.sits();
+    EXPECT_TRUE(sits.count({"pair_second", "pair_first"}));
+    EXPECT_FALSE(sits.count({"pair_first", "pair_first"}));
+}
+
+// ...UNLESS TWO TRANSLATION UNITS PARSED IT INSIDE DIFFERENT ONES.
+//
+// One file compiled twice, the second time with `-DVARIANT`, which renames
+// the function: `work` in one unit and `work_variant` in the other, on the
+// same bytes.  (ompi does this for its checksum and PMPI variants.)  The call
+// to `helper` is one token and so one reference, parsed inside `work` by one
+// unit and inside `work_variant` by the other.
+//
+// Neither is wrong and only one can have it.  Taking whichever unit arrived
+// first would make the index depend on thread timing, so a disagreement
+// between units is no information at all and the tie falls back to the
+// order of the tree -- the same answer in either order.
+TEST(ObjectRoots, AReferenceParsedInTwoPlacesDoesNotDependOnUnitOrder) {
+    using Units = BuiltFixture::Units;
+    BuiltFixture plain_first("dual_compile", Units{{{"main.c", ""}, {"main.c", "-DVARIANT"}}});
+    BuiltFixture variant_first("dual_compile", Units{{{"main.c", "-DVARIANT"}, {"main.c", ""}}});
+
+    // Both units contributed: the file holds both functions.
+    std::set<std::string> functions;
+    for (const auto& sym : plain_first.project.symbols())
+        if (sym.type() == askl::index::FUNCTION) functions.insert(sym.name());
+    ASSERT_TRUE(functions.count("work") && functions.count("work_variant"));
+
+    EXPECT_EQ(plain_first.sits(), variant_first.sits());
+    EXPECT_TRUE(plain_first.sits().count({"work", "helper"}))
+        << "the earlier of the two in the tree's order";
+}
+
+// AN INVOCATION THROUGH AN ALIAS IS STILL ONE INVOCATION.
+//
+// `#define CHECK REAL_CHECK` makes `CHECK(x)` an invocation of `REAL_CHECK`,
+// but not one clang records: its preprocessing record keeps `CHECK`, eight
+// characters wide, and drops the expansion of `REAL_CHECK` because its name
+// came out of another macro.  So what `CHECK(x)` generates extends past the
+// only invocation on record, and looked like a declaration with text of its
+// own.  The kernel's `#define dev_vdbg dev_dbg` unfolded 431 of its 71,277
+// `__compiletime_assert_N` this way.
+//
+// A macro name followed by exactly one parenthesised list is an invocation,
+// whoever's name it turns out to be.  `PREFIX int own(...) { ... }` also
+// starts on a macro and runs past it, and is not: what follows is not an
+// argument list, and its body is the author's.
+TEST(ObjectRoots, AnInvocationThroughAnAliasGeneratesWhatItGenerates) {
+    BuiltFixture built("macro_alias_invocation", {"main.c"});
+    EXPECT_EQ(built.folded(), (std::set<std::string>{"check_failed"}));
+}
+
+// CONTAINMENT NEVER ASKS ABOUT FOLDING.
+//
+// A reference sits in the innermost instance whose extent contains its text,
+// whatever that instance is.  `CHECK(sizeof(struct x) > 4)` generates the
+// declaration `check_failed`, whose extent is the whole invocation, so the
+// `struct x` typed in its argument sits in `check_failed` -- and, because that
+// is inside `user`, `user` still reaches `x`.
+//
+// There used to be a rule that a folded instance takes no reference, so that
+// the argument stayed "the caller's".  It is not needed: the caller's interval
+// contains the generated declaration's, and whether `check_failed` is LISTED
+// is the symbol's folding, a separate question with a separate answer.
+TEST(ObjectRoots, AReferenceSitsInTheInnermostInstanceFoldedOrNot) {
+    BuiltFixture built("symbol_folding", {"main.c", "other.c"});
+    auto sits = built.sits();
+    EXPECT_TRUE(sits.count({"check_failed", "x"}));
+    EXPECT_FALSE(sits.count({"user", "x"}));
+    auto reach = built.reach();
+    EXPECT_TRUE(reach.count({"user", "x"}));
+    EXPECT_TRUE(reach.count({"user", "CHECK"}));
+
+    // And nothing is written to the per-instance fold fields any more: an
+    // engine that still reads them shows everything and loses no edge.
+    for (const auto& obj : built.project.objects()) {
+        for (const auto& i : obj.symbol_instances()) {
+            EXPECT_FALSE(i.folded());
+            EXPECT_EQ(i.fold_depth(), 0);
+        }
+        for (const auto& r : obj.refs()) {
+            EXPECT_FALSE(r.folded());
+            EXPECT_EQ(r.fold_depth(), 0);
+        }
+    }
 }
 
 // A header included twice under different macro definitions.

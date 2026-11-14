@@ -16,11 +16,19 @@ std::pair<int64_t, bool> SymbolTable::getOrCreate(
 
     int64_t id = next_id_++;
     symbols_[key] = id;
-    symbol_list_.push_back({id, name, scope, type});
+    symbol_list_.push_back({id, name, scope, type, false});
     return {id, true};
 }
 
 std::vector<SymbolInfo> SymbolTable::allSymbols() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return symbol_list_;
+}
+
+void SymbolTable::setFolded(const std::vector<char>& folded_by_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (SymbolInfo& si : symbol_list_)
+        si.folded = si.local_id >= 0 &&
+                    static_cast<size_t>(si.local_id) < folded_by_id.size() &&
+                    folded_by_id[static_cast<size_t>(si.local_id)] != 0;
 }

@@ -32,14 +32,19 @@ struct InstanceData {
     int64_t dfs_enter = 0;
     int64_t dfs_exit = 0;
 
-    // FOLDING -- orthogonal to depth.  An instance is folded when it has no
-    // text of its own: its whole extent is one macro invocation (see
-    // `Stage1::isWhollyAnInvocation`).  fold_depth counts the folded
-    // ancestors above it.  `X { Y }` reaches descendants at the same
-    // fold_depth, so what a macro generates is one step out of reach by
-    // default and `mod { macro { func } }` steps into it on purpose.
-    bool folded = false;
-    int32_t fold_depth = 0;
+    // TRANSIENT, never on the wire: the two things a declaration says about
+    // whether its SYMBOL was written down in normal code, which is what
+    // folding is decided from (`Indexer::foldSymbols`).  Neither plays any
+    // part in containment.
+    //
+    // `generated`: the whole extent is one macro invocation, so the
+    // declaration has no text of its own (`Stage1::isWhollyAnInvocation`).
+    //
+    // `name_typed`: the token that names it was typed outside every `#define`
+    // body -- `lock` in `DEFINE_MUTEX(lock)`.  False for a name a macro body
+    // wrote or pasted together.
+    bool generated = false;
+    bool name_typed = false;
 
     // TRANSIENT, never on the wire: the instance this one was nested inside
     // according to the AST walk (nearest open scope in the same file), or -1.
@@ -67,10 +72,22 @@ struct RefData {
     int32_t nesting_level = 0;
     int64_t dfs_enter = 0;
 
-    // Fold state of the owning scope: the argument token in `printk(foo)`
-    // stays at the caller's fold depth, each expanded use sits one deeper.
-    bool folded = false;
-    int32_t fold_depth = 0;
+    // TRANSIENT, never on the wire: what the range says about the NAME, for
+    // folding.  A reference unfolds its target when its name was typed in
+    // normal code, and for most references the range is the name, so where
+    // the reference sits answers that.  Two kinds need saying separately:
+    //
+    // `pasted`: the range is the PART of a pasted name its caller chose
+    // (`send` in `CALL(send)`), or the macro handed to a list.  Inside a
+    // generated declaration such a reference is the generator's plumbing --
+    // `KHASH_INIT(x, ...)` makes functions that call each other, all on the
+    // one `x` -- and does not count.
+    //
+    // `typed_in_define`: that part was typed inside a `#define` body although
+    // the reference sits in normal code -- `EACH(ENTRY)`, where the list
+    // wrote `alpha` and `ENTRY` completed it.
+    bool pasted = false;
+    bool typed_in_define = false;
 
     // TRANSIENT, never on the wire: this reference was SYNTHESISED by Stage2
     // at a declaration site rather than read from a use site, so its range
@@ -80,6 +97,18 @@ struct RefData {
     // the flag lets a test state the same exemption instead of listing
     // fixtures.
     bool synthetic = false;
+
+    // TRANSIENT, never on the wire: the innermost scope of this file the walk
+    // was inside when it met the reference, as an index into the file's
+    // instances.  Like `InstanceData::stack_parent`, and used for the same
+    // single purpose: choosing among instances with IDENTICAL extents.
+    //
+    // Negative when there is none to go by: the reference was met outside
+    // every scope of this file, or two translation units parsed it inside
+    // different ones (`Indexer::processTU`).
+    static constexpr int32_t kNoScope = -1;
+    static constexpr int32_t kScopeDisputed = -2;
+    int32_t scope_idx = kNoScope;
 
     // TRANSIENT, never on the wire: the instance that owns this reference.
     // Set from the AST scope for an ordinary ref and from the enclosing macro
@@ -104,15 +133,24 @@ struct FileData {
     std::vector<RefData> refs;
 };
 
-/// THE ONE PLACEMENT RULE FOR REFERENCES: a reference belongs to the narrowest
-/// UNFOLDED instance whose extent contains its text.  Returns an index into
+/// THE ONE PLACEMENT RULE FOR REFERENCES: a reference sits in the INNERMOST
+/// instance whose extent contains its text.  Returns an index into
 /// `f.instances`, or -1 when nothing contains it.
 ///
-/// Unfolded, because *a macro expansion owns no text*: every byte at the call
-/// site of `foo(a)` -- the name, the parens, the argument -- was typed by the
-/// CALLER.  An expansion owns the symbols it generates, through the DFS
-/// interval, and no bytes at all.  So excluding folded instances is what keeps
-/// `DEV_PRINT(threshold)` from producing an edge `DEV_PRINT -> threshold`.
+/// Innermost is narrowest, then deepest in the tree, then earliest -- the
+/// order the engine uses to place a search hit, so the two agree on where a
+/// piece of text is.  The last two only matter among instances with one
+/// extent, which is everything a single macro invocation generates; there
+/// `numberTree` prefers the one the reference was parsed inside, which text
+/// cannot tell.  The file must already be numbered.
+///
+/// FOLDING PLAYS NO PART.  This used to skip a generated instance, on the
+/// argument that the bytes of `CHECK(sizeof(struct x))` were typed by the
+/// caller and so `struct x` must stay the caller's.  It does stay the
+/// caller's: the caller's interval contains the generated declaration's, and
+/// an edge is "the reference lies in my interval".  The skip added nothing to
+/// that, and it is what once put every reference written in a
+/// `PROFILE_FUNC(...) { body }` on the file.
 ///
 /// This replaced placement by AST scope (`Stage1::stackParent`), which could
 /// not see a macro body at all: the scope stack is consulted per FILE, and when
@@ -186,6 +224,19 @@ public:
     /// file alone, which is the point: a containment tree is a property of the
     /// text, and no single TU holds more than one view of it.
     static void numberTree(FileData& f);
+
+    /// Where a reference goes, and what its range says about the name.
+    struct RefPlace {
+        size_t fi = 0;
+        int32_t start = -1, end = -1;
+        /// The range is a macro that BUILDS the name rather than a part of it
+        /// (`PasteSite::by_callback`), so the text there cannot be expected
+        /// to spell the symbol.
+        bool unspelled = false;
+        /// See `RefData::pasted` and `RefData::typed_in_define`.
+        bool pasted = false;
+        bool typed_in_define = false;
+    };
 
     /// Would a reference to the symbol `name`, made by this cursor, get a
     /// range that names it -- the token that spells it, or for a pasted name
@@ -284,12 +335,7 @@ private:
     /// The range to give a reference whose naming token was pasted together:
     /// the part of the name its caller typed.  False when the name has a
     /// spelling of its own, or no caller chose any part of it.
-    ///
-    /// `out_unspelled`: the range is a macro that builds the name rather than
-    /// a part of it (see `PasteSite::by_callback`), so the text there cannot
-    /// be expected to spell the symbol.
-    bool pastedNameSite(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
-                        int32_t& out_start, int32_t& out_end, bool& out_unspelled);
+    bool pastedNameSite(CXCursor cursor, const std::string& sym_name, RefPlace& out);
 
     // --- DFS numbering -------------------------------------------------
     //
@@ -374,6 +420,24 @@ private:
     /// extent ends inside a macro" is never observable.
     bool isWhollyAnInvocation(size_t fi, int32_t start, int32_t end) const;
 
+    /// The other way a range is nothing but a macro invocation: it STARTS on
+    /// a recorded invocation and the rest of it is one parenthesised list.
+    ///
+    ///     #define dev_vdbg dev_dbg
+    ///     dev_vdbg(dev, "intr\n");
+    ///
+    /// invokes `dev_dbg`, but clang's preprocessing record keeps only
+    /// `dev_vdbg`, eight characters wide: an expansion whose NAME came out of
+    /// another macro is not recorded.  So what the line generates runs past
+    /// the only invocation on record, and read as a declaration with text of
+    /// its own.
+    ///
+    /// The list is read with clang's own tokens, and only once the bytes say
+    /// it could be one: the range must continue with `(` and end with `)`.
+    /// That excludes `PREFIX int f(void) { ... }` for free, which also starts
+    /// on a macro and runs past it.
+    bool continuesAsInvocation(CXCursor cursor, size_t fi, int32_t start, int32_t end) const;
+
     /// The extent of a declaration: where its text starts and ends in the
     /// file it was written in.  False when it has none there.
     ///
@@ -391,6 +455,18 @@ private:
     /// `int plain = ID(7);` ended at `ID`, its initialiser outside it.  The
     /// declaration ends where that invocation ends.
     bool declExtent(CXCursor cursor, CXFile& out_file, unsigned& out_start, unsigned& out_end);
+
+    /// Every `#define` this TU saw in a file, start -> end.  They cannot
+    /// nest, so "is this offset inside one" is a predecessor lookup.  Filled
+    /// by `macroVisitor`, so complete before the AST walk asks.
+    std::unordered_map<size_t, std::map<int32_t, int32_t>> define_spans_;
+    bool insideDefine(size_t fi, int32_t offset) const;
+    /// Was the token that names this declaration typed in normal code?  Not
+    /// when a `#define` body wrote it, and not when it was pasted together,
+    /// which leaves no token at all.
+    bool nameTypedInNormalCode(CXCursor cursor);
+    /// Record on `d` what its declaration says about folding.
+    void markOrigin(CXCursor cursor, size_t fi, InstanceData& d);
     /// Append `d` to `fi`, numbering it into the enclosing scope.  When
     /// `opens_scope`, it becomes the parent of whatever is created next until
     /// the matching closeScopesTo.
@@ -425,19 +501,17 @@ private:
     bool refNameRange(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
                       int32_t& out_start, int32_t& out_end);
     /// The name range when it names the symbol, else the cursor's extent.
-    bool refRange(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
-                  int32_t& out_start, int32_t& out_end, bool& out_unspelled);
+    bool refRange(CXCursor cursor, const std::string& sym_name, RefPlace& out);
     void addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name);
     /// Does the text at a reference's range actually spell the symbol it
     /// references?  A range that does not is describing a position it does not
     /// occupy, which is worse than the reference being absent.
     bool refTextNamesSymbol(size_t file_idx, const std::string& sym_name,
                             int32_t start, int32_t end, bool warn) const;
-    /// `spelled = false` is for the one kind of range that is right without
+    /// `at.unspelled` is for the one kind of range that is right without
     /// spelling its symbol: the macro that builds a pasted name.
-    void insertRef(size_t file_idx, int64_t sym_id, const std::string& sym_name,
-                   int32_t start, int32_t end,
-                   int32_t full_start = -1, int32_t full_end = -1, bool spelled = true);
+    void insertRef(const RefPlace& at, int64_t sym_id, const std::string& sym_name,
+                   int32_t full_start = -1, int32_t full_end = -1);
     void addDocComment(CXCursor cursor, int64_t sym_id, size_t file_idx);
     void indexChildField(CXCursor child);
     /// Fill in the name / signature / content spans for `cursor`, leaving any
