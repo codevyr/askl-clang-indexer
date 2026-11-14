@@ -2147,6 +2147,96 @@ static std::set<std::pair<std::string, std::string>> edgesOf(const char* fixture
     return edges;
 }
 
+/// (symbol leaf name, instance type) -> folded, for every instance in main.c.
+static std::map<std::pair<std::string, int>, bool> foldedOf(const char* fixture) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fixture;
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"main.c"});
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+    auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                     indexer.allFiles(), 1);
+    askl::index::Project project;
+    EXPECT_TRUE(project.ParseFromString(built.project_data));
+
+    std::unordered_map<int64_t, std::string> name;
+    for (const auto& sym : project.symbols()) name[sym.local_id()] = sym.name();
+
+    std::map<std::pair<std::string, int>, bool> folded;
+    for (const auto& obj : project.objects()) {
+        const std::string& path = obj.module_path();
+        if (path.size() < 6 || path.compare(path.size() - 6, 6, "main.c") != 0) continue;
+        for (const auto& i : obj.symbol_instances())
+            folded[{name[i.symbol_local_id()], static_cast<int>(i.instance_type())}] =
+                i.folded();
+    }
+    return folded;
+}
+
+// A DEFINITION WHOSE NAME PASSES THROUGH A MACRO STILL CONTAINS ITS BODY.
+//
+// `PROFILE_FUNC(int, wrapped, (a), int a) { ... }` and `#define alias renamed`
+// / `int alias(int a) { ... }` both hand the function's NAME to the
+// preprocessor, and nothing else: the body is ordinary text the author typed.
+// Folding used to be decided by the name token alone, so both definitions came
+// out folded, a folded instance takes no reference, and every call written in
+// those bodies landed on the file.  On ucx that was `ucp_tag_send_nbx` with 71
+// references written inside it and none placed in it -- a call graph with the
+// function's callees hanging off `tag_send.c`.
+//
+// What a macro wholly generated is different, and is told apart by EXTENT: the
+// declaration's extent is the invocation and nothing more.  `DEFINE_SHOW(event)`
+// is that case and stays folded.
+TEST(ObjectRoots, ADefinitionNamedThroughAMacroContainsItsBody) {
+    EXPECT_EQ(edgesOf("macro_named_definition"),
+              (std::set<std::pair<std::string, std::string>>{
+                  {"plain", "helper"},
+                  {"wrapped", "helper"},
+                  {"renamed", "helper"},
+                  // The invocation that spells the name is written inside the
+                  // definition's own extent, so it is the definition's.
+                  {"wrapped", "PROFILE_FUNC"},
+                  {"renamed", "alias"},
+                  // Wholly generated: the invocation is the file's, and what
+                  // the generated body calls is named by the `#define`.
+                  {"main.c", "DEFINE_SHOW"},
+                  {"DEFINE_SHOW", "shown"},
+              }));
+
+    auto folded = foldedOf("macro_named_definition");
+    const int def = static_cast<int>(askl::index::DEFINITION);
+    ASSERT_TRUE(folded.count({"plain", def}));
+    ASSERT_TRUE(folded.count({"wrapped", def}));
+    ASSERT_TRUE(folded.count({"renamed", def}));
+    ASSERT_TRUE(folded.count({"event_show", def}));
+    EXPECT_FALSE(folded.at(std::make_pair(std::string("plain"), def)));
+    EXPECT_FALSE(folded.at(std::make_pair(std::string("wrapped"), def))) << "its body is text the author typed";
+    EXPECT_FALSE(folded.at(std::make_pair(std::string("renamed"), def))) << "its body is text the author typed";
+    EXPECT_TRUE(folded.at(std::make_pair(std::string("event_show"), def))) << "its extent is the invocation alone";
+}
+
+// ONE INVOCATION, SEVERAL DECLARATIONS, AND A BODY TYPED AFTER IT.
+//
+// The shape of the kernel's `SYSCALL_DEFINE`: the macro emits a prototype and
+// a wrapper, and ends on the header of the function whose body the author
+// writes next.  Only that last declaration reaches past the invocation, so
+// only it has text of its own -- and the calls in the body are its calls.
+TEST(ObjectRoots, ABodyTypedAfterAGeneratingMacroBelongsToItsDeclaration) {
+    auto edges = edgesOf("macro_trailing_body");
+    EXPECT_TRUE(edges.count({"do_read", "helper"}));
+    EXPECT_FALSE(edges.count({"main.c", "helper"}));
+
+    auto folded = foldedOf("macro_trailing_body");
+    const int def = static_cast<int>(askl::index::DEFINITION);
+    const int decl = static_cast<int>(askl::index::DECLARATION);
+    ASSERT_TRUE(folded.count({"do_read", def}));
+    ASSERT_TRUE(folded.count({"do_read", decl}));
+    ASSERT_TRUE(folded.count({"entry_read", def}));
+    EXPECT_FALSE(folded.at(std::make_pair(std::string("do_read"), def))) << "the body after the invocation is its own";
+    EXPECT_TRUE(folded.at(std::make_pair(std::string("do_read"), decl)));
+    EXPECT_TRUE(folded.at(std::make_pair(std::string("entry_read"), def)));
+}
+
 // A header included twice under different macro definitions.
 //
 // `multi.h` has no include guard and holds one line, `DECL(alpha)`.  `a.c`

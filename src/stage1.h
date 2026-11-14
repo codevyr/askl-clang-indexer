@@ -5,6 +5,7 @@
 #include <atomic>
 #include <clang-c/Index.h>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,8 +30,9 @@ struct InstanceData {
     int64_t dfs_enter = 0;
     int64_t dfs_exit = 0;
 
-    // FOLDING -- orthogonal to depth.  An instance is folded when it exists
-    // only because of a macro expansion; fold_depth counts the folded
+    // FOLDING -- orthogonal to depth.  An instance is folded when it has no
+    // text of its own: its whole extent is one macro invocation (see
+    // `Stage1::isWhollyAnInvocation`).  fold_depth counts the folded
     // ancestors above it.  `X { Y }` reaches descendants at the same
     // fold_depth, so what a macro generates is one step out of reach by
     // default and `mod { macro { func } }` steps into it on purpose.
@@ -261,10 +263,38 @@ private:
     /// its own tree.
     int32_t stackParent(size_t fi) const;
 
-    /// True when the cursor exists only because of a macro expansion -- its
-    /// spelling location (where the text is) differs from its expansion
-    /// location (where the code lands).
-    static bool isMacroGenerated(CXCursor cursor);
+    /// Every macro invocation this TU saw in a file, as the [start, end) of
+    /// the whole `NAME(args)` text, keyed by start.  Only the OUTERMOST are
+    /// kept: an invocation written in another's arguments lies inside it and
+    /// can cover nothing the outer one does not.
+    ///
+    /// Filled by `macroVisitor`, so it is complete before the AST walk asks.
+    std::unordered_map<size_t, std::map<int32_t, int32_t>> invocation_spans_;
+    void noteInvocation(size_t fi, int32_t start, int32_t end);
+
+    /// True when [start, end) in file `fi` is nothing but a macro invocation,
+    /// which is what "the preprocessor generated this declaration" means.
+    ///
+    /// EXTENT, NOT NAME.  This used to ask where the declaration's NAME token
+    /// was spelled, and that answers a different question.  A name reaches a
+    /// declaration through a macro in two ordinary ways that generate nothing:
+    ///
+    ///     PROFILE_FUNC(int, wrapped, (a), int a) { return helper(a); }
+    ///
+    ///     #define alias renamed
+    ///     int alias(int a) { return helper(a); }
+    ///
+    /// Both bodies are text the author typed, and both definitions were folded
+    /// anyway.  A folded instance takes no reference (`ownerOfText`), so their
+    /// calls landed on the file: ucx's `ucp_tag_send_nbx` had 71 references
+    /// written inside it and none placed in it.
+    ///
+    /// The extent tells the two apart with no heuristic.  `DEFINE_SHOW(event)`
+    /// generates `event_show` and its extent IS the invocation; `wrapped` and
+    /// `renamed` extend past theirs, to the closing brace.  Nothing weaker
+    /// works: libclang maps a macro end to the end of the expansion, so "the
+    /// extent ends inside a macro" is never observable.
+    bool isWhollyAnInvocation(size_t fi, int32_t start, int32_t end) const;
     /// Append `d` to `fi`, numbering it into the enclosing scope.  When
     /// `opens_scope`, it becomes the parent of whatever is created next until
     /// the matching closeScopesTo.

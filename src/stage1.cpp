@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 
 Stage1::Stage1(SymbolTable& symbols, std::atomic<int64_t>& next_object_id)
     : symbols_(symbols), next_object_id_(next_object_id) {}
@@ -116,7 +117,7 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         //     function, which is where the expansion instance was nested by
         //     range, at the same `nesting_level` and the same `fold_depth`.
         //   - FOLDING.  A macro-generated symbol is folded on its own merit
-        //     (`isMacroGenerated`), never by inheritance, and an expansion was
+        //     (`isWhollyAnInvocation`), never by inheritance, and an expansion was
         //     already barred from being a parent -- measured on ucx, across
         //     41,487 expansions not one DEFINITION was a child.  So no
         //     `fold_depth` anywhere is computed through an expansion.
@@ -136,6 +137,10 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
                             static_cast<int32_t>(start_off + sname.size()),
                             static_cast<int32_t>(start_off),
                             static_cast<int32_t>(end_off));
+            // The same span is what later decides whether a declaration has
+            // any text of its own; see `isWhollyAnInvocation`.
+            self->noteInvocation(fi, static_cast<int32_t>(start_off),
+                                 static_cast<int32_t>(end_off));
         }
     }
 
@@ -268,7 +273,7 @@ void Stage1::indexChildField(CXCursor child) {
         size_t fi = getOrCreateFile(file);
         InstanceData d{sym_id, static_cast<int32_t>(start), static_cast<int32_t>(end), INSTTYPE_DEFINITION};
         fillSpans(child, file, d);
-        d.folded = isMacroGenerated(child);
+        d.folded = isWhollyAnInvocation(fi, d.start_offset, d.end_offset);
         addInstance(fi, d, true);
         closeScopesTo(dfs_stack_.size() - 1);
     }
@@ -327,21 +332,25 @@ int32_t Stage1::stackParent(size_t fi) const {
     return -1;
 }
 
-bool Stage1::isMacroGenerated(CXCursor cursor) {
-    CXSourceLocation loc = clang_getCursorLocation(cursor);
-    CXFile spell_file = nullptr, exp_file = nullptr;
-    unsigned spell_off = 0, exp_off = 0;
-    clang_getSpellingLocation(loc, &spell_file, nullptr, nullptr, &spell_off);
-    clang_getExpansionLocation(loc, &exp_file, nullptr, nullptr, &exp_off);
-    if (!exp_file) return false;
-    // No spelling file at all is the STRONGEST evidence, not the weakest: a
-    // ##-pasted identifier exists in no file, clang materialises it in a
-    // virtual <scratch space> buffer.  That is exactly `event_show` in
-    // PMU_FORMAT_ATTR(event, ...).
-    if (!spell_file) return true;
-    // Otherwise the two differ exactly when the code was written somewhere
-    // other than where it landed -- i.e. it came out of a macro.
-    return spell_off != exp_off || !clang_File_isEqual(spell_file, exp_file);
+void Stage1::noteInvocation(size_t fi, int32_t start, int32_t end) {
+    if (end <= start) return;
+    auto& spans = invocation_spans_[fi];
+    // Invocations nest or are disjoint -- one is written in another's
+    // arguments or it is not -- so the outermost ones are a set of disjoint
+    // intervals and "is this range inside one" is a single predecessor lookup.
+    auto next = spans.upper_bound(start);
+    if (next != spans.begin() && std::prev(next)->second >= end) return;
+    for (auto it = spans.lower_bound(start); it != spans.end() && it->first < end;)
+        it = spans.erase(it);
+    spans[start] = end;
+}
+
+bool Stage1::isWhollyAnInvocation(size_t fi, int32_t start, int32_t end) const {
+    auto file = invocation_spans_.find(fi);
+    if (file == invocation_spans_.end()) return false;
+    auto next = file->second.upper_bound(start);
+    if (next == file->second.begin()) return false;
+    return std::prev(next)->second >= end;
 }
 
 void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
@@ -925,7 +934,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             // A declaration the preprocessor produced is a fold boundary: it is
             // still a real symbol of this module, but what IT contains is macro
             // plumbing and stays out of reach by default.
-            d.folded = isMacroGenerated(cursor);
+            d.folded = isWhollyAnInvocation(fi, d.start_offset, d.end_offset);
             addInstance(fi, d, true);
             addDocComment(cursor, sym_id, fi);
         }
@@ -973,7 +982,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
                 size_t fi = getOrCreateFile(range_file);
                 InstanceData d{sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off), inst_type};
                 fillSpans(cursor, range_file, d);
-                d.folded = isMacroGenerated(cursor);
+                d.folded = isWhollyAnInvocation(fi, d.start_offset, d.end_offset);
                 addInstance(fi, d, true);
                 addDocComment(cursor, sym_id, fi);
             }
@@ -1031,7 +1040,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             // A declaration the preprocessor produced is a fold boundary: it is
             // still a real symbol of this module, but what IT contains is macro
             // plumbing and stays out of reach by default.
-            d.folded = isMacroGenerated(cursor);
+            d.folded = isWhollyAnInvocation(fi, d.start_offset, d.end_offset);
             addInstance(fi, d, true);
             addDocComment(cursor, sym_id, fi);
         }
