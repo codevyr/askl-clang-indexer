@@ -3,6 +3,7 @@
 #include "stage1.h" // for RefData
 
 #include <clang-c/Index.h>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -19,13 +20,18 @@ struct Stage2Result {
 
 class Stage2 {
 public:
-    explicit Stage2(SymbolTable& symbols);
+    /// Does Stage1 place a reference to the symbol `name` for this cursor, at
+    /// a token that names it?  See `Stage2::addFuncPtrRef`.
+    using PlacedByStage1 = std::function<bool(CXCursor, const std::string& name)>;
+
+    Stage2(SymbolTable& symbols, PlacedByStage1 placed_by_stage1);
 
     void process(CXTranslationUnit tu, const std::string& tu_filename);
     Stage2Result takeResults();
 
 private:
     SymbolTable& symbols_;
+    PlacedByStage1 placed_by_stage1_;
     Stage2Result result_;
     std::string tu_filename_;
 

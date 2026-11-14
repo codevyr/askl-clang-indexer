@@ -84,6 +84,7 @@ add_custom_command(
 add_library(askl-clang-indexer-lib STATIC
   src/compilation_db.cpp
   src/indexer.cpp
+  src/macro_paste.cpp
   src/stage1.cpp
   src/stage2.cpp
   src/symbol_table.cpp

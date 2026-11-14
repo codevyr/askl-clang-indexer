@@ -1,11 +1,13 @@
 #pragma once
 
 #include "dedup_keys.h"
+#include "macro_paste.h"
 
 #include <atomic>
 #include <clang-c/Index.h>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -185,6 +187,12 @@ public:
     /// text, and no single TU holds more than one view of it.
     static void numberTree(FileData& f);
 
+    /// Would a reference to the symbol `name`, made by this cursor, get a
+    /// range that names it -- the token that spells it, or for a pasted name
+    /// the part its caller typed?  The same decision `addRef` makes, without
+    /// recording anything.  Valid only while this unit's cursors are.
+    bool placesReference(CXCursor cursor, const std::string& name);
+
 private:
     SymbolTable& symbols_;
     std::atomic<int64_t>& next_object_id_;
@@ -239,6 +247,50 @@ private:
     };
     std::vector<MacroBody> macro_bodies_;
 
+    // --- Pasted names ----------------------------------------------------
+    //
+    // A reference whose name a macro built with `##` sits where the caller's
+    // part of that name was typed; see macro_paste.h for why and how.  What is
+    // kept here is what the replay reads: every invocation's cursor, so its
+    // tokens can be had without rebuilding a source range, and every
+    // definition by name, for the macros an expansion goes on to invoke.
+    //
+    // All of it is lazy.  Nothing is tokenised until a reference turns up
+    // whose name has no spelling, and then only the one invocation it came
+    // from, once.
+
+    /// Token spellings for this unit, interned; see `PasteStrings`.
+    PasteStrings paste_strings_;
+    /// Macro name -> index in `macro_bodies_` of its LATEST definition.
+    std::unordered_map<std::string, size_t> macro_def_index_;
+    /// The same, by interned name: -2 not asked yet, -1 not a macro.  This is
+    /// the question a replay asks of every identifier it meets.
+    std::vector<int32_t> macro_of_string_;
+    /// Parsed on first use, parallel to `macro_bodies_`; null when unreadable.
+    std::vector<std::unique_ptr<PasteMacro>> paste_macros_;
+    std::vector<char> paste_macro_tried_;
+    /// File -> invocation start offset -> the names that invocation pastes.
+    std::unordered_map<size_t, std::unordered_map<
+                                   int32_t, std::unordered_map<PasteStrings::Id, PasteSite>>>
+        paste_cache_;
+
+    /// The tokens of a macro invocation or definition, each with the place it
+    /// was typed.
+    std::vector<PasteToken> pasteTokens(CXCursor cursor);
+    std::unique_ptr<PasteMacro> parsePasteMacro(CXCursor definition);
+    const PasteMacro* pasteMacroAt(size_t index);
+    const PasteMacro* pasteMacroByName(PasteStrings::Id name);
+    const std::unordered_map<PasteStrings::Id, PasteSite>* pastesAt(size_t fi, int32_t start);
+    /// The range to give a reference whose naming token was pasted together:
+    /// the part of the name its caller typed.  False when the name has a
+    /// spelling of its own, or no caller chose any part of it.
+    ///
+    /// `out_unspelled`: the range is a macro that builds the name rather than
+    /// a part of it (see `PasteSite::by_callback`), so the text there cannot
+    /// be expected to spell the symbol.
+    bool pastedNameSite(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
+                        int32_t& out_start, int32_t& out_end, bool& out_unspelled);
+
     // --- DFS numbering -------------------------------------------------
     //
     // Numbers are SPARSE so an ephemeral layer can later insert an instance
@@ -282,14 +334,21 @@ private:
     /// its own tree.
     int32_t stackParent(size_t fi) const;
 
-    /// Every macro invocation this TU saw in a file, as the [start, end) of
-    /// the whole `NAME(args)` text, keyed by start.  Only the OUTERMOST are
-    /// kept: an invocation written in another's arguments lies inside it and
-    /// can cover nothing the outer one does not.
+    /// Every macro invocation this TU saw in a file, keyed by where it starts:
+    /// the end of the whole `NAME(args)` text, and the invocation's cursor.
+    /// Only the OUTERMOST are kept: an invocation written in another's
+    /// arguments lies inside it and can cover nothing the outer one does not.
     ///
     /// Filled by `macroVisitor`, so it is complete before the AST walk asks.
-    std::unordered_map<size_t, std::map<int32_t, int32_t>> invocation_spans_;
-    void noteInvocation(size_t fi, int32_t start, int32_t end);
+    /// The cursor is for `pastesAt`, which needs the invocation's tokens; it
+    /// is the outermost invocation there too, because that is the only one a
+    /// pasted name can be traced back to.
+    struct Invocation {
+        int32_t end;
+        CXCursor cursor;
+    };
+    std::unordered_map<size_t, std::map<int32_t, Invocation>> invocation_spans_;
+    void noteInvocation(size_t fi, int32_t start, int32_t end, CXCursor cursor);
 
     /// True when [start, end) in file `fi` is nothing but a macro invocation,
     /// which is what "the preprocessor generated this declaration" means.
@@ -349,16 +408,18 @@ private:
                       int32_t& out_start, int32_t& out_end);
     /// The name range when it names the symbol, else the cursor's extent.
     bool refRange(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
-                  int32_t& out_start, int32_t& out_end);
+                  int32_t& out_start, int32_t& out_end, bool& out_unspelled);
     void addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name);
     /// Does the text at a reference's range actually spell the symbol it
     /// references?  A range that does not is describing a position it does not
     /// occupy, which is worse than the reference being absent.
     bool refTextNamesSymbol(size_t file_idx, const std::string& sym_name,
                             int32_t start, int32_t end, bool warn) const;
+    /// `spelled = false` is for the one kind of range that is right without
+    /// spelling its symbol: the macro that builds a pasted name.
     void insertRef(size_t file_idx, int64_t sym_id, const std::string& sym_name,
                    int32_t start, int32_t end,
-                   int32_t full_start = -1, int32_t full_end = -1);
+                   int32_t full_start = -1, int32_t full_end = -1, bool spelled = true);
     void addDocComment(CXCursor cursor, int64_t sym_id, size_t file_idx);
     void indexChildField(CXCursor child);
     /// Fill in the name / signature / content spans for `cursor`, leaving any

@@ -2334,16 +2334,17 @@ TEST(ObjectRoots, ACallIsNotAlsoAValueReference) {
 
 // A FUNCTION STORED IN A FIELD BY A MACRO.
 //
-// Three ways the function's name can reach `.open = ...` through a macro, and
-// what records each:
+// Three ways the function's name can reach `.open = ...` through a macro.
+// Each is one reference, and it sits where the name was written:
 //
-//   * pasted (`_n##_open`): there is no token anywhere that spells it, so the
-//     only possible record is Stage2's, over the invocation that produced it;
-//   * written in the `#define` body: the body names it, and Stage2 still
-//     records the use at the invocation;
-//   * passed as an argument: the token is the caller's, written at the call
-//     site, and that token is the reference.  Stage2 stands down there --
-//     otherwise the one use is two references with different ranges.
+//   * passed as an argument: the token is the caller's, at the call site;
+//   * pasted (`_n##_open`): the part the caller typed, `ev`, at the call site;
+//   * written in the `#define` body: in the body, and the macro's.  The
+//     invocation site names nothing, so it has no reference of its own --
+//     `main.c -> STATIC_OPS -> fixed_open` is two edges, as it is for a call.
+//
+// The second pass used to add a reference over the whole invocation for the
+// last two, beside whatever the first pass placed.
 TEST(ObjectRoots, AFunctionStoredByAMacroIsReferencedOnce) {
     std::string fixture_dir = std::string(FIXTURE_DIR) + "/function_value_from_macro";
     TempDir temp_dir = makeTempDir();
@@ -2377,15 +2378,130 @@ TEST(ObjectRoots, AFunctionStoredByAMacroIsReferencedOnce) {
     }
 
     using V = std::vector<std::string>;
-    EXPECT_EQ(texts[std::make_pair(std::string("main.c"), std::string("ev_open"))],
-              V{"DEFINE_OPS(ev)"});
-    EXPECT_EQ(texts[std::make_pair(std::string("main.c"), std::string("fixed_open"))],
-              V{"STATIC_OPS"});
-    EXPECT_EQ(texts[std::make_pair(std::string("ops.h"), std::string("fixed_open"))],
-              V{"fixed_open"});
     EXPECT_EQ(texts[std::make_pair(std::string("main.c"), std::string("arg_open"))],
               V{"arg_open"})
         << "the argument token, and nothing wider beside it";
+    EXPECT_EQ(texts[std::make_pair(std::string("main.c"), std::string("ev_open"))], V{"ev"})
+        << "the part of the pasted name the caller typed";
+    EXPECT_EQ(texts[std::make_pair(std::string("ops.h"), std::string("fixed_open"))],
+              V{"fixed_open"});
+    EXPECT_EQ(texts[std::make_pair(std::string("main.c"), std::string("fixed_open"))], V{})
+        << "written by the macro's body, so the body's reference and not the call site's";
+}
+
+// A NAME BUILT BY `##` IS REFERENCED WHERE ITS CHOSEN PART WAS TYPED.
+//
+// `CALL(send(x))` with `#define CALL(a) mca_pml.pml_ ## a` refers to the field
+// `pml_send`, and no token anywhere spells that.  What the caller wrote is
+// `send` -- the part of the name that makes it this field and not `pml_recv`
+// -- and that is where the reference sits, so the edge is the caller's:
+// `direct -> pml_send`.
+//
+// It used to be the macro's, and by accident: the reference fell back to the
+// first byte of the expression in the `#define` body, and survived the range
+// guard only when that byte happened to occur in the name.  Every call site
+// of `CALL` merged onto that one byte, so `CALL` appeared to use every field
+// any caller had ever picked and no caller appeared to use any.
+//
+// The part is followed to wherever it was typed.  Through a wrapper that
+// passes its argument on (`OUTER`) that is still the call site; when a
+// wrapper's own body supplies it (`PROBE`), it is that body, and the edge is
+// the wrapper's.  When no parameter feeds the paste at all (`FIXED`), nobody
+// chose anything and the reference stays with the macro that wrote both
+// halves.
+//
+// `EACH(ENTRY)` is an X-macro list.  Its body types `alpha` and `beta`, but
+// that alone names nothing -- the same list applied to another macro would
+// declare, or stringify.  What makes `handle_alpha` a reference here is
+// `ENTRY`, the macro handed to the list, so the reference sits on `ENTRY` at
+// the call site and the edge is `table -> handle_alpha`, not the list's.
+//
+// `OP` is the two-level `CONCAT` idiom, which exists because an argument
+// beside `##` is pasted as written and anywhere else is expanded first:
+// `CONCAT(op_##name, SUFFIX)` builds `op_add_avx`, where pasting directly
+// would build `op_addSUFFIX`.  `LOG` has `, ## __VA_ARGS__`, which is not a
+// paste and must not swallow the comma the inner call's arguments need.
+TEST(ObjectRoots, APastedNameIsReferencedWhereItsPartWasTyped) {
+    EXPECT_EQ(edgesOf("macro_pasted_ref"),
+              (std::set<std::pair<std::string, std::string>>{
+                  {"direct", "CALL"},
+                  {"direct", "mod.pml_send"},
+                  {"layered", "OUTER"},
+                  {"layered", "mod.pml_recv"},
+                  {"via_body", "PROBE"},
+                  {"PROBE", "mod.pml_probe"},
+                  {"func", "kh_put"},
+                  {"func", "kh_put_tbl"},
+                  {"typed", "khash_t"},
+                  {"typed", "kh_tbl_t"},
+                  {"fixed", "FIXED"},
+                  {"FIXED", "mod.pml_send"},
+                  {"indirect", "OP"},
+                  {"indirect", "op_add_avx"},
+                  {"variadic", "LOG"},
+                  {"variadic", "log_at_info"},
+                  {"table", "EACH"},
+                  {"table", "handle_alpha"},
+                  {"table", "handle_beta"},
+                  // What each `#define` body names in plain tokens.
+                  {"OUTER", "CALL"},
+                  {"PROBE", "CALL"},
+                  {"OP", "CONCAT"},
+                  {"OP", "SUFFIX"},
+                  {"CONCAT", "CONCAT_"},
+                  {"CALL", "mca_pml"},
+                  {"FIXED", "mca_pml"},
+                  {"mca_pml", "mod"},
+              }));
+}
+
+// WHAT THE REPLAY CANNOT FOLLOW IS STILL RECORDED.
+//
+// The replay resolves a macro an expansion goes on to invoke by NAME, so it
+// reads the latest definition.  `SEL` is defined twice here; for the first
+// `MK(fn)` the replay builds `fn_b` where the compiler built `fn_a`, finds no
+// such name among the pastes, and has no token to put the reference on.
+//
+// A function stored in a field has a second record for exactly this: the use
+// over the whole construct.  It is the fallback, emitted only when there is
+// no token -- so `fn_a` is still referenced, once, and `fn_b`, which the
+// replay does follow, sits on the `fn` its caller typed and nowhere else.
+TEST(ObjectRoots, APastedNameTheReplayCannotFollowKeepsItsWideReference) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/macro_pasted_fallback";
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"main.c"});
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+    auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                     indexer.allFiles(), 1);
+    askl::index::Project project;
+    ASSERT_TRUE(project.ParseFromString(built.project_data));
+
+    std::unordered_map<int64_t, std::string> name;
+    for (const auto& sym : project.symbols()) name[sym.local_id()] = sym.name();
+
+    std::map<std::string, std::vector<std::pair<int32_t, std::string>>> uses;
+    for (const auto& obj : project.objects()) {
+        for (const auto& ref : obj.refs()) {
+            const std::string& to = name[ref.to_symbol_local_id()];
+            if (to != "fn_a" && to != "fn_b") continue;
+            std::string text = obj.content().substr(
+                ref.from_offset_start(), ref.from_offset_end() - ref.from_offset_start());
+            if (text.rfind("int (*open)", 0) == 0) continue; // the field's own edge
+            uses[to].push_back({ref.from_offset_start(), text});
+        }
+    }
+
+    std::string src;
+    for (const auto& obj : project.objects())
+        if (obj.content().find("struct ops first") != std::string::npos) src = obj.content();
+    const auto first = static_cast<int32_t>(src.find("MK(fn)"));
+    const auto second = static_cast<int32_t>(src.rfind("MK(fn)"));
+    ASSERT_NE(first, second);
+
+    using V = std::vector<std::pair<int32_t, std::string>>;
+    EXPECT_EQ(uses["fn_a"], (V{{first, "MK(fn)"}})) << "the fallback, over the invocation";
+    EXPECT_EQ(uses["fn_b"], (V{{second + 3, "fn"}})) << "the part the caller typed";
 }
 
 // A header included twice under different macro definitions.

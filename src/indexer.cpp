@@ -118,7 +118,11 @@ void Indexer::processTU(const CompileCommand& cmd) {
     stage1.process(tu, cmd.filename);
 
     // Stage 2: Function pointer assignment analysis
-    Stage2 stage2(symbol_table_);
+    // Stage2 asks Stage1 what it has already placed, so `stage1` must still
+    // hold this unit's state here -- its results are taken only below.
+    Stage2 stage2(symbol_table_, [&stage1](CXCursor cursor, const std::string& name) {
+        return stage1.placesReference(cursor, name);
+    });
     stage2.process(tu, cmd.filename);
 
     // Collect results

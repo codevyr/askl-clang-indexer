@@ -87,6 +87,7 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
             // The body is read for the macros it names once every macro in
             // this TU is known; see `linkMacroBodies`.
             self->macro_bodies_.push_back({cursor, fi, start_off, end_off, sname});
+            self->macro_def_index_[sname] = self->macro_bodies_.size() - 1;
         }
     } else if (kind == CXCursor_MacroExpansion) {
         ClangString name(clang_getCursorSpelling(cursor));
@@ -140,7 +141,7 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
             // The same span is what later decides whether a declaration has
             // any text of its own; see `isWhollyAnInvocation`.
             self->noteInvocation(fi, static_cast<int32_t>(start_off),
-                                 static_cast<int32_t>(end_off));
+                                 static_cast<int32_t>(end_off), cursor);
         }
     }
 
@@ -332,17 +333,17 @@ int32_t Stage1::stackParent(size_t fi) const {
     return -1;
 }
 
-void Stage1::noteInvocation(size_t fi, int32_t start, int32_t end) {
+void Stage1::noteInvocation(size_t fi, int32_t start, int32_t end, CXCursor cursor) {
     if (end <= start) return;
     auto& spans = invocation_spans_[fi];
     // Invocations nest or are disjoint -- one is written in another's
     // arguments or it is not -- so the outermost ones are a set of disjoint
     // intervals and "is this range inside one" is a single predecessor lookup.
     auto next = spans.upper_bound(start);
-    if (next != spans.begin() && std::prev(next)->second >= end) return;
+    if (next != spans.begin() && std::prev(next)->second.end >= end) return;
     for (auto it = spans.lower_bound(start); it != spans.end() && it->first < end;)
         it = spans.erase(it);
-    spans[start] = end;
+    spans[start] = {end, cursor};
 }
 
 bool Stage1::isWhollyAnInvocation(size_t fi, int32_t start, int32_t end) const {
@@ -350,7 +351,7 @@ bool Stage1::isWhollyAnInvocation(size_t fi, int32_t start, int32_t end) const {
     if (file == invocation_spans_.end()) return false;
     auto next = file->second.upper_bound(start);
     if (next == file->second.begin()) return false;
-    return std::prev(next)->second >= end;
+    return std::prev(next)->second.end >= end;
 }
 
 void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
@@ -605,6 +606,186 @@ void Stage1::numberTree(FileData& f) {
     }
 }
 
+std::vector<PasteToken> Stage1::pasteTokens(CXCursor cursor) {
+    std::vector<PasteToken> out;
+    CXTranslationUnit tu = clang_Cursor_getTranslationUnit(cursor);
+    CXSourceRange range = clang_getCursorExtent(cursor);
+    // One invocation, or one `#define`, is written in one file.
+    CXFile file = nullptr;
+    clang_getSpellingLocation(clang_getRangeStart(range), &file, nullptr, nullptr, nullptr);
+    if (!file) return out;
+    const auto fi = static_cast<uint32_t>(getOrCreateFile(file));
+
+    CXToken* toks = nullptr;
+    unsigned n = 0;
+    clang_tokenize(tu, range, &toks, &n);
+    if (!toks) return out;
+    out.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        ClangString spell(clang_getTokenSpelling(tu, toks[i]));
+        const std::string text = spell.to_string();
+        PasteToken t;
+        t.text = paste_strings_.intern(text);
+        const CXTokenKind kind = clang_getTokenKind(toks[i]);
+        t.ident = kind == CXToken_Identifier || kind == CXToken_Keyword;
+        // Anchored on the token's END, for the reason `linkMacroBodies` gives:
+        // a line splice belongs to the token after it, so the start can be
+        // two bytes early while the end is always the identifier's.
+        CXFile tok_file = nullptr;
+        unsigned tok_end = 0;
+        clang_getSpellingLocation(clang_getRangeEnd(clang_getTokenExtent(tu, toks[i])),
+                                  &tok_file, nullptr, nullptr, &tok_end);
+        if (tok_file && clang_File_isEqual(tok_file, file) && tok_end >= text.size()) {
+            t.origin.file_idx = fi;
+            t.origin.start = static_cast<int32_t>(tok_end - text.size());
+            t.origin.end = static_cast<int32_t>(tok_end);
+        }
+        out.push_back(t);
+    }
+    clang_disposeTokens(tu, toks, n);
+    return out;
+}
+
+std::unique_ptr<PasteMacro> Stage1::parsePasteMacro(CXCursor definition) {
+    std::vector<PasteToken> toks = pasteTokens(definition);
+    if (toks.empty()) return nullptr;
+
+    auto macro = std::make_unique<PasteMacro>();
+    macro->name = toks[0].text;
+    macro->function_like = clang_Cursor_isMacroFunctionLike(definition) != 0;
+    size_t i = 1;
+    if (macro->function_like) {
+        if (i >= toks.size() || toks[i].text != paste_strings_.lparen) return nullptr;
+        for (++i; i < toks.size() && toks[i].text != paste_strings_.rparen; ++i) {
+            if (toks[i].text == paste_strings_.ellipsis) {
+                // `args...` names the variadic parameter; a bare `...` is
+                // `__VA_ARGS__`.
+                const bool named = !macro->params.empty() && toks[i - 1].ident &&
+                                   toks[i - 1].text == macro->params.back();
+                if (!named) macro->params.push_back(paste_strings_.va_args);
+                macro->variadic = true;
+            } else if (toks[i].ident) {
+                macro->params.push_back(toks[i].text);
+            }
+        }
+        if (i >= toks.size()) return nullptr;
+        ++i; // the `)`
+    }
+    macro->body.assign(toks.begin() + static_cast<std::ptrdiff_t>(i), toks.end());
+    return macro;
+}
+
+const PasteMacro* Stage1::pasteMacroAt(size_t index) {
+    if (paste_macros_.size() < macro_bodies_.size()) {
+        paste_macros_.resize(macro_bodies_.size());
+        paste_macro_tried_.resize(macro_bodies_.size(), 0);
+    }
+    if (!paste_macro_tried_[index]) {
+        paste_macro_tried_[index] = 1;
+        paste_macros_[index] = parsePasteMacro(macro_bodies_[index].cursor);
+    }
+    return paste_macros_[index].get();
+}
+
+const PasteMacro* Stage1::pasteMacroByName(PasteStrings::Id name) {
+    if (macro_of_string_.size() <= name) macro_of_string_.resize(paste_strings_.size(), -2);
+    int32_t& slot = macro_of_string_[name];
+    if (slot == -2) {
+        auto it = macro_def_index_.find(paste_strings_.str(name));
+        slot = it == macro_def_index_.end() ? -1 : static_cast<int32_t>(it->second);
+    }
+    return slot < 0 ? nullptr : pasteMacroAt(static_cast<size_t>(slot));
+}
+
+const std::unordered_map<PasteStrings::Id, PasteSite>* Stage1::pastesAt(size_t fi,
+                                                                        int32_t start) {
+    auto& per_file = paste_cache_[fi];
+    auto hit = per_file.find(start);
+    if (hit != per_file.end()) return &hit->second;
+    // Cached even when empty: an invocation that pastes nothing a caller
+    // chose is asked about once per reference it generated.
+    auto& pastes = per_file[start];
+
+    auto file = invocation_spans_.find(fi);
+    if (file == invocation_spans_.end()) return &pastes;
+    auto inv = file->second.find(start);
+    if (inv == file->second.end()) return &pastes;
+    const CXCursor invocation = inv->second.cursor;
+
+    // The definition THIS invocation used, which a name lookup could get
+    // wrong: `#define X(a) ...` / `#undef X` / `#define X(a) ...` around a
+    // list is an ordinary idiom.  It is nearly always the latest one all the
+    // same, and then the parse is already in hand.
+    CXCursor definition = clang_getCursorReferenced(invocation);
+    if (clang_getCursorKind(definition) != CXCursor_MacroDefinition) return &pastes;
+    const PasteMacro* macro = nullptr;
+    std::unique_ptr<PasteMacro> earlier_definition;
+    {
+        ClangString def_name(clang_getCursorSpelling(definition));
+        auto latest = macro_def_index_.find(def_name.to_string());
+        if (latest != macro_def_index_.end() &&
+            clang_equalCursors(macro_bodies_[latest->second].cursor, definition)) {
+            macro = pasteMacroAt(latest->second);
+        } else {
+            earlier_definition = parsePasteMacro(definition);
+            macro = earlier_definition.get();
+        }
+    }
+    if (!macro) return &pastes;
+
+    std::vector<PasteToken> tokens = pasteTokens(invocation);
+    if (tokens.empty()) return &pastes;
+    tokens.erase(tokens.begin()); // the macro's own name
+
+    pastes = replayPastes(*macro, tokens, paste_strings_,
+                          [this](PasteStrings::Id name) { return pasteMacroByName(name); });
+    return &pastes;
+}
+
+bool Stage1::pastedNameSite(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
+                            int32_t& out_start, int32_t& out_end, bool& out_unspelled) {
+    CXSourceRange nr = clang_Cursor_getSpellingNameRange(cursor, 0, 0);
+    if (clang_Range_isNull(nr)) return false;
+    CXSourceLocation at = clang_getRangeStart(nr);
+
+    // A pasted identifier is the one kind of token with no spelling file:
+    // clang keeps it in a scratch buffer.
+    CXFile spell_file = nullptr;
+    clang_getSpellingLocation(at, &spell_file, nullptr, nullptr, nullptr);
+    if (spell_file) return false;
+
+    // What it does have is the OUTERMOST invocation it came out of, however
+    // many macros deep the paste itself was.
+    CXFile exp_file = nullptr;
+    unsigned exp_off = 0;
+    clang_getExpansionLocation(at, &exp_file, nullptr, nullptr, &exp_off);
+    if (!exp_file) return false;
+
+    const auto* pastes = pastesAt(getOrCreateFile(exp_file), static_cast<int32_t>(exp_off));
+    if (!pastes || pastes->empty()) return false;
+
+    // By leaf, as `refTextNamesSymbol` reads a name: `mod.pml_send` is
+    // written `pml_send`.  A name no replay ever built was never interned.
+    std::string leaf = sym_name;
+    auto cut = leaf.find_last_of("./");
+    if (cut != std::string::npos) leaf = leaf.substr(cut + 1);
+    PasteStrings::Id leaf_id = 0;
+    if (!paste_strings_.find(leaf, leaf_id)) return false;
+    auto it = pastes->find(leaf_id);
+    if (it == pastes->end()) return false;
+
+    // WHERE IT SITS, not where its part was typed.  The two differ for a name
+    // completed by a macro passed as an argument (`PasteSite`); `typed` is
+    // then in a `#define` body and is what will say the name was never
+    // written in normal code.
+    const PasteSite& found = it->second;
+    out_fi = found.site.file_idx;
+    out_start = found.site.start;
+    out_end = found.site.end;
+    out_unspelled = found.by_callback;
+    return true;
+}
+
 bool Stage1::refTextNamesSymbol(size_t file_idx, const std::string& sym_name,
                                 int32_t start, int32_t end, bool warn) const {
     const std::vector<uint8_t>& content = result_.files[file_idx].content;
@@ -659,7 +840,8 @@ bool Stage1::refTextNamesSymbol(size_t file_idx, const std::string& sym_name,
 }
 
 void Stage1::insertRef(size_t file_idx, int64_t sym_id, const std::string& sym_name,
-                       int32_t start, int32_t end, int32_t full_start, int32_t full_end) {
+                       int32_t start, int32_t end, int32_t full_start, int32_t full_end,
+                       bool spelled) {
     if (!file_ref_sets_[file_idx].insert({sym_id, start, end}).second)
         return;
     // The owner is left UNSET: `numberTree` resolves it by text, through
@@ -686,7 +868,12 @@ void Stage1::insertRef(size_t file_idx, int64_t sym_id, const std::string& sym_n
     // numbered with everything else after the merge -- so the ones it
     // deliberately parks at a field's declaration site stay exempt by
     // construction.
-    if (!refTextNamesSymbol(file_idx, sym_name, start, end, /*warn=*/true)) return;
+    //
+    // One kind of range is right without spelling its symbol: the macro that
+    // builds a pasted name, `ENTRY` in `EACH(ENTRY)`.  The replay has already
+    // shown that this token, applied to the list, produces the name -- which
+    // is a stronger statement than the text resembling it.
+    if (spelled && !refTextNamesSymbol(file_idx, sym_name, start, end, /*warn=*/true)) return;
 
     RefData r{sym_id, start, end};
     r.full_start = full_start;
@@ -819,9 +1006,17 @@ bool Stage1::refNameRange(CXCursor cursor, const std::string& sym_name, size_t& 
 /// `ucs_offsetof(T, hugetlb_mode)` it is the only one that is right -- the
 /// extent is the chimera this whole change exists to remove.
 bool Stage1::refRange(CXCursor cursor, const std::string& sym_name, size_t& out_fi,
-                      int32_t& out_start, int32_t& out_end) {
+                      int32_t& out_start, int32_t& out_end, bool& out_unspelled) {
+    out_unspelled = false;
     if (refNameRange(cursor, sym_name, out_fi, out_start, out_end) &&
         refTextNamesSymbol(out_fi, sym_name, out_start, out_end, /*warn=*/false))
+        return true;
+
+    // No token spells the name: a macro pasted it together.  Then the
+    // reference sits on the part its caller typed, when a caller typed one.
+    // Before the extent fallback below, which for such a name is the start of
+    // an expression in some `#define` body and names nothing.
+    if (pastedNameSite(cursor, sym_name, out_fi, out_start, out_end, out_unspelled))
         return true;
 
     CXFile ef = nullptr;
@@ -838,11 +1033,20 @@ bool Stage1::refRange(CXCursor cursor, const std::string& sym_name, size_t& out_
     return true;
 }
 
+bool Stage1::placesReference(CXCursor cursor, const std::string& name) {
+    size_t fi = 0;
+    int32_t start = -1, end = -1;
+    bool unspelled = false;
+    return refRange(cursor, name, fi, start, end, unspelled) &&
+           (unspelled || refTextNamesSymbol(fi, name, start, end, /*warn=*/false));
+}
+
 void Stage1::addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name) {
     size_t fi;
     int32_t spelling_start, spelling_end;
     spelling_start = -1;
-    if (refRange(cursor, sym_name, fi, spelling_start, spelling_end)) {
+    bool unspelled = false;
+    if (refRange(cursor, sym_name, fi, spelling_start, spelling_end, unspelled)) {
         // The FULL span is the whole referencing construct -- `foo(a, b)` where
         // the name span covers only `foo`.  Display only; ownership comes from
         // the DFS position.  Absent when the construct straddles files, which
@@ -859,7 +1063,7 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name
             full_end = static_cast<int32_t>(fe);
         }
         insertRef(fi, sym_id, sym_name, spelling_start, spelling_end, full_start,
-                  full_end);
+                  full_end, /*spelled=*/!unspelled);
     }
 
     // NO EXPANSION-SITE REFERENCE.  There used to be a second reference here,
