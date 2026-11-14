@@ -189,10 +189,10 @@ struct SymbolOrder {
 ///
 /// Measured before this existed: reversing criu's 211 translation units moved
 /// 2,953 instances and 3,006 references to different numbers. The TREE was
-/// identical -- not one of 34,018 instances changed `nesting_level`,
-/// `fold_depth` or `folded` -- so nothing was wrong with the graph; it simply
-/// could not be reproduced, which rules out comparing two indices or
-/// addressing a row by position across a reindex.
+/// identical -- not one of 34,018 instances changed `nesting_level` -- so
+/// nothing was wrong with the graph; it simply could not be reproduced, which
+/// rules out comparing two indices or addressing a row by position across a
+/// reindex.
 ///
 /// The order is `(start, end, instance_type, symbol name, symbol scope)`, and
 /// it is TOTAL because of instance dedup: `InstKey` makes

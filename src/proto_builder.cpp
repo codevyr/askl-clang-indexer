@@ -181,9 +181,6 @@ BuildResult ProtoBuilder::build(
             pb_inst->set_nesting_level(inst.nesting_level);
             pb_inst->set_dfs_enter(inst.dfs_enter);
             pb_inst->set_dfs_exit(inst.dfs_exit);
-            // `folded` and `fold_depth` are left at their defaults.  Folding
-            // is the symbol's; an engine that still reads these per-instance
-            // fields sees nothing folded, shows everything and loses no edge.
             // -1 means the indexer could not determine the span; leave the
             // field unset so "unknown" stays distinct from "empty".
             if (inst.name_start >= 0) {

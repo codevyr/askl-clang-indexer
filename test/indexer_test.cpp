@@ -1617,10 +1617,6 @@ TEST(ObjectRoots, AMacroInvocationIsInsideItsEnclosingFunction) {
                 << "," << func->dfs_exit() << ")";
             EXPECT_EQ(ref.nesting_level(), func->nesting_level() + 1)
                 << "one level down, not a sibling";
-            // At the FUNCTION's fold depth, not one past it: the caller wrote
-            // this invocation, so it is not behind a fold.  What the macro
-            // GENERATES is what stays one level out of reach.
-            EXPECT_EQ(ref.fold_depth(), func->fold_depth());
             // The full span is the whole invocation `some_macro(bar)`, while
             // the reference's own range is just the name.
             EXPECT_GT(ref.full().end(), ref.from_offset_end())
@@ -2723,19 +2719,6 @@ TEST(ObjectRoots, AReferenceSitsInTheInnermostInstanceFoldedOrNot) {
     auto reach = built.reach();
     EXPECT_TRUE(reach.count({"user", "x"}));
     EXPECT_TRUE(reach.count({"user", "CHECK"}));
-
-    // And nothing is written to the per-instance fold fields any more: an
-    // engine that still reads them shows everything and loses no edge.
-    for (const auto& obj : built.project.objects()) {
-        for (const auto& i : obj.symbol_instances()) {
-            EXPECT_FALSE(i.folded());
-            EXPECT_EQ(i.fold_depth(), 0);
-        }
-        for (const auto& r : obj.refs()) {
-            EXPECT_FALSE(r.folded());
-            EXPECT_EQ(r.fold_depth(), 0);
-        }
-    }
 }
 
 // A header included twice under different macro definitions.
@@ -2913,14 +2896,13 @@ TEST(ObjectRoots, EveryInstanceFormsAValidTree) {
         for (const auto& obj : project.objects()) {
             std::string where = std::string(fx) + " " + obj.module_path();
 
-            // (enter, exit, nesting_level, folded, fold_depth), outermost
-            // first; exit DESC breaks ties so a parent precedes a child that
-            // starts at the same number.
-            struct Node { int64_t enter, exit; int32_t level; bool folded; int32_t fold; };
+            // (enter, exit, nesting_level), outermost first; exit DESC breaks
+            // ties so a parent precedes a child that starts at the same
+            // number.
+            struct Node { int64_t enter, exit; int32_t level; };
             std::vector<Node> nodes;
             for (const auto& i : obj.symbol_instances())
-                nodes.push_back({i.dfs_enter(), i.dfs_exit(), i.nesting_level(),
-                                 i.folded(), i.fold_depth()});
+                nodes.push_back({i.dfs_enter(), i.dfs_exit(), i.nesting_level()});
             std::sort(nodes.begin(), nodes.end(), [](const Node& a, const Node& b) {
                 return a.enter != b.enter ? a.enter < b.enter : a.exit > b.exit;
             });
@@ -2941,13 +2923,6 @@ TEST(ObjectRoots, EveryInstanceFormsAValidTree) {
                     ASSERT_LE(n.exit, p.exit)
                         << where << ": [" << n.enter << ", " << n.exit
                         << ") escapes its parent [" << p.enter << ", " << p.exit << ")";
-                    ASSERT_EQ(n.fold, p.fold + (p.folded ? 1 : 0))
-                        << where << ": [" << n.enter << ", " << n.exit
-                        << ") fold_depth disagrees with its parent";
-                } else {
-                    ASSERT_EQ(n.fold, 0)
-                        << where << ": root [" << n.enter << ", " << n.exit
-                        << ") has fold_depth " << n.fold;
                 }
                 ASSERT_EQ(n.level, static_cast<int32_t>(stack.size()))
                     << where << ": [" << n.enter << ", " << n.exit
@@ -2997,8 +2972,8 @@ TEST(ObjectRoots, EveryInstanceFormsAValidTree) {
             }
 
             // A ref is a point in the same order, so it has to land strictly
-            // inside some instance -- and its depth and fold depth have to
-            // agree with the instance its NUMBER puts it in.
+            // inside some instance -- and its depth has to agree with the
+            // instance its NUMBER puts it in.
             //
             // Those can drift, because they come from different places: the
             // expansion-site branch of `addRef` takes a ref's dfs_enter from
@@ -3020,11 +2995,6 @@ TEST(ObjectRoots, EveryInstanceFormsAValidTree) {
                     << where << ": ref at " << ref.dfs_enter() << " says nesting_level "
                     << ref.nesting_level() << ", but its interval puts it inside ["
                     << owner->enter << ", " << owner->exit << ") at level " << owner->level;
-                EXPECT_EQ(ref.fold_depth(), owner->fold + (owner->folded ? 1 : 0))
-                    << where << ": ref at " << ref.dfs_enter() << " says fold_depth "
-                    << ref.fold_depth() << ", but its owner [" << owner->enter << ", "
-                    << owner->exit << ") has fold_depth " << owner->fold
-                    << " folded=" << owner->folded;
             }
 
             // One full stride between enter and exit, which numbering by
