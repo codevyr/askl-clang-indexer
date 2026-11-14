@@ -258,6 +258,25 @@ private:
     };
     std::vector<DfsScope> dfs_stack_;
 
+    /// The calls the walk is currently inside, innermost last: the function
+    /// each one calls, and whether its callee has been seen yet.
+    ///
+    /// A call names its function once, and the AST says so twice -- the
+    /// CallExpr refers to it, and so does the DeclRefExpr that is its callee.
+    /// The call's reference is the one to keep (its full span is the whole
+    /// `helper(1)`), so the first DeclRefExpr to that function inside the call
+    /// is the callee and is skipped; any later one is a real second mention,
+    /// as in `apply(apply)`.
+    ///
+    /// By IDENTITY, not by the two happening to get the same range: for an
+    /// overloaded C++ operator they do not -- the call covers `a != b` and the
+    /// callee is the `!=` token -- and one use came out as two references.
+    struct OpenCall {
+        CXCursor callee;
+        bool callee_seen;
+    };
+    std::vector<OpenCall> open_calls_;
+
     /// Index of the innermost open scope in `fi`, or -1.  Scopes from other
     /// files are skipped: one TU walk descends into headers, and each file has
     /// its own tree.

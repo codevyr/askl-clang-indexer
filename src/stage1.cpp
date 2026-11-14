@@ -901,9 +901,11 @@ CXChildVisitResult Stage1::visitor(CXCursor cursor, CXCursor parent, CXClientDat
     // gives no "leaving this cursor" callback, and the DFS exit number has to
     // be stamped after the subtree is done.  Traversal is otherwise identical.
     size_t mark = self->dfs_stack_.size();
+    size_t calls = self->open_calls_.size();
     self->visitCursor(cursor, parent);
     clang_visitChildren(cursor, visitor, self);
     self->closeScopesTo(mark);
+    while (self->open_calls_.size() > calls) self->open_calls_.pop_back();
     return CXChildVisit_Continue;
 }
 
@@ -1057,6 +1059,9 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
 
         int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_FUNCTION);
         addRef(cursor, sym_id, sname);
+        // Its callee is about to be visited as a DeclRefExpr to the same
+        // function; see `open_calls_`.  Closed by `visitor` on the way out.
+        open_calls_.push_back({referenced, false});
         break;
     }
     case CXCursor_DeclRefExpr: {
@@ -1081,6 +1086,27 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             if (sname.empty()) break;
 
             int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_DATA);
+            addRef(cursor, sym_id, sname);
+        } else if (ref_kind == CXCursor_FunctionDecl) {
+            // A FUNCTION NAMED WITHOUT BEING CALLED: `register_cb(helper)`,
+            // `return helper;`, `&helper`, `.open = helper`.  Only the
+            // CallExpr case above used to record a function, so none of these
+            // produced an edge -- and `INIT(fn)`, where the macro uses its
+            // argument as a value, left `fn` with no reference at all.
+            //
+            // Except the one mention that IS a call: the callee of the call
+            // being walked.  That is the call's reference, already recorded.
+            if (!open_calls_.empty() && !open_calls_.back().callee_seen &&
+                clang_equalCursors(open_calls_.back().callee, referenced)) {
+                open_calls_.back().callee_seen = true;
+                break;
+            }
+
+            ClangString ref_name(clang_getCursorSpelling(referenced));
+            std::string sname = ref_name.to_string();
+            if (sname.empty()) break;
+
+            int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_FUNCTION);
             addRef(cursor, sym_id, sname);
         }
         break;

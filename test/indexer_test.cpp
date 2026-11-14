@@ -302,15 +302,15 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "setup", 106, 111},
                 {"main.c", "file_ops.read", 127, 131},     // MemberRefExpr: ops.read(0,0,0)
                 {"ops.c", "file_ops", 207, 215},
-                {"ops.c", "my_read", 236, 251},
-                {"ops.c", "my_write", 257, 274},
+                {"ops.c", "my_read", 244, 251},            // .read = my_read: the name token
+                {"ops.c", "my_write", 266, 274},           // .write = my_write
                 {"ops.c", "file_ops", 330, 338},
                 {"ops.c", "file_ops.read", 356, 360},      // MemberRefExpr: ops->read = ...
-                {"ops.c", "my_read", 351, 370},
+                {"ops.c", "my_read", 363, 370},            // ops->read = my_read
                 {"ops.c", "file_ops.write", 381, 386},     // MemberRefExpr: ops->write = ...
-                {"ops.c", "my_write", 376, 397},
+                {"ops.c", "my_write", 389, 397},           // ops->write = my_write
                 {"ops.c", "container", 442, 451},
-                {"ops.c", "my_read", 482, 497},
+                {"ops.c", "my_read", 490, 497},            // .ops = { .read = my_read }
                 {"ops.h", "my_read", 51, 91},              // synthetic: field impl ref (deduped across patterns)
                 {"ops.h", "my_write", 97, 144},            // synthetic: field impl ref (deduped across patterns)
                 {"ops.h", "file_ops", 180, 188},
@@ -1012,8 +1012,8 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "iface_ops", 276, 285},
                 {"main.c", "iface_ops.read", 303, 307},     // MemberRefExpr: ops->read(...)
                 {"main.c", "iface_ops.write", 327, 332},    // MemberRefExpr: ops->write(...)
-                {"main.c", "my_read", 200, 215},
-                {"main.c", "my_write", 221, 238},
+                {"main.c", "my_read", 208, 215},            // .read = my_read: the name token
+                {"main.c", "my_write", 230, 238},           // .write = my_write
                 {"ops.h", "my_read", 174, 191},              // field impl ref
                 {"ops.h", "my_write", 197, 215},             // field impl ref
                 {"ops.h", "read_func_t", 174, 185},          // TypeRef in field decl
@@ -2235,6 +2235,157 @@ TEST(ObjectRoots, ABodyTypedAfterAGeneratingMacroBelongsToItsDeclaration) {
     EXPECT_FALSE(folded.at(std::make_pair(std::string("do_read"), def))) << "the body after the invocation is its own";
     EXPECT_TRUE(folded.at(std::make_pair(std::string("do_read"), decl)));
     EXPECT_TRUE(folded.at(std::make_pair(std::string("entry_read"), def)));
+}
+
+// A FUNCTION NAMED WITHOUT BEING CALLED IS STILL REFERENCED.
+//
+// Only a CALL used to produce a reference to a function.  Passing one as a
+// callback, returning it, taking its address or storing it in a local did not,
+// so the graph had no edge for any of them -- and `INIT(fn)`, where the macro
+// uses its argument as a value, recorded nothing at all for `fn`.
+//
+// The reference sits where the name is written, like every other: in the
+// function that mentions it, and for a macro argument at the argument.
+TEST(ObjectRoots, AFunctionUsedAsAValueIsReferenced) {
+    EXPECT_EQ(edgesOf("function_as_value"),
+              (std::set<std::pair<std::string, std::string>>{
+                  {"pass", "register_cb"},
+                  {"pass", "helper"},     // register_cb(helper)
+                  {"ret", "helper"},      // return helper;
+                  {"addr", "other"},      // return &other;
+                  {"local", "other"},     // fn_t f = other;
+                  {"call", "helper"},     // helper(1), as before
+                  {"twice", "apply"},     // apply((void *)apply)
+                  // INIT(other): `get_init` is wholly generated, so the
+                  // argument is the file's, exactly as the invocation is.
+                  {"main.c", "INIT"},
+                  {"main.c", "other"},
+                  // The types, unchanged by any of this.
+                  {"ret", "fn_t"},
+                  {"addr", "fn_t"},
+                  {"local", "fn_t"},
+                  {"register_cb", "fn_t"},
+                  {"INIT", "fn_t"},
+              }));
+}
+
+// A CALL IS STILL ONE REFERENCE, AND STILL THE CALL.
+//
+// `helper(1)` is a CallExpr whose callee is a DeclRefExpr to the same
+// function.  The callee is not a second mention: the call's reference is the
+// only one, and its FULL span is the whole `helper(1)` rather than the bare
+// name.
+//
+// A function passed to itself IS mentioned twice -- `apply((void *)apply)` --
+// and only the first of the two is the callee.
+TEST(ObjectRoots, ACallIsNotAlsoAValueReference) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/function_as_value";
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"main.c"});
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+    auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                     indexer.allFiles(), 1);
+    askl::index::Project project;
+    ASSERT_TRUE(project.ParseFromString(built.project_data));
+
+    int64_t helper_id = -1;
+    for (const auto& sym : project.symbols())
+        if (sym.name() == "helper") helper_id = sym.local_id();
+    ASSERT_GE(helper_id, 0);
+
+    int in_call = 0;
+    for (const auto& obj : project.objects()) {
+        const std::string& text = obj.content();
+        auto at = text.find("helper(1)");
+        if (at == std::string::npos) continue;
+        const auto name_start = static_cast<int32_t>(at);
+        const auto name_end = static_cast<int32_t>(at + std::string("helper").size());
+        const auto call_end = static_cast<int32_t>(at + std::string("helper(1)").size());
+        for (const auto& ref : obj.refs()) {
+            if (ref.to_symbol_local_id() != helper_id) continue;
+            if (ref.from_offset_start() != name_start) continue;
+            ++in_call;
+            EXPECT_EQ(ref.from_offset_end(), name_end);
+            ASSERT_TRUE(ref.has_full());
+            EXPECT_EQ(ref.full().start(), name_start);
+            EXPECT_EQ(ref.full().end(), call_end) << "the call's span, not the name's";
+        }
+    }
+    EXPECT_EQ(in_call, 1) << "one token, one reference";
+
+    int64_t apply_id = -1;
+    for (const auto& sym : project.symbols())
+        if (sym.name() == "apply") apply_id = sym.local_id();
+    ASSERT_GE(apply_id, 0);
+    for (const auto& obj : project.objects()) {
+        const std::string& text = obj.content();
+        auto at = text.find("apply((void *)apply)");
+        if (at == std::string::npos) continue;
+        const auto callee = static_cast<int32_t>(at);
+        const auto argument = static_cast<int32_t>(at + std::string("apply((void *)").size());
+        std::set<int32_t> starts;
+        for (const auto& ref : obj.refs())
+            if (ref.to_symbol_local_id() == apply_id) starts.insert(ref.from_offset_start());
+        EXPECT_EQ(starts, (std::set<int32_t>{callee, argument}))
+            << "the callee and the argument, each once";
+    }
+}
+
+// A FUNCTION STORED IN A FIELD BY A MACRO.
+//
+// Three ways the function's name can reach `.open = ...` through a macro, and
+// what records each:
+//
+//   * pasted (`_n##_open`): there is no token anywhere that spells it, so the
+//     only possible record is Stage2's, over the invocation that produced it;
+//   * written in the `#define` body: the body names it, and Stage2 still
+//     records the use at the invocation;
+//   * passed as an argument: the token is the caller's, written at the call
+//     site, and that token is the reference.  Stage2 stands down there --
+//     otherwise the one use is two references with different ranges.
+TEST(ObjectRoots, AFunctionStoredByAMacroIsReferencedOnce) {
+    std::string fixture_dir = std::string(FIXTURE_DIR) + "/function_value_from_macro";
+    TempDir temp_dir = makeTempDir();
+    generateCompileCommands(fixture_dir, temp_dir.path, {"main.c"});
+    Indexer indexer("test", temp_dir.path, fixture_dir, 1);
+    indexer.run();
+    auto built = ProtoBuilder::build("test", fixture_dir, indexer.symbolTable(),
+                                     indexer.allFiles(), 1);
+    askl::index::Project project;
+    ASSERT_TRUE(project.ParseFromString(built.project_data));
+
+    std::unordered_map<int64_t, std::string> name;
+    for (const auto& sym : project.symbols()) name[sym.local_id()] = sym.name();
+
+    // (file leaf, function) -> the text each reference covers.
+    std::map<std::pair<std::string, std::string>, std::vector<std::string>> texts;
+    for (const auto& obj : project.objects()) {
+        const std::string& path = obj.module_path();
+        auto slash = path.rfind('/');
+        std::string file = slash == std::string::npos ? path : path.substr(slash + 1);
+        for (const auto& ref : obj.refs()) {
+            const std::string& to = name[ref.to_symbol_local_id()];
+            if (to != "ev_open" && to != "fixed_open" && to != "arg_open") continue;
+            // Stage2 also parks a reference at the FIELD's declaration; that
+            // one is the field's edge, not a use site.
+            std::string text = obj.content().substr(
+                ref.from_offset_start(), ref.from_offset_end() - ref.from_offset_start());
+            if (text.rfind("int (*open)", 0) == 0) continue;
+            texts[{file, to}].push_back(text);
+        }
+    }
+
+    using V = std::vector<std::string>;
+    EXPECT_EQ(texts[std::make_pair(std::string("main.c"), std::string("ev_open"))],
+              V{"DEFINE_OPS(ev)"});
+    EXPECT_EQ(texts[std::make_pair(std::string("main.c"), std::string("fixed_open"))],
+              V{"STATIC_OPS"});
+    EXPECT_EQ(texts[std::make_pair(std::string("ops.h"), std::string("fixed_open"))],
+              V{"fixed_open"});
+    EXPECT_EQ(texts[std::make_pair(std::string("main.c"), std::string("arg_open"))],
+              V{"arg_open"})
+        << "the argument token, and nothing wider beside it";
 }
 
 // A header included twice under different macro definitions.

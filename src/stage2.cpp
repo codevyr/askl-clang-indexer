@@ -38,6 +38,39 @@ void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start
     std::string sname = ref_name.to_string();
     if (sname.empty()) return;
 
+    // THE TOKEN IS THE REFERENCE WHEN THERE IS ONE.
+    //
+    // This records the use over the whole `.read = my_read` or
+    // `ops->read = my_read`, which was the only record of it while Stage1
+    // took a reference to a function from calls alone.  Stage1 now records a
+    // function named as a value at the token that names it, so where that
+    // token is written inside this range the two say the same thing twice,
+    // with different ranges, and nothing downstream can tell they are one.
+    //
+    // What is left for this path is a name with no token here: one a macro
+    // pasted together (`.open = name##_open`), or one written in a `#define`
+    // body and expanded at this site.
+    //
+    // "Written here" is asked of the token, not of the range above, which
+    // cannot answer it: for `OPS_WITH(arg_open)` the entry `.open = _fn`
+    // straddles the macro body and the argument and collapses to one byte at
+    // the start of the invocation, nowhere near `arg_open`.  The FILE location
+    // is the question itself -- it is the spelling for a token typed directly
+    // or passed as a macro argument, and the expansion site for one that came
+    // out of a body -- so it equals the spelling exactly when the caller typed
+    // the name.  A pasted name has no spelling file at all.
+    CXSourceRange name_range = clang_Cursor_getSpellingNameRange(func_ref, 0, 0);
+    if (!clang_Range_isNull(name_range)) {
+        CXSourceLocation name_loc = clang_getRangeStart(name_range);
+        CXFile spell_file = nullptr, file_file = nullptr;
+        unsigned spell_off = 0, file_off = 0;
+        clang_getSpellingLocation(name_loc, &spell_file, nullptr, nullptr, &spell_off);
+        clang_getFileLocation(name_loc, &file_file, nullptr, nullptr, &file_off);
+        if (spell_file && file_file && clang_File_isEqual(spell_file, file_file) &&
+            spell_off == file_off)
+            return;
+    }
+
     int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_FUNCTION);
 
     Stage2Ref ref;
