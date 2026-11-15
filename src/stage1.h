@@ -33,12 +33,14 @@ struct InstanceData {
     int64_t dfs_exit = 0;
 
     // TRANSIENT, never on the wire: the two things a declaration says about
-    // whether its SYMBOL was written down in normal code, which is what
-    // folding is decided from (`Indexer::foldSymbols`).  Neither plays any
-    // part in containment.
+    // where it came from.
     //
-    // `generated`: the whole extent is one macro invocation, so the
+    // `generated`: the whole extent lies in one macro invocation, so the
     // declaration has no text of its own (`Stage1::isWhollyAnInvocation`).
+    // Containment reads it: such a declaration contains only what was read
+    // inside it (`Stage1::numberTree`).  Folding reads it too, as one of the
+    // reasons a SYMBOL was never written down (`Indexer::foldSymbols`) -- but
+    // the two do not read each other.
     //
     // `name_typed`: the token that names it was typed outside every `#define`
     // body -- `lock` in `DEFINE_MUTEX(lock)`.  False for a name a macro body
@@ -46,11 +48,20 @@ struct InstanceData {
     bool generated = false;
     bool name_typed = false;
 
-    // TRANSIENT, never on the wire: the instance this one was nested inside
-    // according to the AST walk (nearest open scope in the same file), or -1.
-    // `numberTree` uses it only to break ties between instances with IDENTICAL
-    // ranges -- the one case ranges cannot decide.
-    int32_t stack_parent = -1;
+    // TRANSIENT, never on the wire: the instance this one was READ INSIDE
+    // according to the AST walk (nearest open scope in the same file).
+    // `numberTree` uses it among declarations with one extent, which text
+    // cannot tell apart.
+    //
+    // `kReadAtFileScope`: inside no declaration of this file.
+    // `kReadDisputed`: two translation units read it inside DIFFERENT
+    // declarations (one file compiled twice under two names).  Neither is
+    // wrong and a tree has one parent, so the walk says nothing and text
+    // decides -- keeping whichever unit arrived first would make the index
+    // depend on thread timing.
+    static constexpr int32_t kReadAtFileScope = -1;
+    static constexpr int32_t kReadDisputed = -2;
+    int32_t stack_parent = kReadAtFileScope;
 
     // Finer spans inside [start_offset, end_offset).  -1 = the indexer does not
     // know one: a ##-pasted identifier has no file location at all (its name
@@ -136,40 +147,6 @@ struct FileData {
     std::vector<RefData> refs;
 };
 
-/// THE ONE PLACEMENT RULE FOR REFERENCES: a reference sits in the INNERMOST
-/// instance whose extent contains its text.  Returns an index into
-/// `f.instances`, or -1 when nothing contains it.
-///
-/// Innermost is narrowest, then deepest in the tree, then earliest -- the
-/// order the engine uses to place a search hit, so the two agree on where a
-/// piece of text is.  The last two only matter among instances with one
-/// extent, which is everything a single macro invocation generates; there
-/// `numberTree` prefers the one the reference was parsed inside, which text
-/// cannot tell.  The file must already be numbered.
-///
-/// FOLDING PLAYS NO PART.  This used to skip a generated instance, on the
-/// argument that the bytes of `CHECK(sizeof(struct x))` were typed by the
-/// caller and so `struct x` must stay the caller's.  It does stay the
-/// caller's: the caller's interval contains the generated declaration's, and
-/// an edge is "the reference lies in my interval".  The skip added nothing to
-/// that, and it is what once put every reference written in a
-/// `PROFILE_FUNC(...) { body }` on the file.
-///
-/// This replaced placement by AST scope (`Stage1::stackParent`), which could
-/// not see a macro body at all: the scope stack is consulted per FILE, and when
-/// `handler` in main.c expands a macro defined in log.h, nothing from log.h is
-/// on it.  So `printk`, written inside `DEV_PRINT`'s `#define` body, was
-/// attributed to log.h's file root and the edge read `log.h -> printk` instead
-/// of `DEV_PRINT -> printk`.  Text containment gets the same answer as the
-/// scope for every ordinary reference and the right one here.
-///
-/// The one thing text alone could not tell used to be an argument token from
-/// the macro's own expansion-site use of it, both lying inside the caller at
-/// overlapping offsets.  There are no expansion-site references any more --
-/// each layer records only what its own body names -- so the ambiguity is gone
-/// with them.
-int32_t ownerOfText(const FileData& f, int32_t start, int32_t end);
-
 /// A SYMBOL'S PLACE IN THE CANONICAL ORDER, indexed by its local id.
 ///
 /// The local id itself cannot be used: ids are handed out by `getOrCreate` in
@@ -187,8 +164,8 @@ struct SymbolOrder {
 ///
 /// Two things read the vector's order and would otherwise inherit the merge's:
 /// `numberTree` builds each node's child list by walking it, which fixes the
-/// preorder sequence and therefore every DFS number; and `ownerOfText` breaks
-/// ties between equally narrow candidates by taking the earlier one.
+/// preorder sequence and therefore every DFS number; and where two typed
+/// declarations share one extent, the earlier of them is an instance's parent.
 ///
 /// Measured before this existed: reversing criu's 211 translation units moved
 /// 2,953 instances and 3,006 references to different numbers. The TREE was
@@ -421,7 +398,7 @@ private:
     ///     int alias(int a) { return helper(a); }
     ///
     /// Both bodies are text the author typed, and both definitions were folded
-    /// anyway.  A folded instance takes no reference (`ownerOfText`), so their
+    /// anyway.  A folded instance took no reference then, so their
     /// calls landed on the file: ucx's `ucp_tag_send_nbx` had 71 references
     /// written inside it and none placed in it.
     ///

@@ -2064,6 +2064,22 @@ struct BuiltFixture {
         return out;
     }
 
+    /// (instance, the instance it sits in), by name.
+    std::set<std::pair<std::string, std::string>> parents() const {
+        std::set<std::pair<std::string, std::string>> out;
+        for (const auto& obj : project.objects())
+            for (const auto& x : obj.symbol_instances()) {
+                const askl::index::SymbolInstance* p = nullptr;
+                for (const auto& i : obj.symbol_instances())
+                    if (i.dfs_enter() < x.dfs_enter() && x.dfs_exit() < i.dfs_exit() &&
+                        (!p || i.dfs_enter() > p->dfs_enter()))
+                        p = &i;
+                if (p)
+                    out.insert({name.at(x.symbol_local_id()), name.at(p->symbol_local_id())});
+            }
+        return out;
+    }
+
     /// (innermost instance, target): where each reference sits.
     std::set<std::pair<std::string, std::string>> sits() const {
         std::set<std::pair<std::string, std::string>> out;
@@ -2271,7 +2287,9 @@ TEST(ObjectRoots, ADefinitionNamedThroughAMacroContainsItsBody) {
                   // Wholly generated.  The invocation is written inside the
                   // extent of what it generates, by the same rule as above;
                   // what the generated body calls is named by the `#define`.
-                  {"event_show", "DEFINE_SHOW"},
+                  // The invocation was read by nothing, and what it generated
+                  // has no text of its own to hold it: it sits in the file.
+                  {"main.c", "DEFINE_SHOW"},
                   {"DEFINE_SHOW", "shown"},
               }));
 
@@ -2315,12 +2333,10 @@ TEST(ObjectRoots, AFunctionUsedAsAValueIsReferenced) {
                   {"local", "other"},     // fn_t f = other;
                   {"call", "helper"},     // helper(1), as before
                   {"twice", "apply"},     // apply((void *)apply)
-                  // INIT(other): `get_init` is wholly generated, so the
-                  // argument is the file's, exactly as the invocation is.
-                  // `INIT(other)` generates `get_init`, whose extent is the
-                  // invocation: both the macro's name and its argument are
-                  // written inside it.
-                  {"get_init", "INIT"},
+                  // `INIT(other)` generates `get_init`.  It read `other`,
+                  // which it returns; the `INIT` token nothing read, and a
+                  // generated declaration has no text of its own to hold it.
+                  {"main.c", "INIT"},
                   {"get_init", "other"},
                   // The types, unchanged by any of this.
                   {"ret", "fn_t"},
@@ -2743,26 +2759,88 @@ TEST(ObjectRoots, AnInvocationThroughAnAliasGeneratesWhatItGenerates) {
     EXPECT_EQ(built.folded(), (std::set<std::string>{"check_failed"}));
 }
 
-// CONTAINMENT NEVER ASKS ABOUT FOLDING.
+// A GENERATED DECLARATION CONTAINS ONLY WHAT WAS READ INSIDE IT.
 //
-// A reference sits in the innermost instance whose extent contains its text,
-// whatever that instance is.  `CHECK(sizeof(struct x) > 4)` generates the
-// declaration `check_failed`, whose extent is the whole invocation, so the
-// `struct x` typed in its argument sits in `check_failed` -- and, because that
-// is inside `user`, `user` still reaches `x`.
+// A declaration somebody typed contains what lies in its text.  One a macro
+// generated has no text of its own: the extent clang reports for it is the
+// invocation's, which says where the macro was used and nothing about what the
+// declaration is made of.
 //
-// There used to be a rule that a folded instance takes no reference, so that
-// the argument stayed "the caller's".  It is not needed: the caller's interval
-// contains the generated declaration's, and whether `check_failed` is LISTED
-// is the symbol's folding, a separate question with a separate answer.
-TEST(ObjectRoots, AReferenceSitsInTheInnermostInstanceFoldedOrNot) {
+// `CHECK(sizeof(struct x) > 4)` in `user` generates the declaration
+// `check_failed` on the invocation's extent.  `struct x` and the `CHECK` token
+// lie in that extent, and neither was read inside `check_failed` -- the
+// condition is `user`'s code.  Both sit in `user`.
+//
+// The rule used to be "the innermost extent, whatever it is", which put both
+// in `check_failed`.  `user` still reached them, one level further down, and a
+// declaration that calls nothing appeared to use a type and a macro.
+TEST(ObjectRoots, AGeneratedDeclarationContainsOnlyWhatWasReadInsideIt) {
     BuiltFixture built("symbol_folding", {"main.c", "other.c"});
     auto sits = built.sits();
-    EXPECT_TRUE(sits.count({"check_failed", "x"}));
-    EXPECT_FALSE(sits.count({"user", "x"}));
-    auto reach = built.reach();
-    EXPECT_TRUE(reach.count({"user", "x"}));
-    EXPECT_TRUE(reach.count({"user", "CHECK"}));
+    EXPECT_TRUE(sits.count({"user", "x"}));
+    EXPECT_TRUE(sits.count({"user", "CHECK"}));
+    EXPECT_FALSE(sits.count({"check_failed", "x"}));
+    EXPECT_FALSE(sits.count({"check_failed", "CHECK"}));
+    // The declaration itself is where it was: inside `user`, which read it.
+    bool inside = false;
+    for (const auto& obj : built.project.objects())
+        for (const auto& outer : obj.symbol_instances())
+            for (const auto& inner : obj.symbol_instances())
+                if (built.name.at(outer.symbol_local_id()) == "user" &&
+                    built.name.at(inner.symbol_local_id()) == "check_failed" &&
+                    outer.dfs_enter() < inner.dfs_enter() && inner.dfs_exit() < outer.dfs_exit())
+                    inside = true;
+    EXPECT_TRUE(inside);
+}
+
+// ...AND SEVERAL GENERATED ON ONE EXTENT ARE NOT GIVEN WHAT NONE OF THEM READ.
+//
+// `DEFINE_FAMILY(tab, my_key_t, my_hash)` generates three functions.  Each
+// read `my_hash`, and each has it.  The `DEFINE_FAMILY` token was read by
+// none: a macro use is recorded before the walk.  It used to go to the first
+// of the three, which then alone appeared to use the macro that made all of
+// them.  It sits in the file.
+TEST(ObjectRoots, WhatNoGeneratedDeclarationReadSitsBesideThem) {
+    BuiltFixture built("generated_family", {"main.c"});
+    auto sits = built.sits();
+    EXPECT_TRUE(sits.count({"main.c", "DEFINE_FAMILY"}));
+    for (const char* fn : {"tab_get", "tab_resize", "tab_put"})
+        EXPECT_FALSE(sits.count({fn, "DEFINE_FAMILY"})) << fn;
+}
+
+// TWO TYPED DECLARATIONS ON ONE TEXT BOTH CONTAIN IT.
+//
+// One file compiled twice declares `work` and `work_variant` on the same
+// bytes.  Both were typed, so both contain what lies in their text.  `TWICE`
+// in the body is a macro use, read by neither: it is in both, as the call to
+// `helper` is in both because each read it.  It used to be in whichever came
+// first in the tree's order.
+TEST(ObjectRoots, TwoTypedDeclarationsOnOneTextBothContainIt) {
+    using Units = BuiltFixture::Units;
+    BuiltFixture plain_first("dual_compile", Units{{{"main.c", ""}, {"main.c", "-DVARIANT"}}});
+    BuiltFixture variant_first("dual_compile", Units{{{"main.c", "-DVARIANT"}, {"main.c", ""}}});
+    EXPECT_EQ(plain_first.sits(), variant_first.sits());
+    EXPECT_TRUE(plain_first.sits().count({"work", "TWICE"}));
+    EXPECT_TRUE(plain_first.sits().count({"work_variant", "TWICE"}));
+}
+
+// WHERE TWO UNITS READ AN INSTANCE IN DIFFERENT PLACES, THE WALK SAYS NOTHING.
+//
+// One file compiled twice declares `work` and `work_variant` on the same
+// bytes, and `CHECK(a > 0)` in the body generates `check_failed`.  It is one
+// instance, read inside `work` by one unit and inside `work_variant` by the
+// other, and a tree gives it one parent.  Taking whichever unit arrived first
+// would make the index depend on thread timing.  A disagreement is no
+// information, and it is placed by text: in the first of the two typed
+// declarations, in the tree's order -- the same answer in either order.
+TEST(ObjectRoots, AnInstanceReadInTwoPlacesDoesNotDependOnUnitOrder) {
+    using Units = BuiltFixture::Units;
+    BuiltFixture plain_first("dual_compile_generated",
+                             Units{{{"main.c", ""}, {"main.c", "-DVARIANT"}}});
+    BuiltFixture variant_first("dual_compile_generated",
+                               Units{{{"main.c", "-DVARIANT"}, {"main.c", ""}}});
+    EXPECT_EQ(plain_first.parents(), variant_first.parents());
+    EXPECT_TRUE(plain_first.parents().count({"check_failed", "work"}));
 }
 
 // A header included twice under different macro definitions.

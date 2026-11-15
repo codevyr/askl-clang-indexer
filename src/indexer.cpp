@@ -245,12 +245,24 @@ void Indexer::processTU(const CompileCommand& cmd) {
                     }
                     remap[i] = slot->second;
                 }
-                for (size_t i : inserted) {
+                // WHERE IT WAS READ is not "first writer wins" either.  Two
+                // units that read one instance inside different declarations
+                // are both right, a tree has one parent, and keeping the
+                // first to arrive would make the tree depend on thread
+                // timing.  A disagreement is recorded as no information.
+                std::vector<bool> is_new(file.instances.size(), false);
+                for (size_t i : inserted) is_new[i] = true;
+                for (size_t i = 0; i < file.instances.size(); ++i) {
                     int32_t sp = file.instances[i].stack_parent;
-                    existing.instances[remap[i]].stack_parent =
-                        (sp >= 0 && static_cast<size_t>(sp) < remap.size())
-                            ? static_cast<int32_t>(remap[static_cast<size_t>(sp)])
-                            : -1;
+                    if (sp >= 0)
+                        sp = static_cast<size_t>(sp) < remap.size()
+                                 ? static_cast<int32_t>(remap[static_cast<size_t>(sp)])
+                                 : InstanceData::kReadAtFileScope;
+                    int32_t& kept = existing.instances[remap[i]].stack_parent;
+                    if (is_new[i])
+                        kept = sp;
+                    else if (kept != sp)
+                        kept = InstanceData::kReadDisputed;
                 }
                 if (!inserted.empty()) {
                     files_with_late_instances_.insert(it->second);

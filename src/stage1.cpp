@@ -117,9 +117,8 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
         //   - CONTAINMENT.  `func { macro }` and `mod("amdgpu") { macro }`
         //     keep working, through the reference, exactly as
         //     `func("main") { "printk" }` does -- printk has no instance in
-        //     main either.  `ownerOfText` puts the reference in the enclosing
-        //     function, which is where the expansion instance was nested by
-        //     range.
+        //     main either.  The reference sits in the enclosing function,
+        //     which is where the expansion instance was nested by range.
         //   - FOLDING.  Whether a generated symbol is listed is decided for
         //     the symbol (`Indexer::foldSymbols`), and an expansion was
         //     already barred from being a parent -- measured on ucx, across
@@ -524,32 +523,6 @@ void Stage1::closeScopesTo(size_t mark) {
     while (dfs_stack_.size() > mark) dfs_stack_.pop_back();
 }
 
-int32_t ownerOfText(const FileData& f, int32_t start, int32_t end) {
-    int32_t best = -1;
-    auto width = [](const InstanceData& d) {
-        return static_cast<int64_t>(d.end_offset) - d.start_offset;
-    };
-    for (size_t i = 0; i < f.instances.size(); ++i) {
-        const InstanceData& inst = f.instances[i];
-        if (inst.start_offset > start || inst.end_offset < end) continue;
-        bool better = best < 0;
-        if (!better) {
-            const InstanceData& b = f.instances[static_cast<size_t>(best)];
-            // Narrowest, then deepest, then earliest.  Every component is a
-            // property of the numbered tree, so the choice does not depend on
-            // the order cursors happened to arrive in.
-            if (width(inst) != width(b))
-                better = width(inst) < width(b);
-            else if (inst.nesting_level != b.nesting_level)
-                better = inst.nesting_level > b.nesting_level;
-            else
-                better = inst.dfs_enter < b.dfs_enter;
-        }
-        if (better) best = static_cast<int32_t>(i);
-    }
-    return best;
-}
-
 void canonicaliseInstanceOrder(FileData& f, const std::vector<SymbolOrder>& order) {
     const size_t n = f.instances.size();
     if (n < 2) return;
@@ -603,8 +576,8 @@ void canonicaliseInstanceOrder(FileData& f, const std::vector<SymbolOrder>& orde
     for (InstanceData& d : sorted) {
         if (d.stack_parent >= 0 && static_cast<size_t>(d.stack_parent) < n)
             d.stack_parent = static_cast<int32_t>(rank[static_cast<size_t>(d.stack_parent)]);
-        else
-            d.stack_parent = -1;
+        else if (d.stack_parent != InstanceData::kReadDisputed)
+            d.stack_parent = InstanceData::kReadAtFileScope;
     }
     for (RefData& r : f.refs) {
         if (r.scope_idx < 0) continue; // none: nothing to move
@@ -619,65 +592,94 @@ void Stage1::numberTree(FileData& f) {
     const size_t n = f.instances.size();
     if (n == 0) return;
 
+    // --- WHAT CONTAINS WHAT --------------------------------------------
+    //
+    //   A declaration somebody typed contains what lies in its text.
+    //   A declaration a macro generated has no text of its own, so it
+    //   contains only what the compiler read inside it.
+    //
+    // One law, for an instance and for a reference.  The extents that hold a
+    // piece of text are asked innermost first, and for each of them:
+    //
+    //   1. If it was READ INSIDE a declaration with that extent, it sits there.
+    //      Several declarations can have one extent -- everything
+    //      `KHASH_INIT(...)` generates, or one function compiled twice under
+    //      two names -- and text cannot tell them apart.  The walk can.
+    //   2. Otherwise it sits in the declarations with that extent that have
+    //      TEXT OF THEIR OWN.  A generated one is passed over: its extent is
+    //      the invocation's, which says where the macro was used and nothing
+    //      about what the declaration is made of.
+    //   3. Otherwise the next wider extent is asked.
+    //
+    // `BUILD_BUG_ON(sizeof(struct x))` in `f` generates a declaration on the
+    // invocation's extent.  `struct x` lies in that extent and was read in
+    // `f`, so it sits in `f`.  The three functions `KHASH_INIT(x, int, hash)`
+    // generates each read `hash` and each have it; the `KHASH_INIT` token was
+    // read by none of them and sits in the file.
+    //
+    // It used to be "innermost extent, then deepest, then earliest", which
+    // gave a generated declaration whatever its invocation mentioned and, for
+    // several on one extent, gave it to an arbitrary one of them.
+    //
+    // `read_in` is the innermost declaration it was read inside, followed
+    // outwards through `stack_parent`.  `self` is the instance being placed,
+    // or -1 for a reference: an instance is never inside itself, and one with
+    // the SAME extent holds it only by (1) -- two declarations on one extent
+    // are beside each other unless the walk nested them.
+    auto extentOf = [&](int32_t i) {
+        const InstanceData& d = f.instances[static_cast<size_t>(i)];
+        return std::pair<int32_t, int32_t>(d.start_offset, d.end_offset);
+    };
+    std::vector<int32_t> around;
+    auto containersOf = [&](int32_t start, int32_t end, int32_t read_in, int32_t self,
+                            std::vector<int32_t>& out) {
+        out.clear();
+        around.clear();
+        for (size_t j = 0; j < n; ++j) {
+            const InstanceData& c = f.instances[j];
+            if (static_cast<int32_t>(j) != self && c.start_offset <= start && end <= c.end_offset)
+                around.push_back(static_cast<int32_t>(j));
+        }
+        // Innermost first.  Among equals the canonical order decides, which is
+        // a property of the file and not of the order units arrived in.
+        std::sort(around.begin(), around.end(), [&](int32_t a, int32_t b) {
+            const InstanceData& x = f.instances[static_cast<size_t>(a)];
+            const InstanceData& y = f.instances[static_cast<size_t>(b)];
+            const int64_t wx = static_cast<int64_t>(x.end_offset) - x.start_offset;
+            const int64_t wy = static_cast<int64_t>(y.end_offset) - y.start_offset;
+            if (wx != wy) return wx < wy;
+            if (x.start_offset != y.start_offset) return x.start_offset < y.start_offset;
+            return a < b;
+        });
+        for (size_t g = 0; g < around.size();) {
+            size_t h = g + 1;
+            while (h < around.size() && extentOf(around[h]) == extentOf(around[g])) ++h;
+            for (int32_t s = read_in; s >= 0 && static_cast<size_t>(s) < n;
+                 s = f.instances[static_cast<size_t>(s)].stack_parent)
+                if (s != self && extentOf(s) == extentOf(around[g])) {
+                    out.push_back(s);
+                    return;
+                }
+            const bool beside = self >= 0 && extentOf(self) == extentOf(around[g]);
+            for (size_t k = g; !beside && k < h; ++k)
+                if (!f.instances[static_cast<size_t>(around[k])].generated)
+                    out.push_back(around[k]);
+            if (!out.empty()) return;
+            g = h;
+        }
+    };
+
     // --- PARENTAGE -----------------------------------------------------
-    //
-    //   parent(x) = the innermost instance containing x, where "containing"
-    //   means (a) its range STRICTLY contains x's, or (b) its range EQUALS x's
-    //   and it is x's stack ancestor.  Innermost = narrowest range, then
-    //   deepest on the stack.
-    //
-    // (a) is what ranges are good at, and it is what the walk could not do: a
-    // macro expansion comes from `collectMacros`, a pass that runs before the
-    // AST walk with an empty stack, so it was numbered as a sibling of the
-    // function it textually sits in and `func { macro }` could not work.  The
-    // same blindness made every `opens_scope = false` instance a tree leaf
-    // whose range none the less contained other instances.
-    //
-    // (b) is the only thing ranges cannot do, and the stack is exactly the
-    // information that can.  Everything `PMU_FORMAT_ATTR(...)` generates shares
-    // one extent; the stack knows the assert is inside `event_show`'s body
-    // while `format_attr_event` is beside it.  An equal range is narrower than
-    // any strict container, so (b) outranks (a) -- but ONLY for a stack
-    // ancestor, which is what keeps `event_show` a child of the enclosing
-    // function rather than of whatever else the invocation generated.
+    // A tree has one parent per node.  Where the law names several -- one
+    // function compiled twice under two names, with a declaration in its body
+    // -- the first in canonical order is taken.
     std::vector<int32_t> parent(n, -1);
+    std::vector<int32_t> holders;
     for (size_t i = 0; i < n; ++i) {
         const InstanceData& x = f.instances[i];
-        int32_t s = x.stack_parent;
-        while (s >= 0) {
-            const InstanceData& a = f.instances[static_cast<size_t>(s)];
-            if (a.start_offset == x.start_offset && a.end_offset == x.end_offset) break;
-            s = a.stack_parent;
-        }
-        if (s >= 0) {
-            parent[i] = s;
-            continue;
-        }
-        int64_t best_w = 0;
-        int32_t best = -1;
-        for (size_t j = 0; j < n; ++j) {
-            if (j == i) continue;
-            const InstanceData& c = f.instances[j];
-            // A GENERATED INSTANCE IS A PARENT LIKE ANY OTHER: containment is
-            // decided by extent and never by where the text came from.
-            //
-            // There used to be an exception here -- an EXPANSION was barred
-            // from being a parent by range, because a macro passed as an
-            // ARGUMENT nests inside the text of the outer invocation and
-            // `ucs_unlikely(kh_end(x))` reported 31 unrelated macros as
-            // `ucs_unlikely`'s contents.  A macro use is a reference now
-            // (`macroVisitor`), so there is no expansion instance to exclude
-            // and no range to nest it by.
-            if (c.start_offset > x.start_offset || c.end_offset < x.end_offset) continue;
-            if (c.start_offset == x.start_offset && c.end_offset == x.end_offset)
-                continue; // equal, not strict -- only (b) may use it
-            int64_t w = static_cast<int64_t>(c.end_offset) - c.start_offset;
-            if (best < 0 || w < best_w) {
-                best = static_cast<int32_t>(j);
-                best_w = w;
-            }
-        }
-        parent[i] = best;
+        containersOf(x.start_offset, x.end_offset, x.stack_parent, static_cast<int32_t>(i),
+                     holders);
+        if (!holders.empty()) parent[i] = holders.front();
     }
 
     // --- NUMBERING -----------------------------------------------------
@@ -731,41 +733,26 @@ void Stage1::numberTree(FileData& f) {
     }
 
     // --- REFS ----------------------------------------------------------
-    // A ref is a point one step inside its owner, on every axis.  Stamping it
-    // here from `owner_idx` is what makes "a ref lies inside its owner" true by
-    // construction, instead of two independently computed numbers that agreed
-    // only while a reference sat inside exactly one scope.
-    for (RefData& r : f.refs) {
-        // EVERY reference is placed by TEXT, by the one rule in `ownerOfText`:
-        // the innermost instance containing it.  `insertRef` no longer guesses
-        // an owner from the AST scope -- it could not see a macro body, and the
-        // case that needed a scope (an argument token vs the macro's own
-        // expansion-site use of it) no longer exists.
-        r.owner_idx = ownerOfText(f, r.from_offset_start, r.from_offset_end);
-        if (r.owner_idx < 0 || static_cast<size_t>(r.owner_idx) >= n) continue;
-        // ...EXCEPT AMONG IDENTICAL EXTENTS, which text cannot tell apart and
-        // the walk can -- rule (b) above, for a reference.  `DEFINE_PAIR(p)`
-        // generates `p_first` and `p_second` on one extent, and the call to
-        // `p_first` that `p_second` makes sits on the `p` both were made
-        // from.  It was parsed inside `p_second`, so that is where it sits.
-        //
-        // Only among equals: a scope with a DIFFERENT extent is never
-        // consulted, so this cannot move a reference out of the innermost
-        // extent that contains it.
-        if (r.scope_idx >= 0 && static_cast<size_t>(r.scope_idx) < n) {
-            const InstanceData& found = f.instances[static_cast<size_t>(r.owner_idx)];
-            for (int32_t s = r.scope_idx; s >= 0;
-                 s = f.instances[static_cast<size_t>(s)].stack_parent) {
-                const InstanceData& a = f.instances[static_cast<size_t>(s)];
-                if (a.start_offset == found.start_offset && a.end_offset == found.end_offset) {
-                    r.owner_idx = s;
-                    break;
-                }
-            }
+    // A ref is a point one step inside what contains it, on every axis.
+    // Stamping it here from `owner_idx` is what makes "a ref lies inside its
+    // container" true by construction.
+    //
+    // A reference nothing read -- a macro use, recorded before the walk -- that
+    // lies in the text of two typed declarations sits in both: each of them
+    // contains its text.  That is one more reference, not a choice.
+    const size_t given = f.refs.size();
+    for (size_t ri = 0; ri < given; ++ri) {
+        containersOf(f.refs[ri].from_offset_start, f.refs[ri].from_offset_end,
+                     f.refs[ri].scope_idx, -1, holders);
+        for (size_t k = 0; k < holders.size(); ++k) {
+            if (k > 0) f.refs.push_back(f.refs[ri]);
+            RefData& r = k > 0 ? f.refs.back() : f.refs[ri];
+            const InstanceData& o = f.instances[static_cast<size_t>(holders[k])];
+            r.owner_idx = holders[k];
+            r.dfs_enter = o.dfs_enter + 1;
+            r.nesting_level = o.nesting_level + 1;
         }
-        const InstanceData& o = f.instances[static_cast<size_t>(r.owner_idx)];
-        r.dfs_enter = o.dfs_enter + 1;
-        r.nesting_level = o.nesting_level + 1;
+        if (holders.empty()) f.refs[ri].owner_idx = -1;
     }
 
     // ONE REFERENCE PER (target, token, place).  Until here a reference was
@@ -1044,8 +1031,8 @@ void Stage1::insertRef(const RefPlace& at, int64_t sym_id, const std::string& sy
     const int32_t scope = scopeAround(file_idx, start, end);
     if (!file_ref_sets_[file_idx].insert({sym_id, start, end, scope}).second)
         return;
-    // The owner is left UNSET: `numberTree` resolves it by text, through
-    // `ownerOfText`, once every instance in the file is known.  It used to come
+    // Where it sits is left UNSET: `numberTree` decides, once every instance
+    // in the file is known.  It used to come
     // from `stackParent(file_idx)` here, and that was wrong for exactly the
     // references a macro body contributes -- the scope stack is consulted per
     // FILE, and when a function in one file expands a macro defined in
