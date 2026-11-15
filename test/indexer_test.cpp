@@ -2824,7 +2824,35 @@ TEST(ObjectRoots, TwoTypedDeclarationsOnOneTextBothContainIt) {
     EXPECT_TRUE(plain_first.sits().count({"work_variant", "TWICE"}));
 }
 
-// WHERE TWO UNITS READ AN INSTANCE IN DIFFERENT PLACES, THE WALK SAYS NOTHING.
+// A GENERATED DECLARATION SITS WHERE IT WAS READ.
+//
+//     #define PROFILE_FUNC(type, name, param) int blah; type blah_##name(int param)
+//     PROFILE_FUNC(int, send, x) { return helper(x); }
+//
+// `blah` is made of the macro's own tokens, and the only extent libclang has
+// for it is the invocation.  `blah_send` starts at that invocation and runs on
+// through a body the author typed, so the invocation -- and with it `blah` --
+// lies in `blah_send`'s text.  Placed by text, a global variable ended up
+// inside a function.
+//
+// It has no text there to be placed by.  The compiler read it at file scope,
+// before `blah_send` was opened, and that is where it sits.
+TEST(ObjectRoots, AGeneratedDeclarationSitsWhereItWasRead) {
+    BuiltFixture built("generated_sibling", {"main.c"});
+    auto parents = built.parents();
+    EXPECT_TRUE(parents.count({"blah", "main.c"}));
+    EXPECT_FALSE(parents.count({"blah", "blah_send"}));
+    // What was typed is unchanged: the invocation lies in `blah_send`'s text.
+    EXPECT_TRUE(built.sits().count({"blah_send", "PROFILE_FUNC"}));
+    EXPECT_TRUE(built.sits().count({"blah_send", "helper"}));
+
+    // The kernel's SYSCALL_DEFINE shape: the prototypes are beside the
+    // function that carries the body, not inside it.
+    BuiltFixture sys("macro_trailing_body", {"main.c"});
+    EXPECT_FALSE(sys.parents().count({"entry_read", "do_read"}));
+}
+
+// ...AND WHERE TWO UNITS READ IT IN DIFFERENT PLACES, THE WALK SAYS NOTHING.
 //
 // One file compiled twice declares `work` and `work_variant` on the same
 // bytes, and `CHECK(a > 0)` in the body generates `check_failed`.  It is one
@@ -2841,6 +2869,54 @@ TEST(ObjectRoots, AnInstanceReadInTwoPlacesDoesNotDependOnUnitOrder) {
                                Units{{{"main.c", "-DVARIANT"}, {"main.c", ""}}});
     EXPECT_EQ(plain_first.parents(), variant_first.parents());
     EXPECT_TRUE(plain_first.parents().count({"check_failed", "work"}));
+}
+
+// WHERE A DECLARATION WAS READ NEVER LEADS BACK TO ITSELF.
+//
+//     #define struct_group(NAME, MEMBERS...) \
+//         union { struct { MEMBERS }; struct { MEMBERS } NAME; }
+//
+// The kernel's `struct_group` expands its members into two anonymous structs,
+// both at the invocation's location, so they are ONE instance -- and clang
+// meets every record twice besides, hoisted and under its declarator.  The
+// union is therefore met again while a struct that was read inside it is
+// open.  Taking that as "the union was read inside the struct" made each the
+// other's parent: neither was reachable from the file, neither was numbered,
+// and the engine refused the whole index (seven headers in Linux, `skbuff.h`
+// among them).  A reading that puts a declaration inside itself says nothing.
+TEST(ObjectRoots, ADeclarationMetAgainWhileOpenIsNotInsideItself) {
+    BuiltFixture built("struct_group", {"main.c"});
+    size_t instances = 0;
+    for (const auto& obj : built.project.objects())
+        for (const auto& inst : obj.symbol_instances()) {
+            ++instances;
+            EXPECT_GT(inst.dfs_exit(), inst.dfs_enter())
+                << built.name.at(inst.symbol_local_id()) << " was left out of the tree";
+        }
+    EXPECT_GT(instances, 0u);
+    // Everything the invocation generated is inside the struct it was typed in.
+    EXPECT_TRUE(built.sits().count({"outer", "struct_group"}));
+}
+
+// ...AND TWO UNITS THAT READ A PAIR IN OPPOSITE ORDER AGREE ON NEITHER.
+//
+// One file compiled twice; the second time `first` and `second` swap places,
+// so `struct first { struct second { ... } f; }` in one unit is
+// `struct second { struct first { ... } f; }` in the other, on the same
+// bytes.  Each unit read one inside the other.  Following both would be a
+// loop; keeping the first unit's answer would depend on which unit that was.
+// Both lose the walk's answer and text places them.
+TEST(ObjectRoots, TwoUnitsThatNestAPairOppositelyDoNotDependOnOrder) {
+    using Units = BuiltFixture::Units;
+    BuiltFixture plain_first("dual_compile_swapped",
+                             Units{{{"main.c", ""}, {"main.c", "-DSWAPPED"}}});
+    BuiltFixture swapped_first("dual_compile_swapped",
+                               Units{{{"main.c", "-DSWAPPED"}, {"main.c", ""}}});
+    EXPECT_EQ(plain_first.parents(), swapped_first.parents());
+    for (const auto& obj : plain_first.project.objects())
+        for (const auto& inst : obj.symbol_instances())
+            EXPECT_GT(inst.dfs_exit(), inst.dfs_enter())
+                << plain_first.name.at(inst.symbol_local_id()) << " was left out of the tree";
 }
 
 // A header included twice under different macro definitions.
@@ -2997,7 +3073,9 @@ TEST(ObjectRoots, EveryInstanceFormsAValidTree) {
                            "reincluded_header",
                            // Layerwise macro edges: an invocation edge at a
                            // call site, a body edge at the `#define`.
-                           "macro_layerwise"}) {
+                           "macro_layerwise",
+                           // One declaration met again while it is open.
+                           "struct_group"}) {
         std::string fixture_dir = std::string(FIXTURE_DIR) + "/" + fx;
         TempDir temp_dir = makeTempDir();
         std::vector<std::string> srcs;

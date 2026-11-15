@@ -50,8 +50,9 @@ struct InstanceData {
 
     // TRANSIENT, never on the wire: the instance this one was READ INSIDE
     // according to the AST walk (nearest open scope in the same file).
-    // `numberTree` uses it among declarations with one extent, which text
-    // cannot tell apart.
+    // `numberTree` uses it where text cannot say what contains what: among
+    // declarations with one extent, and for a generated declaration, whose
+    // extent is its invocation's and not text of its own.
     //
     // `kReadAtFileScope`: inside no declaration of this file.
     // `kReadDisputed`: two translation units read it inside DIFFERENT
@@ -62,6 +63,11 @@ struct InstanceData {
     static constexpr int32_t kReadAtFileScope = -1;
     static constexpr int32_t kReadDisputed = -2;
     int32_t stack_parent = kReadAtFileScope;
+
+    // TRANSIENT, never on the wire: the walk enters this declaration, so it
+    // knows of everything it met whether that was read inside it.  False for
+    // what is recorded without the walk: a file, a `#define`, a comment.
+    bool scope = false;
 
     // Finer spans inside [start_offset, end_offset).  -1 = the indexer does not
     // know one: a ##-pasted identifier has no file location at all (its name
@@ -146,6 +152,22 @@ struct FileData {
     std::vector<InstanceData> instances;
     std::vector<RefData> refs;
 };
+
+/// TWO READINGS OF WHERE ONE INSTANCE WAS READ, reconciled.
+///
+/// clang meets a struct written inside a declarator twice: hoisted, as a
+/// sibling before `typedef struct { ... } T;`, and again under the typedef.
+/// The second reading has the first one's place on its chain and is the more
+/// specific of the two, so it is taken.  Two readings with neither inside the
+/// other -- one header included twice, one file compiled twice -- are a
+/// disagreement, `InstanceData::kReadDisputed`.  Symmetric, so the result does
+/// not depend on which reading came first.
+///
+/// `self` is the instance the readings are of.  A reading that lies inside
+/// `self` is dropped, so `stack_parent` never leads back to where it started:
+/// `numberTree` follows that chain and relies on it ending.
+int32_t reconcileReadIn(const std::vector<InstanceData>& instances, int32_t self, int32_t kept,
+                        int32_t incoming);
 
 /// A SYMBOL'S PLACE IN THE CANONICAL ORDER, indexed by its local id.
 ///

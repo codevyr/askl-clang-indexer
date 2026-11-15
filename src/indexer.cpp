@@ -249,20 +249,48 @@ void Indexer::processTU(const CompileCommand& cmd) {
                 // units that read one instance inside different declarations
                 // are both right, a tree has one parent, and keeping the
                 // first to arrive would make the tree depend on thread
-                // timing.  A disagreement is recorded as no information.
+                // timing.  A disagreement is recorded as no information
+                // (`reconcileReadIn`).
                 std::vector<bool> is_new(file.instances.size(), false);
                 for (size_t i : inserted) is_new[i] = true;
-                for (size_t i = 0; i < file.instances.size(); ++i) {
+                // New instances first: until this is done their `stack_parent`
+                // is still an index into the UNIT's instances, and
+                // `reconcileReadIn` follows those chains.
+                auto remapped = [&](size_t i) {
                     int32_t sp = file.instances[i].stack_parent;
-                    if (sp >= 0)
-                        sp = static_cast<size_t>(sp) < remap.size()
-                                 ? static_cast<int32_t>(remap[static_cast<size_t>(sp)])
-                                 : InstanceData::kReadAtFileScope;
-                    int32_t& kept = existing.instances[remap[i]].stack_parent;
-                    if (is_new[i])
-                        kept = sp;
-                    else if (kept != sp)
-                        kept = InstanceData::kReadDisputed;
+                    if (sp < 0) return sp;
+                    return static_cast<size_t>(sp) < remap.size()
+                               ? static_cast<int32_t>(remap[static_cast<size_t>(sp)])
+                               : InstanceData::kReadAtFileScope;
+                };
+                for (size_t i = 0; i < file.instances.size(); ++i)
+                    if (is_new[i]) existing.instances[remap[i]].stack_parent = remapped(i);
+                for (size_t i = 0; i < file.instances.size(); ++i) {
+                    if (is_new[i]) continue;
+                    const int32_t self = static_cast<int32_t>(remap[i]);
+                    const int32_t incoming = remapped(i);
+                    // This unit read `self` inside something an earlier unit
+                    // read inside `self`.  Neither order is the right one, so
+                    // every instance on that loop loses the walk's answer --
+                    // whichever unit came first.
+                    bool loops = false;
+                    size_t steps = 0;
+                    for (int32_t s = incoming;
+                         s >= 0 && steps <= existing.instances.size();
+                         s = existing.instances[static_cast<size_t>(s)].stack_parent, ++steps)
+                        if (s == self) loops = true;
+                    if (loops) {
+                        for (int32_t s = incoming; s != self;) {
+                            int32_t& up = existing.instances[static_cast<size_t>(s)].stack_parent;
+                            s = up;
+                            up = InstanceData::kReadDisputed;
+                        }
+                        existing.instances[static_cast<size_t>(self)].stack_parent =
+                            InstanceData::kReadDisputed;
+                        continue;
+                    }
+                    int32_t& kept = existing.instances[static_cast<size_t>(self)].stack_parent;
+                    kept = reconcileReadIn(existing.instances, self, kept, incoming);
                 }
                 if (!inserted.empty()) {
                     files_with_late_instances_.insert(it->second);

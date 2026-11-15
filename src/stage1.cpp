@@ -478,12 +478,39 @@ void Stage1::markOrigin(CXCursor cursor, size_t fi, InstanceData& d) {
     d.name_typed = d.generated && nameTypedInNormalCode(cursor);
 }
 
+int32_t reconcileReadIn(const std::vector<InstanceData>& instances, int32_t self, int32_t kept,
+                        int32_t incoming) {
+    if (kept == incoming) return kept;
+    // Is `outer` where `inner` was read, or around it?  File scope is around
+    // everything.
+    auto within = [&](int32_t inner, int32_t outer) {
+        if (outer == InstanceData::kReadAtFileScope) return true;
+        size_t steps = 0;
+        for (int32_t s = inner; s >= 0 && static_cast<size_t>(s) < instances.size() &&
+                                steps <= instances.size();
+             s = instances[static_cast<size_t>(s)].stack_parent, ++steps)
+            if (s == outer) return true;
+        return false;
+    };
+    // A reading that puts the instance inside itself says nothing about where
+    // it is.  It happens when one declaration is met again while it is open:
+    // `struct_group(...)` expands its members twice, into two anonymous structs
+    // at one location, which are one instance.
+    if (within(incoming, self)) return kept;
+    if (kept == InstanceData::kReadDisputed || incoming == InstanceData::kReadDisputed)
+        return InstanceData::kReadDisputed;
+    if (within(incoming, kept)) return incoming;
+    if (within(kept, incoming)) return kept;
+    return InstanceData::kReadDisputed;
+}
+
 void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
     // Record structure, number later.  `numberTree` assigns dfs_enter,
     // dfs_exit and nesting_level together, so none of them can be set while
     // another is forgotten -- which is exactly how non-scope instances ended
     // up with dfs_exit == dfs_enter, able to contain nothing.
     d.stack_parent = stackParent(fi);
+    d.scope = opens_scope;
 
     // ONE DECLARATION IN THE TEXT IS ONE INSTANCE, however many times the text
     // is parsed.  A header without an include guard is parsed once per
@@ -511,6 +538,8 @@ void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
         InstanceData& kept = instances[it->second];
         kept.generated = kept.generated && d.generated;
         kept.name_typed = kept.name_typed || d.name_typed;
+        kept.stack_parent = reconcileReadIn(instances, static_cast<int32_t>(it->second),
+                                            kept.stack_parent, d.stack_parent);
     }
     // `opens_scope` now means only "later cursors nest inside this one", which
     // is all it ever should have meant.
@@ -611,6 +640,16 @@ void Stage1::numberTree(FileData& f) {
     //      about what the declaration is made of.
     //   3. Otherwise the next wider extent is asked.
     //
+    // The same holds for a generated declaration that is being PLACED: the
+    // invocation's extent is not its text, so text does not say where it
+    // sits.  `PROFILE(int, send) { body }`, whose macro also declares a
+    // global, yields a function that starts at the invocation and runs on
+    // through the typed body -- the invocation, and the global with it, lies
+    // in the function's text.  The compiler read the global at file scope.  So
+    // in (2) a generated declaration is not given to a declaration the walk
+    // enters and did not read it inside; what the walk does not enter (the
+    // file) still holds it by text.
+    //
     // `BUILD_BUG_ON(sizeof(struct x))` in `f` generates a declaration on the
     // invocation's extent.  `struct x` lies in that extent and was read in
     // `f`, so it sits in `f`.  The three functions `KHASH_INIT(x, int, hash)`
@@ -635,6 +674,9 @@ void Stage1::numberTree(FileData& f) {
                             std::vector<int32_t>& out) {
         out.clear();
         around.clear();
+        const bool placed_by_walk =
+            self >= 0 && f.instances[static_cast<size_t>(self)].generated &&
+            f.instances[static_cast<size_t>(self)].stack_parent != InstanceData::kReadDisputed;
         for (size_t j = 0; j < n; ++j) {
             const InstanceData& c = f.instances[j];
             if (static_cast<int32_t>(j) != self && c.start_offset <= start && end <= c.end_offset)
@@ -661,9 +703,12 @@ void Stage1::numberTree(FileData& f) {
                     return;
                 }
             const bool beside = self >= 0 && extentOf(self) == extentOf(around[g]);
-            for (size_t k = g; !beside && k < h; ++k)
-                if (!f.instances[static_cast<size_t>(around[k])].generated)
-                    out.push_back(around[k]);
+            for (size_t k = g; !beside && k < h; ++k) {
+                const InstanceData& c = f.instances[static_cast<size_t>(around[k])];
+                if (c.generated) continue;
+                if (placed_by_walk && c.scope) continue;
+                out.push_back(around[k]);
+            }
             if (!out.empty()) return;
             g = h;
         }
@@ -1335,11 +1380,12 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
     case CXCursor_UnionDecl:
     case CXCursor_EnumDecl:
     case CXCursor_TypedefDecl: {
-        // Skip type decls that are children of a TypedefDecl — clang visits
-        // them both as hoisted TU children and as TypedefDecl children during
-        // recursion, which would create duplicate instances.
-        if (kind != CXCursor_TypedefDecl &&
-            clang_getCursorKind(parent) == CXCursor_TypedefDecl) break;
+        // clang visits a record written inside a typedef twice: hoisted, as
+        // a sibling before the typedef, and again as the typedef's child.
+        // Both are recorded.  `addInstance` keeps one instance for the two,
+        // and the second visit is what tells it -- and the fields below it --
+        // that they were read inside the typedef.
+        (void)parent;
 
         // Decide whether to skip TYPE symbol/instance creation:
         // - Anonymous enums: synthetic name (e.g. "enum (unnamed at ...)") is useless
