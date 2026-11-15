@@ -265,8 +265,15 @@ void Stage1::collectTypedefTypes(CXTranslationUnit tu) {
     }, this);
 }
 
-// Index a FieldDecl child cursor as a FIELD symbol with a compound name
-// "parent.child".  Used for struct and union field visitors.
+// Index a FieldDecl cursor as a FIELD symbol with a compound name
+// "parent.child".
+//
+// THE FIELD STAYS OPEN while the walk reads what is below it, like every
+// other declaration: its type, its bit width.  It used to be closed at once,
+// so whatever a field named was read "inside the struct".  Text put it in the
+// field anyway -- except where text cannot: `PAIR(struct cfg, a, b)` declares
+// two fields on one extent, and which of them a `cfg` belongs to is something
+// only the walk knows.
 void Stage1::indexChildField(CXCursor child) {
     std::string compound_name = resolveFieldCompoundName(child);
     if (compound_name.empty()) return;
@@ -281,7 +288,6 @@ void Stage1::indexChildField(CXCursor child) {
         fillSpans(child, file, d);
         markOrigin(child, fi, d);
         addInstance(fi, d, true);
-        closeScopesTo(dfs_stack_.size() - 1);
     }
 }
 
@@ -1386,36 +1392,29 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             }
         }
 
-        // Index struct/union fields as FIELD symbols with compound "parent.child" names.
-        // Enum constants are indexed as standalone DATA symbols — in C they
-        // live in the global namespace regardless of whether the enum is named.
-        if (kind == CXCursor_StructDecl || kind == CXCursor_UnionDecl) {
-            clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
-                if (clang_getCursorKind(child) != CXCursor_FieldDecl)
-                    return CXChildVisit_Continue;
-                static_cast<Stage1*>(data)->indexChildField(child);
-                return CXChildVisit_Continue;
-            }, this);
-        } else if (kind == CXCursor_EnumDecl) {
-            clang_visitChildren(cursor, [](CXCursor child, CXCursor, CXClientData data) {
-                if (clang_getCursorKind(child) != CXCursor_EnumConstantDecl)
-                    return CXChildVisit_Continue;
-                auto* self = static_cast<Stage1*>(data);
-                ClangString name(clang_getCursorSpelling(child));
-                std::string sname = name.to_string();
-                if (sname.empty()) return CXChildVisit_Continue;
-                auto [sym_id, _] = self->symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_DATA);
-                CXFile file;
-                unsigned start, end;
-                if (self->declExtent(child, file, start, end)) {
-                    size_t fi = self->getOrCreateFile(file);
-                    InstanceData d{sym_id, static_cast<int32_t>(start),
-                                   static_cast<int32_t>(end), INSTTYPE_DEFINITION};
-                    self->markOrigin(child, fi, d);
-                    self->addInstance(fi, d, false);
-                }
-                return CXChildVisit_Continue;
-            }, this);
+        // Fields and enum constants are met below this cursor, by the walk
+        // (`CXCursor_FieldDecl`, `CXCursor_EnumConstantDecl`) -- also when
+        // the record itself was skipped above.
+        break;
+    }
+    case CXCursor_FieldDecl:
+        indexChildField(cursor);
+        break;
+    case CXCursor_EnumConstantDecl: {
+        // Enum constants are standalone DATA symbols: in C they live in the
+        // global namespace whether or not the enum is named.
+        ClangString name(clang_getCursorSpelling(cursor));
+        std::string sname = name.to_string();
+        if (sname.empty()) break;
+        auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_DATA);
+        CXFile range_file;
+        unsigned start_off, end_off;
+        if (declExtent(cursor, range_file, start_off, end_off)) {
+            size_t fi = getOrCreateFile(range_file);
+            InstanceData d{sym_id, static_cast<int32_t>(start_off),
+                           static_cast<int32_t>(end_off), INSTTYPE_DEFINITION};
+            markOrigin(cursor, fi, d);
+            addInstance(fi, d, true);
         }
         break;
     }

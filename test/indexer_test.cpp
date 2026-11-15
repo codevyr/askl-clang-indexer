@@ -2686,6 +2686,23 @@ TEST(ObjectRoots, OneTokenReadInSeveralDeclarationsIsAReferenceInEach) {
     EXPECT_FALSE(sits.count({"tab_get", "tab_resize"}));
 }
 
+// A FIELD AND AN ENUM CONSTANT ARE READ INSIDE, LIKE A FUNCTION.
+//
+// `PAIR(struct cfg, first, second)` declares two fields on one extent, and
+// each is a `struct cfg`; `TWO(LEFT, RIGHT, START)` does the same for two enum
+// constants that are both computed from `START`.  The walk used to close a
+// field the moment it opened it and never opened an enum constant, so
+// everything they named was read "inside the struct" -- one reference, which
+// text then gave to the first of the two.
+TEST(ObjectRoots, AFieldAndAnEnumConstantHoldWhatWasReadInsideThem) {
+    BuiltFixture built("generated_fields", {"main.c"});
+    auto sits = built.sits();
+    EXPECT_TRUE(sits.count({"holder.first", "cfg"}));
+    EXPECT_TRUE(sits.count({"holder.second", "cfg"}));
+    EXPECT_TRUE(sits.count({"LEFT", "START"}));
+    EXPECT_TRUE(sits.count({"RIGHT", "START"}));
+}
+
 // ...AND SO IS ONE TOKEN READ BY TWO TRANSLATION UNITS IN DIFFERENT ONES.
 //
 // One file compiled twice, the second time with `-DVARIANT`, which renames
