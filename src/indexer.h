@@ -61,7 +61,7 @@ private:
     /// Key -> index in the file's `refs`.  The index is for the few facts a
     /// reference carries that two units may see differently (`mergeRefView`);
     /// everything else about a reference is its key.
-    std::vector<std::unordered_map<EntryKey, uint32_t, EntryKeyHash>> merged_ref_keys_;
+    std::vector<std::unordered_map<RefKey, uint32_t, RefKeyHash>> merged_ref_keys_;
 
     /// How much the cross-TU union actually contributed, for the summary line.
     /// A file counted here was seen DIFFERENTLY by two or more translation

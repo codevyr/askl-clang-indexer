@@ -338,6 +338,17 @@ int32_t Stage1::stackParent(size_t fi) const {
     return -1;
 }
 
+int32_t Stage1::scopeAround(size_t fi, int32_t start, int32_t end) const {
+    const auto& instances = result_.files[fi].instances;
+    for (auto it = dfs_stack_.rbegin(); it != dfs_stack_.rend(); ++it) {
+        if (it->file_idx != fi) continue;
+        const InstanceData& d = instances[it->instance_idx];
+        if (d.start_offset <= start && end <= d.end_offset)
+            return static_cast<int32_t>(it->instance_idx);
+    }
+    return -1;
+}
+
 void Stage1::noteInvocation(size_t fi, int32_t start, int32_t end, CXCursor cursor) {
     if (end <= start) return;
     auto& spans = invocation_spans_[fi];
@@ -590,7 +601,7 @@ void canonicaliseInstanceOrder(FileData& f, const std::vector<SymbolOrder>& orde
             d.stack_parent = -1;
     }
     for (RefData& r : f.refs) {
-        if (r.scope_idx < 0) continue; // none, or disputed: nothing to move
+        if (r.scope_idx < 0) continue; // none: nothing to move
         r.scope_idx = static_cast<size_t>(r.scope_idx) < n
                           ? static_cast<int32_t>(rank[static_cast<size_t>(r.scope_idx)])
                           : RefData::kNoScope;
@@ -749,6 +760,35 @@ void Stage1::numberTree(FileData& f) {
         const InstanceData& o = f.instances[static_cast<size_t>(r.owner_idx)];
         r.dfs_enter = o.dfs_enter + 1;
         r.nesting_level = o.nesting_level + 1;
+    }
+
+    // ONE REFERENCE PER (target, token, place).  Until here a reference was
+    // told apart by the declaration it was read inside, which is finer than
+    // where it sits: a `#define` body token is read in every function that
+    // expands the macro and sits in the macro's definition.  Readings that
+    // ended in one place are one reference; they keep what any of them knew.
+    {
+        std::unordered_map<RefKey, size_t, RefKeyHash> seen;
+        std::vector<RefData> kept;
+        kept.reserve(f.refs.size());
+        for (const RefData& r : f.refs) {
+            auto [it, fresh] = seen.try_emplace(
+                RefKey{r.to_symbol_local_id, r.from_offset_start, r.from_offset_end, r.owner_idx},
+                kept.size());
+            if (fresh) {
+                kept.push_back(r);
+                continue;
+            }
+            RefData& k = kept[it->second];
+            k.pasted = k.pasted && r.pasted;
+            k.typed_in_define = k.typed_in_define && r.typed_in_define;
+            k.synthetic = k.synthetic && r.synthetic;
+            if (k.full_start < 0 && r.full_start >= 0) {
+                k.full_start = r.full_start;
+                k.full_end = r.full_end;
+            }
+        }
+        f.refs.swap(kept);
     }
 }
 
@@ -991,7 +1031,12 @@ void Stage1::insertRef(const RefPlace& at, int64_t sym_id, const std::string& sy
                        int32_t full_start, int32_t full_end) {
     const size_t file_idx = at.fi;
     const int32_t start = at.start, end = at.end;
-    if (!file_ref_sets_[file_idx].insert({sym_id, start, end}).second)
+    // WHERE IT WAS READ IS PART OF WHAT IT IS.  `KHASH_INIT(x, int, my_hash)`
+    // generates three functions that each call `my_hash`, on the one token the
+    // caller typed: three references, one in each.  Keyed by the token alone,
+    // the first function read kept the call and the other two had none.
+    const int32_t scope = scopeAround(file_idx, start, end);
+    if (!file_ref_sets_[file_idx].insert({sym_id, start, end, scope}).second)
         return;
     // The owner is left UNSET: `numberTree` resolves it by text, through
     // `ownerOfText`, once every instance in the file is known.  It used to come
@@ -1026,7 +1071,7 @@ void Stage1::insertRef(const RefPlace& at, int64_t sym_id, const std::string& sy
         return;
 
     RefData r{sym_id, start, end};
-    r.scope_idx = stackParent(file_idx);
+    r.scope_idx = scope;
     r.pasted = at.pasted;
     r.typed_in_define = at.typed_in_define;
     r.full_start = full_start;

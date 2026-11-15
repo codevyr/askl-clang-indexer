@@ -22,6 +22,29 @@ struct EntryKeyHash {
     }
 };
 
+/// WHAT IDENTIFIES A REFERENCE: what it names, the token that names it, and
+/// WHERE IT IS -- `where` is the declaration it was parsed inside until the
+/// file is numbered, and its place in the tree after.
+struct RefKey {
+    int64_t id;
+    int32_t start;
+    int32_t end;
+    int64_t where;
+    bool operator==(const RefKey& o) const {
+        return id == o.id && start == o.start && end == o.end && where == o.where;
+    }
+};
+
+struct RefKeyHash {
+    size_t operator()(const RefKey& k) const {
+        size_t h = std::hash<int64_t>{}(k.id);
+        h ^= std::hash<int32_t>{}(k.start) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int32_t>{}(k.end) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(k.where) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
 /// WHAT IDENTIFIES AN INSTANCE: a declaration in the text.
 ///
 /// Not a parse of that text.  A header without an include guard is parsed once

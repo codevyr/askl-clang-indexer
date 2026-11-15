@@ -200,10 +200,13 @@ BuildResult ProtoBuilder::build(
             }
         }
 
-        // Deduplicate refs by (to_symbol_local_id, from_offset_start, from_offset_end)
-        std::unordered_set<EntryKey, EntryKeyHash> seen_refs;
+        // One reference per (target, token, place in the tree).  `numberTree`
+        // already guarantees it for a file it numbered; this covers a caller
+        // that hands over references it built itself.
+        std::unordered_set<RefKey, RefKeyHash> seen_refs;
         for (auto& ref : file.refs) {
-            EntryKey key{ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end};
+            RefKey key{ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end,
+                       ref.dfs_enter};
             if (seen_refs.insert(key).second) {
                 auto* pb_ref = obj->add_refs();
                 pb_ref->set_to_symbol_local_id(ref.to_symbol_local_id);

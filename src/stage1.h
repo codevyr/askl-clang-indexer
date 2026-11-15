@@ -98,16 +98,19 @@ struct RefData {
     // fixtures.
     bool synthetic = false;
 
-    // TRANSIENT, never on the wire: the innermost scope of this file the walk
-    // was inside when it met the reference, as an index into the file's
-    // instances.  Like `InstanceData::stack_parent`, and used for the same
-    // single purpose: choosing among instances with IDENTICAL extents.
+    // TRANSIENT, never on the wire: the innermost declaration of this file the
+    // walk was inside when it met the reference AND whose text holds the
+    // token, as an index into the file's instances (`Stage1::scopeAround`).
     //
-    // Negative when there is none to go by: the reference was met outside
-    // every scope of this file, or two translation units parsed it inside
-    // different ones (`Indexer::processTU`).
+    // It is PART OF WHAT THE REFERENCE IS until the file is numbered: one
+    // token read inside two declarations is two references (`RefKey`).  Like
+    // `InstanceData::stack_parent`, it also chooses among instances with
+    // IDENTICAL extents, which text cannot tell apart.
+    //
+    // `kNoScope` when the walk has nothing to say: the token is written
+    // outside every declaration being read (a `#define` body, a macro use
+    // recorded before the walk).
     static constexpr int32_t kNoScope = -1;
-    static constexpr int32_t kScopeDisputed = -2;
     int32_t scope_idx = kNoScope;
 
     // TRANSIENT, never on the wire: the instance that owns this reference.
@@ -251,7 +254,7 @@ private:
 
     // Per-TU state
     std::unordered_map<std::string, size_t> file_index_; // filepath -> index in result_.files
-    std::unordered_map<size_t, std::unordered_set<EntryKey, EntryKeyHash>> file_ref_sets_; // per-file ref dedup
+    std::unordered_map<size_t, std::unordered_set<RefKey, RefKeyHash>> file_ref_sets_; // per-file: one per (target, token, scope)
     /// Per-file instance index, key -> position in that file's `instances`.
     ///
     /// A set would be enough to drop a repeat, but `addInstance` needs the
@@ -379,6 +382,15 @@ private:
     /// files are skipped: one TU walk descends into headers, and each file has
     /// its own tree.
     int32_t stackParent(size_t fi) const;
+
+    /// The innermost scope of file `fi` on the stack whose text holds
+    /// [start, end), or -1.  This is where a reference at that range was READ.
+    ///
+    /// The extent test is what separates a token read where it is written
+    /// from one a `#define` in the same file contributed: the body token is
+    /// read inside whichever function expanded the macro and written in none
+    /// of them, and a reference sits where its name was typed.
+    int32_t scopeAround(size_t fi, int32_t start, int32_t end) const;
 
     /// Every macro invocation this TU saw in a file, keyed by where it starts:
     /// the end of the whole `NAME(args)` text, and the invocation's cursor.

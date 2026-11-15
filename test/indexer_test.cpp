@@ -783,6 +783,9 @@ INSTANTIATE_TEST_SUITE_P(
                 // my_drv: spelling ref in the macro argument, owned by the
                 // caller because every byte at a call site is the caller's.
                 {"main.c", "my_drv", 89, 95},
+                // ...and twice: `__init` and `__exit` each read that one
+                // token, so each has its reference.
+                {"main.c", "my_drv", 89, 95},
                 // driver_info.id: spelling refs inside register_driver macro body
                 {"register.h", "driver_info.id", 219, 221},
                 {"register.h", "driver_info.id", 270, 272},
@@ -2652,32 +2655,56 @@ TEST(ObjectRoots, AReferenceAmongEqualExtentsSitsWhereItWasParsed) {
     EXPECT_FALSE(sits.count({"pair_first", "pair_first"}));
 }
 
-// ...UNLESS TWO TRANSLATION UNITS PARSED IT INSIDE DIFFERENT ONES.
+// ONE TOKEN READ INSIDE THREE DECLARATIONS IS THREE REFERENCES.
+//
+// `DEFINE_FAMILY(tab, my_key_t, my_hash)` generates `tab_get`, `tab_resize`
+// and `tab_put`, and each of them calls `my_hash` and takes a `my_key_t`.  The
+// caller typed each name once, so all three uses are on one token.  While a
+// reference was identified by its target and its token alone, the first
+// function read kept the call and the other two called nothing.
+//
+// A reference is what it names, the token that names it, and where it sits --
+// as an instance already is.
+TEST(ObjectRoots, OneTokenReadInSeveralDeclarationsIsAReferenceInEach) {
+    BuiltFixture built("generated_family", {"main.c"});
+    auto sits = built.sits();
+    for (const char* fn : {"tab_get", "tab_resize", "tab_put"}) {
+        EXPECT_TRUE(sits.count({fn, "my_hash"})) << fn;
+        EXPECT_TRUE(sits.count({fn, "my_key_t"})) << fn;
+    }
+    // Three rows on the one token, told apart by their place alone.
+    std::map<std::pair<int32_t, int32_t>, std::set<int32_t>> places;
+    for (const auto& obj : built.project.objects())
+        for (const auto& ref : obj.refs())
+            if (built.name.at(ref.to_symbol_local_id()) == "my_hash")
+                places[{ref.from_offset_start(), ref.from_offset_end()}].insert(ref.dfs_enter());
+    ASSERT_EQ(places.size(), 1u);
+    EXPECT_EQ(places.begin()->second.size(), 3u);
+    // What was already right stays: the call between two of them is where it
+    // was read, and nothing is read twice in one place.
+    EXPECT_TRUE(sits.count({"tab_put", "tab_resize"}));
+    EXPECT_FALSE(sits.count({"tab_get", "tab_resize"}));
+}
+
+// ...AND SO IS ONE TOKEN READ BY TWO TRANSLATION UNITS IN DIFFERENT ONES.
 //
 // One file compiled twice, the second time with `-DVARIANT`, which renames
 // the function: `work` in one unit and `work_variant` in the other, on the
 // same bytes.  (ompi does this for its checksum and PMPI variants.)  The call
-// to `helper` is one token and so one reference, parsed inside `work` by one
-// unit and inside `work_variant` by the other.
+// to `helper` is one token, read inside `work` by one unit and inside
+// `work_variant` by the other.
 //
-// Neither is wrong and only one can have it.  Taking whichever unit arrived
-// first would make the index depend on thread timing, so a disagreement
-// between units is no information at all and the tie falls back to the
-// order of the tree -- the same answer in either order.
-TEST(ObjectRoots, AReferenceParsedInTwoPlacesDoesNotDependOnUnitOrder) {
+// Both are true, and both are kept.  There used to be one reference for the
+// two, and since neither unit was wrong it went to the earlier function in the
+// tree's order, leaving the other calling nothing.
+TEST(ObjectRoots, AReferenceReadInTwoPlacesByTwoUnitsIsInBoth) {
     using Units = BuiltFixture::Units;
     BuiltFixture plain_first("dual_compile", Units{{{"main.c", ""}, {"main.c", "-DVARIANT"}}});
     BuiltFixture variant_first("dual_compile", Units{{{"main.c", "-DVARIANT"}, {"main.c", ""}}});
 
-    // Both units contributed: the file holds both functions.
-    std::set<std::string> functions;
-    for (const auto& sym : plain_first.project.symbols())
-        if (sym.type() == askl::index::FUNCTION) functions.insert(sym.name());
-    ASSERT_TRUE(functions.count("work") && functions.count("work_variant"));
-
     EXPECT_EQ(plain_first.sits(), variant_first.sits());
-    EXPECT_TRUE(plain_first.sits().count({"work", "helper"}))
-        << "the earlier of the two in the tree's order";
+    EXPECT_TRUE(plain_first.sits().count({"work", "helper"}));
+    EXPECT_TRUE(plain_first.sits().count({"work_variant", "helper"}));
 }
 
 // AN INVOCATION THROUGH AN ALIAS IS STILL ONE INVOCATION.

@@ -78,21 +78,13 @@ std::string Indexer::computeCommonAncestor(const std::vector<CompileCommand>& cm
 /// lifts it -- evidence that the symbol was written down wins, as for an
 /// instance.
 ///
-/// The scope is where the reference was parsed, and breaks a tie between
-/// declarations with one extent (`Stage1::numberTree`).  Units normally agree
-/// on it.  When they do not -- one file compiled twice under different macros
-/// declares two functions on the same bytes, and each unit parsed the call
-/// inside its own -- neither is wrong and only one can have the reference, so
-/// the disagreement is recorded as no information and the tie falls back to
-/// the order of the tree.
+/// Where the reference was read is not merged: it is part of the key.  Two
+/// units that read one token inside different declarations -- one file
+/// compiled twice under different macros declares two functions on the same
+/// bytes, and each unit read the call inside its own -- hold two references.
 static void mergeRefView(RefData& kept, const RefData& in) {
     kept.pasted = kept.pasted && in.pasted;
     kept.typed_in_define = kept.typed_in_define && in.typed_in_define;
-    if (in.scope_idx < 0 || kept.scope_idx == RefData::kScopeDisputed) return;
-    if (kept.scope_idx == RefData::kNoScope)
-        kept.scope_idx = in.scope_idx;
-    else if (kept.scope_idx != in.scope_idx)
-        kept.scope_idx = RefData::kScopeDisputed;
 }
 
 void Indexer::processTU(const CompileCommand& cmd) {
@@ -269,8 +261,6 @@ void Indexer::processTU(const CompileCommand& cmd) {
                 // again against a KEPT set, for the same reason.
                 auto& seen = merged_ref_keys_[it->second];
                 for (auto& ref : file.refs) {
-                    const EntryKey key{ref.to_symbol_local_id, ref.from_offset_start,
-                                       ref.from_offset_end};
                     // Its scope is an index into the INCOMING instances, like
                     // `stack_parent`, and moves the same way.
                     if (ref.scope_idx >= 0)
@@ -278,6 +268,8 @@ void Indexer::processTU(const CompileCommand& cmd) {
                             static_cast<size_t>(ref.scope_idx) < remap.size()
                                 ? static_cast<int32_t>(remap[static_cast<size_t>(ref.scope_idx)])
                                 : RefData::kNoScope;
+                    const RefKey key{ref.to_symbol_local_id, ref.from_offset_start,
+                                     ref.from_offset_end, ref.scope_idx};
                     auto [slot, fresh] =
                         seen.try_emplace(key, static_cast<uint32_t>(existing.refs.size()));
                     if (fresh) {
@@ -311,8 +303,8 @@ void Indexer::processTU(const CompileCommand& cmd) {
                 rk.reserve(added.refs.size());
                 for (size_t i = 0; i < added.refs.size(); ++i) {
                     const RefData& r = added.refs[i];
-                    rk.emplace(EntryKey{r.to_symbol_local_id, r.from_offset_start,
-                                        r.from_offset_end},
+                    rk.emplace(RefKey{r.to_symbol_local_id, r.from_offset_start,
+                                      r.from_offset_end, r.scope_idx},
                                static_cast<uint32_t>(i));
                 }
             }
