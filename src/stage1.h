@@ -48,6 +48,29 @@ struct InstanceData {
     bool generated = false;
     bool name_typed = false;
 
+    // TRANSIENT, never on the wire: THE INVOCATION THAT NAMES IT -- where, in
+    // this file, the outermost macro invocation starts that its name came
+    // through, or -1 when somebody typed the name outside every invocation.
+    //
+    //     static DEFINE_MUTEX(lock);
+    //     PROFILE_FUNC(int, send, x) { return x; }
+    //     #define MPI_Send PMPI_Send
+    //     int MPI_Send(void) { ... }
+    //
+    // Each of these has text of its own, so none is `generated`; each got its
+    // name from the invocation.  That invocation DECLARES it: the macro refers
+    // to the declaration (`Stage1::linkDeclared`), and the invocation sits
+    // where the declaration sits, not inside it (`Stage1::numberTree`).
+    //
+    // By the NAME, not the extent: `DEPRECATED int f(void)` starts on an
+    // invocation that names nothing.
+    //
+    // `introduced`: this is a definition, or the first declaration the
+    // compiler met.  `EXPORT_SYMBOL(foo)` redeclares `foo` and introduces
+    // nothing; the macro does not lead to a symbol it merely mentioned again.
+    int32_t named_at = -1;
+    bool introduced = false;
+
     // TRANSIENT, never on the wire: the instance this one was READ INSIDE
     // according to the AST walk (nearest open scope in the same file).
     // `numberTree` uses it where text cannot say what contains what: among
@@ -106,13 +129,14 @@ struct RefData {
     bool pasted = false;
     bool typed_in_define = false;
 
-    // TRANSIENT, never on the wire: this reference was SYNTHESISED by Stage2
-    // at a declaration site rather than read from a use site, so its range
-    // deliberately does not spell its symbol -- a function-pointer field's
-    // declaration claims the function assigned to it.  Stage2 does not go
-    // through `insertRef`, so the producer's range check never sees these;
-    // the flag lets a test state the same exemption instead of listing
-    // fixtures.
+    // TRANSIENT, never on the wire: this reference was SYNTHESISED rather
+    // than read from a use site, so its range deliberately does not spell its
+    // symbol.  Two kinds: Stage2's, where a function-pointer field's
+    // declaration claims the function assigned to it, and a macro's reference
+    // to what its invocations declared, which sits on the macro's own name
+    // (`Stage1::linkGenerated`).  Nobody typed the target's name at either, so
+    // neither says the symbol was written down.  The flag also lets a test
+    // state the range exemption instead of listing fixtures.
     bool synthetic = false;
 
     // TRANSIENT, never on the wire: the innermost declaration of this file the
@@ -129,6 +153,12 @@ struct RefData {
     // recorded before the walk).
     static constexpr int32_t kNoScope = -1;
     int32_t scope_idx = kNoScope;
+
+    // TRANSIENT, never on the wire: this reference IS a macro invocation, and
+    // this is where the invocation starts.  A declaration the invocation names
+    // (`InstanceData::named_at`) does not contain it.  -1 for every other
+    // reference.
+    int32_t invocation_at = -1;
 
     // TRANSIENT, never on the wire: the instance that owns this reference.
     // Set from the AST scope for an ordinary ref and from the enclosing macro
@@ -238,6 +268,10 @@ public:
         /// See `RefData::pasted` and `RefData::typed_in_define`.
         bool pasted = false;
         bool typed_in_define = false;
+        /// See `RefData::synthetic`.
+        bool synthetic = false;
+        /// The reference is a macro invocation; see `RefData::invocation_at`.
+        bool invocation = false;
     };
 
     /// Would a reference to the symbol `name`, made by this cursor, get a
@@ -498,6 +532,32 @@ private:
     /// definitions (17%) name another macro, so the hole is the common case,
     /// not an edge case.
     void linkMacroBodies(CXTranslationUnit tu);
+    /// A MACRO REFERS TO WHAT ITS INVOCATIONS DECLARED.
+    ///
+    ///     #define DEFINE_LOCK(name) int name = 0
+    ///     static DEFINE_LOCK(lock);
+    ///
+    /// Nothing somebody typed leads to `lock` except the invocation, and the
+    /// invocation is the macro's doing.  For every declaration an invocation
+    /// names (`InstanceData::named_at`), the invoked macro's `#define` gets a
+    /// reference to it, on the macro's name -- the only text a macro has.
+    ///
+    /// DIRECTLY: a declaration read inside another one the same invocation
+    /// named is reached through that one, like anything else something
+    /// contains.  `KHASH_INIT` leads to the struct and the functions, not to
+    /// each field of the struct.
+    ///
+    /// INTRODUCED: not for a redeclaration; see `InstanceData::introduced`.
+    ///
+    /// Only the OUTERMOST invocation is known (`invocation_spans_`), so that
+    /// is the macro credited: `READ_ONCE` for the assertion `BUILD_BUG_ON`
+    /// declares inside it.
+    ///
+    /// Run after the walk, when each instance's `stack_parent` is this unit's
+    /// final answer and the invocations' cursors still live.
+    void linkDeclared();
+    /// See `InstanceData::named_at`.
+    int32_t namedAt(CXCursor cursor, size_t fi, const InstanceData& d);
     static CXChildVisitResult macroVisitor(CXCursor cursor, CXCursor parent, CXClientData data);
 
     static CXChildVisitResult visitor(CXCursor cursor, CXCursor parent, CXClientData data);

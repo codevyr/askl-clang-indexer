@@ -499,6 +499,10 @@ INSTANTIATE_TEST_SUITE_P(
                 // `main.c -> result` edge for text that says `RESULT`.
                 {"main.c", "DEFINE_HANDLER", 102, 116},
                 {"main.c", "DEFINE_HANDLER", 156, 170},
+                // ...and the two functions those invocations declared, on
+                // DEFINE_HANDLER's own name in the header.
+                {"macros.h", "handle_open", 187, 201},
+                {"macros.h", "handle_close", 187, 201},
                 {"main.c", "RESULT", 272, 278},
                 {"main.c", "RESULT", 302, 308},
                 {"main.c", "DEFAULT_STATUS", 325, 339},
@@ -541,6 +545,17 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "type_b", 309, 315},
                 {"types.h", "type_c", 332, 338},
                 {"types.h", "ALL_TYPES", 398, 407},
+                // What the one recorded invocation declared, on the name of
+                // the macro that was invoked: three fields of the union
+                // somebody typed, and the three structs their declarators
+                // introduce.  ONE_TYPE wrote them, but only the outermost
+                // invocation is on record.
+                {"types.h", "any_type.__type_a__", 261, 270},
+                {"types.h", "any_type.__type_b__", 261, 270},
+                {"types.h", "any_type.__type_c__", 261, 270},
+                {"types.h", "type_a", 261, 270},
+                {"types.h", "type_b", 261, 270},
+                {"types.h", "type_c", 261, 270},
             },
             // instances — a macro has ONE instance, its `#define`.  Using it
             // is a reference, so ALL_TYPES appears once, not once per use.
@@ -599,6 +614,9 @@ INSTANTIATE_TEST_SUITE_P(
                 {"types.h", "alpha", 403, 408},
                 // The invocation edge at the ALL_STRUCTS name span.
                 {"types.h", "ALL_STRUCTS", 477, 488},
+                // What that invocation declared, on ALL_STRUCTS's own name.
+                {"types.h", "alpha", 374, 385},
+                {"types.h", "wrapper.alpha_ptr", 374, 385},
             },
             {
                 {"main.c", "main.c"},
@@ -789,6 +807,10 @@ INSTANTIATE_TEST_SUITE_P(
                 // driver_info.id: spelling refs inside register_driver macro body
                 {"register.h", "driver_info.id", 219, 221},
                 {"register.h", "driver_info.id", 270, 272},
+                // The two functions the invocation declared, on the macro's
+                // own name.
+                {"register.h", "__init", 153, 168},
+                {"register.h", "__exit", 153, 168},
             },
             {
                 {"main.c", "__exit"},
@@ -2280,15 +2302,17 @@ TEST(ObjectRoots, ADefinitionNamedThroughAMacroContainsItsBody) {
                   {"plain", "helper"},
                   {"wrapped", "helper"},
                   {"renamed", "helper"},
-                  // The invocation that spells the name is written inside the
-                  // definition's own extent, so it is the definition's.
-                  {"wrapped", "PROFILE_FUNC"},
-                  {"renamed", "alias"},
-                  // Wholly generated.  The invocation is written inside the
-                  // extent of what it generates, by the same rule as above;
-                  // what the generated body calls is named by the `#define`.
-                  // The invocation was read by nothing, and what it generated
-                  // has no text of its own to hold it: it sits in the file.
+                  // The invocation that supplies a definition's name declares
+                  // it: the macro leads to the definition, and the invocation
+                  // sits where the definition sits, not inside it.  The body
+                  // somebody typed stays the definition's.
+                  {"PROFILE_FUNC", "wrapped"},
+                  {"main.c", "PROFILE_FUNC"},
+                  {"alias", "renamed"},
+                  {"main.c", "alias"},
+                  // Wholly generated: the same rule.  What the generated body
+                  // calls is named by the `#define`.
+                  {"DEFINE_SHOW", "event_show"},
                   {"main.c", "DEFINE_SHOW"},
                   {"DEFINE_SHOW", "shown"},
               }));
@@ -2338,6 +2362,8 @@ TEST(ObjectRoots, AFunctionUsedAsAValueIsReferenced) {
                   // generated declaration has no text of its own to hold it.
                   {"main.c", "INIT"},
                   {"get_init", "other"},
+                  // The macro leads to the function its invocation declared.
+                  {"INIT", "get_init"},
                   // The types, unchanged by any of this.
                   {"ret", "fn_t"},
                   {"addr", "fn_t"},
@@ -2842,14 +2868,99 @@ TEST(ObjectRoots, AGeneratedDeclarationSitsWhereItWasRead) {
     auto parents = built.parents();
     EXPECT_TRUE(parents.count({"blah", "main.c"}));
     EXPECT_FALSE(parents.count({"blah", "blah_send"}));
-    // What was typed is unchanged: the invocation lies in `blah_send`'s text.
-    EXPECT_TRUE(built.sits().count({"blah_send", "PROFILE_FUNC"}));
+    // What was typed is unchanged, but for the invocation that named
+    // `blah_send`: it is beside the function it declared
+    // (`AMacroRefersToWhatItsInvocationsDeclared`).
+    EXPECT_TRUE(built.sits().count({"main.c", "PROFILE_FUNC"}));
     EXPECT_TRUE(built.sits().count({"blah_send", "helper"}));
 
     // The kernel's SYSCALL_DEFINE shape: the prototypes are beside the
     // function that carries the body, not inside it.
     BuiltFixture sys("macro_trailing_body", {"main.c"});
     EXPECT_FALSE(sys.parents().count({"entry_read", "do_read"}));
+}
+
+// A MACRO LEADS TO WHAT ITS INVOCATIONS DECLARED.
+//
+//     #define DEFINE_LOCK(name) int name = 0
+//     static DEFINE_LOCK(slock);
+//
+// Nothing somebody typed leads to `slock` except the invocation, and the
+// invocation is the macro's doing.  So:
+//
+//   An invocation that supplies a declaration's name declares it: the macro
+//   refers to the declaration, and the invocation sits where the declaration
+//   sits, not inside it.
+//
+// By the NAME, not the extent.  `static DEFINE_LOCK(slock)` starts on text
+// somebody typed and `PROFILE_FUNC(int, send, x) { ... }` ends on it; both got
+// their name from the invocation, and 1,012 of the kernel's 1,098 file-scope
+// `DEFINE_MUTEX` variables are written the first way.  `DEPRECATED int f()`
+// starts on an invocation that names nothing, and is unchanged.
+//
+// DIRECTLY: what a declared struct or function holds in turn is reached
+// through it, like anything else something contains.  INTRODUCED: a macro
+// that only redeclares what exists (`EXPORT_SYMBOL(foo)`) does not lead to it.
+//
+// The reference sits on the macro's name in its `#define`, which is the only
+// text the macro has.  It says nothing about whether the declaration was ever
+// written down, so it unfolds nothing.
+TEST(ObjectRoots, AMacroRefersToWhatItsInvocationsDeclared) {
+    BuiltFixture built("reference_from_define", {"main.c"});
+    auto sits = built.sits();
+    EXPECT_TRUE(sits.count({"DEFINE_LOCK", "lock"}));
+    // Typed text before the invocation: the same answer, one edge.
+    EXPECT_TRUE(sits.count({"DEFINE_LOCK", "slock"}));
+    EXPECT_FALSE(sits.count({"slock", "DEFINE_LOCK"}));
+    EXPECT_TRUE(sits.count({"main.c", "DEFINE_LOCK"}));
+    // A field declared inside a struct somebody typed: the macro leads to
+    // the field, and the field to the type its declaration names.
+    EXPECT_TRUE(sits.count({"HOOK", "hooks.open"}));
+    EXPECT_TRUE(sits.count({"HOOK", "other.close"}));
+    EXPECT_TRUE(sits.count({"hooks", "HOOK"}));
+    EXPECT_TRUE(sits.count({"hooks.open", "ops_ret"}));
+    // Typed text after the invocation: the function keeps its body and what
+    // the body names; the invocation that named it is beside it.
+    EXPECT_TRUE(sits.count({"PROFILE_FUNC", "blah"}));
+    EXPECT_TRUE(sits.count({"PROFILE_FUNC", "blah_send"}));
+    EXPECT_FALSE(sits.count({"blah_send", "PROFILE_FUNC"}));
+    EXPECT_TRUE(sits.count({"main.c", "PROFILE_FUNC"}));
+    EXPECT_TRUE(sits.count({"blah_send", "helper"}));
+    // An invocation that names nothing stays in the declaration around it.
+    EXPECT_TRUE(sits.count({"old_api", "DEPRECATED"}));
+    EXPECT_FALSE(sits.count({"DEPRECATED", "old_api"}));
+    // The first declaration is introduced; a redeclaration is not.
+    EXPECT_TRUE(sits.count({"DECLARE_COUNTER", "hits"}));
+    EXPECT_FALSE(sits.count({"EXPORT", "lock"}));
+    // Directly: the struct and the function, not what they hold.
+    EXPECT_TRUE(sits.count({"FAMILY", "pair_s"}));
+    EXPECT_TRUE(sits.count({"FAMILY", "pair_get"}));
+    EXPECT_FALSE(sits.count({"FAMILY", "pair_s.n"}));
+    // Inside a function too.
+    EXPECT_TRUE(sits.count({"CHECK", "check_failed"}));
+
+    // The reference is on the macro's name, in the file that defines it.
+    bool found = false;
+    for (const auto& obj : built.project.objects()) {
+        const std::string& text = obj.content();
+        for (const auto& ref : obj.refs()) {
+            if (built.name.at(ref.to_symbol_local_id()) != "lock") continue;
+            const std::string at = text.substr(
+                static_cast<size_t>(ref.from_offset_start()),
+                static_cast<size_t>(ref.from_offset_end() - ref.from_offset_start()));
+            if (at != "DEFINE_LOCK") continue;
+            found = true;
+            EXPECT_NE(obj.filesystem_path().find("defs.h"), std::string::npos);
+        }
+    }
+    EXPECT_TRUE(found);
+
+    // It unfolds nothing: what only a macro wrote stays unlisted.
+    auto folded = built.folded();
+    EXPECT_TRUE(folded.count("blah"));
+    EXPECT_TRUE(folded.count("pair_get"));
+    EXPECT_TRUE(folded.count("check_failed"));
+    EXPECT_FALSE(folded.count("lock"));
 }
 
 // ...AND WHERE TWO UNITS READ IT IN DIFFERENT PLACES, THE WALK SAYS NOTHING.

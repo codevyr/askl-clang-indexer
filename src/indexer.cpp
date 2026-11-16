@@ -230,6 +230,8 @@ void Indexer::processTU(const CompileCommand& cmd) {
                         // wins, whichever unit holds it.
                         e.generated = e.generated && in.generated;
                         e.name_typed = e.name_typed || in.name_typed;
+                        e.named_at = std::max(e.named_at, in.named_at);
+                        e.introduced = e.introduced || in.introduced;
                         if (e.name_start < 0 && in.name_start >= 0) {
                             e.name_start = in.name_start;
                             e.name_end = in.name_end;

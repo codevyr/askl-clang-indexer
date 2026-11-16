@@ -137,6 +137,7 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
             at.fi = fi;
             at.start = static_cast<int32_t>(start_off);
             at.end = static_cast<int32_t>(start_off + sname.size());
+            at.invocation = true;
             self->insertRef(at, sym_id, sname, static_cast<int32_t>(start_off),
                             static_cast<int32_t>(end_off));
             // The same span is what later decides whether a declaration has
@@ -242,6 +243,64 @@ void Stage1::linkMacroBodies(CXTranslationUnit tu) {
             insertRef(at, it->second, tok);
         }
         clang_disposeTokens(tu, toks, n);
+    }
+}
+
+void Stage1::linkDeclared() {
+    // Where a macro's name is, by the invocation that names it.  One
+    // invocation can declare many things and a header's invocations are met
+    // again in every unit, so the definition is looked up once each.
+    struct Site {
+        bool known = false;
+        size_t fi = 0;
+        int32_t start = 0, end = 0;
+        std::string name;
+    };
+    for (auto& [fi, spans] : invocation_spans_) {
+        std::unordered_map<int32_t, Site> sites;
+        // By index: a reference into another file can add a file, and
+        // `result_.files` may move.
+        for (size_t i = 0; i < result_.files[fi].instances.size(); ++i) {
+            const InstanceData d = result_.files[fi].instances[i];
+            if (d.named_at < 0 || !d.introduced) continue;
+            auto inv = spans.find(d.named_at);
+            if (inv == spans.end()) continue;
+
+            // Read inside another declaration this invocation named: that
+            // one holds it, and the macro leads to that one.
+            if (d.stack_parent >= 0 &&
+                result_.files[fi].instances[static_cast<size_t>(d.stack_parent)].named_at ==
+                    d.named_at)
+                continue;
+
+            auto [slot, fresh] = sites.try_emplace(inv->first);
+            Site& site = slot->second;
+            if (fresh) {
+                CXCursor def = clang_getCursorReferenced(inv->second.cursor);
+                CXFile def_file = nullptr;
+                unsigned def_start = 0, def_end = 0;
+                if (clang_getCursorKind(def) == CXCursor_MacroDefinition &&
+                    getSpellingRange(def, def_file, def_start, def_end) && def_file) {
+                    ClangString name(clang_getCursorSpelling(def));
+                    site.name = name.to_string();
+                    site.fi = getOrCreateFile(def_file);
+                    // A `#define`'s extent starts at the name it defines.
+                    site.start = static_cast<int32_t>(def_start);
+                    site.end = site.start + static_cast<int32_t>(site.name.size());
+                    site.known = !site.name.empty();
+                }
+            }
+            if (!site.known) continue;
+
+            RefPlace at;
+            at.fi = site.fi;
+            at.start = site.start;
+            at.end = site.end;
+            // The text there is the macro's name, not the declaration's.
+            at.unspelled = true;
+            at.synthetic = true;
+            insertRef(at, d.symbol_local_id, site.name);
+        }
     }
 }
 
@@ -476,6 +535,36 @@ void Stage1::markOrigin(CXCursor cursor, size_t fi, InstanceData& d) {
     // A declaration with text of its own has been written down already; the
     // name only decides anything for one that has none.
     d.name_typed = d.generated && nameTypedInNormalCode(cursor);
+    d.named_at = namedAt(cursor, fi, d);
+    d.introduced = clang_isCursorDefinition(cursor) ||
+                   clang_equalCursors(clang_getCanonicalCursor(cursor), cursor);
+}
+
+int32_t Stage1::namedAt(CXCursor cursor, size_t fi, const InstanceData& d) {
+    auto file = invocation_spans_.find(fi);
+    if (file == invocation_spans_.end()) return -1;
+    auto spanAround = [&](int32_t offset) -> int32_t {
+        auto next = file->second.upper_bound(offset);
+        if (next == file->second.begin()) return -1;
+        auto inv = std::prev(next);
+        return inv->second.end > offset ? inv->first : -1;
+    };
+    // Where the name token EXPANDS: for anything that came through an
+    // invocation -- an argument, a body token, a pasted name -- that is the
+    // invocation; for a token somebody typed in place, it is the token.
+    CXSourceRange nr = clang_Cursor_getSpellingNameRange(cursor, 0, 0);
+    if (!clang_Range_isNull(nr)) {
+        CXFile at_file = nullptr;
+        unsigned offset = 0;
+        clang_getExpansionLocation(clang_getRangeStart(nr), &at_file, nullptr, nullptr, &offset);
+        if (at_file && getOrCreateFile(at_file) == fi) {
+            int32_t at = spanAround(static_cast<int32_t>(offset));
+            if (at >= 0) return at;
+        }
+    }
+    // A declaration that is nothing but an invocation is named by it whatever
+    // clang says of the name: an unnamed record has no name token at all.
+    return d.generated ? spanAround(d.start_offset) : -1;
 }
 
 int32_t reconcileReadIn(const std::vector<InstanceData>& instances, int32_t self, int32_t kept,
@@ -538,6 +627,8 @@ void Stage1::addInstance(size_t fi, InstanceData d, bool opens_scope) {
         InstanceData& kept = instances[it->second];
         kept.generated = kept.generated && d.generated;
         kept.name_typed = kept.name_typed || d.name_typed;
+        kept.named_at = std::max(kept.named_at, d.named_at);
+        kept.introduced = kept.introduced || d.introduced;
         kept.stack_parent = reconcileReadIn(instances, static_cast<int32_t>(it->second),
                                             kept.stack_parent, d.stack_parent);
     }
@@ -671,7 +762,7 @@ void Stage1::numberTree(FileData& f) {
     };
     std::vector<int32_t> around;
     auto containersOf = [&](int32_t start, int32_t end, int32_t read_in, int32_t self,
-                            std::vector<int32_t>& out) {
+                            int32_t invocation_at, std::vector<int32_t>& out) {
         out.clear();
         around.clear();
         const bool placed_by_walk =
@@ -679,6 +770,8 @@ void Stage1::numberTree(FileData& f) {
             f.instances[static_cast<size_t>(self)].stack_parent != InstanceData::kReadDisputed;
         for (size_t j = 0; j < n; ++j) {
             const InstanceData& c = f.instances[j];
+            // A declaration does not contain the invocation that names it.
+            if (invocation_at >= 0 && c.named_at == invocation_at) continue;
             if (static_cast<int32_t>(j) != self && c.start_offset <= start && end <= c.end_offset)
                 around.push_back(static_cast<int32_t>(j));
         }
@@ -723,7 +816,7 @@ void Stage1::numberTree(FileData& f) {
     for (size_t i = 0; i < n; ++i) {
         const InstanceData& x = f.instances[i];
         containersOf(x.start_offset, x.end_offset, x.stack_parent, static_cast<int32_t>(i),
-                     holders);
+                     -1, holders);
         if (!holders.empty()) parent[i] = holders.front();
     }
 
@@ -788,7 +881,7 @@ void Stage1::numberTree(FileData& f) {
     const size_t given = f.refs.size();
     for (size_t ri = 0; ri < given; ++ri) {
         containersOf(f.refs[ri].from_offset_start, f.refs[ri].from_offset_end,
-                     f.refs[ri].scope_idx, -1, holders);
+                     f.refs[ri].scope_idx, -1, f.refs[ri].invocation_at, holders);
         for (size_t k = 0; k < holders.size(); ++k) {
             if (k > 0) f.refs.push_back(f.refs[ri]);
             RefData& r = k > 0 ? f.refs.back() : f.refs[ri];
@@ -1112,6 +1205,8 @@ void Stage1::insertRef(const RefPlace& at, int64_t sym_id, const std::string& sy
     r.scope_idx = scope;
     r.pasted = at.pasted;
     r.typed_in_define = at.typed_in_define;
+    r.synthetic = at.synthetic;
+    if (at.invocation) r.invocation_at = full_start;
     r.full_start = full_start;
     r.full_end = full_end;
     result_.files[file_idx].refs.push_back(r);
@@ -1599,6 +1694,7 @@ void Stage1::process(CXTranslationUnit tu, const std::string& tu_filename) {
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, visitor, this);
     closeScopesTo(0);
+    linkDeclared();
     // Structure only.  NUMBERING HAPPENS AFTER THE MERGE, in `Indexer::run`,
     // because a file's instances are a property of its TEXT and this TU holds
     // only one view of it: numbering here meant a second TU's refs had to be
