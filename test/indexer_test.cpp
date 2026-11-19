@@ -2963,6 +2963,45 @@ TEST(ObjectRoots, AMacroRefersToWhatItsInvocationsDeclared) {
     EXPECT_FALSE(folded.count("lock"));
 }
 
+// A VARIABLE WITHOUT AN INITIALIZER IS DEFINED WHERE IT IS NOT `extern`.
+//
+// `int x;` at file scope is a definition in C -- a tentative one, which the
+// compiler turns into the definition unless another unit supplies an
+// initializer.  libclang answers "not a definition" for it, so after an
+// `extern int x;` in a header the indexer recorded `int x;` as one more
+// declaration: the variable had no definition anywhere, and the macro that
+// defined it (`DEFINE_PER_CPU(struct rq, runqueues)`) was not credited with
+// it while the one that only declared it was.
+TEST(ObjectRoots, AVariableWithoutAnInitializerIsDefinedWhereItIsNotExtern) {
+    BuiltFixture built("tentative_definition", {"main.c"});
+
+    // (name, file) of every DEFINITION instance.
+    std::set<std::pair<std::string, std::string>> defined;
+    for (const auto& obj : built.project.objects()) {
+        const std::string& path = obj.filesystem_path();
+        const std::string file = path.substr(path.rfind('/') + 1);
+        for (const auto& i : obj.symbol_instances())
+            if (i.instance_type() == askl::index::InstanceType::DEFINITION)
+                defined.insert({built.name.at(i.symbol_local_id()), file});
+    }
+    EXPECT_TRUE(defined.count({"initialised", "main.c"}));
+    EXPECT_TRUE(defined.count({"tentative", "main.c"}));
+    EXPECT_TRUE(defined.count({"plain", "main.c"}));
+    EXPECT_TRUE(defined.count({"counter", "main.c"}));
+    // An `extern` declaration stays one, in the header and with no definition
+    // anywhere.
+    EXPECT_FALSE(defined.count({"tentative", "defs.h"}));
+    EXPECT_FALSE(defined.count({"plain", "defs.h"}));
+    EXPECT_FALSE(defined.count({"only_declared", "defs.h"}));
+
+    // The macro that defined it is credited, like the one with an
+    // initializer; the first declaration still is too.
+    auto sits = built.sits();
+    EXPECT_TRUE(sits.count({"DEFINE_VI", "initialised"}));
+    EXPECT_TRUE(sits.count({"DEFINE_V", "tentative"}));
+    EXPECT_TRUE(sits.count({"DECLARE_V", "tentative"}));
+}
+
 // ...AND WHERE TWO UNITS READ IT IN DIFFERENT PLACES, THE WALK SAYS NOTHING.
 //
 // One file compiled twice declares `work` and `work_variant` on the same
