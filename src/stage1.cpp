@@ -529,6 +529,25 @@ bool Stage1::nameTypedInNormalCode(CXCursor cursor) {
     return !insideDefine(getOrCreateFile(file), static_cast<int32_t>(offset));
 }
 
+// Whether this declaration is the thing itself and not an announcement of it.
+//
+// libclang answers that for everything but C's tentative definition: `int x;`
+// at file scope, with no `extern` and no initializer.  That is how most
+// uninitialized globals are defined (`DEFINE_PER_CPU(...)`, a plain
+// `int debug;`), and the compiler makes it THE definition unless another
+// unit initializes the variable -- but `clang_isCursorDefinition` says no,
+// and after an `extern int x;` in a header the variable had no definition at
+// all.  C++ has no tentative definitions and already answers yes there; a
+// static data member is declared inside its class, not at file scope.
+static bool definesHere(CXCursor cursor) {
+    if (clang_isCursorDefinition(cursor)) return true;
+    if (clang_getCursorKind(cursor) != CXCursor_VarDecl) return false;
+    const CX_StorageClass storage = clang_Cursor_getStorageClass(cursor);
+    if (storage == CX_SC_Extern || storage == CX_SC_PrivateExtern) return false;
+    return clang_getCursorKind(clang_getCursorSemanticParent(cursor)) ==
+           CXCursor_TranslationUnit;
+}
+
 void Stage1::markOrigin(CXCursor cursor, size_t fi, InstanceData& d) {
     d.generated = isWhollyAnInvocation(fi, d.start_offset, d.end_offset) ||
                   continuesAsInvocation(cursor, fi, d.start_offset, d.end_offset);
@@ -536,7 +555,7 @@ void Stage1::markOrigin(CXCursor cursor, size_t fi, InstanceData& d) {
     // name only decides anything for one that has none.
     d.name_typed = d.generated && nameTypedInNormalCode(cursor);
     d.named_at = namedAt(cursor, fi, d);
-    d.introduced = clang_isCursorDefinition(cursor) ||
+    d.introduced = definesHere(cursor) ||
                    clang_equalCursors(clang_getCanonicalCursor(cursor), cursor);
 }
 
@@ -1555,7 +1574,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         int64_t sym_id = resolveSymbol(symbols_, cursor, sname, SYMTYPE_DATA);
-        int inst_type = clang_isCursorDefinition(cursor) ? INSTTYPE_DEFINITION : INSTTYPE_DECLARATION;
+        int inst_type = definesHere(cursor) ? INSTTYPE_DEFINITION : INSTTYPE_DECLARATION;
 
         CXFile range_file;
         unsigned start_off, end_off;
