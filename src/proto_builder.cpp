@@ -52,7 +52,6 @@ void ensureObjectRoot(askl::index::Object* obj, int64_t stride) {
         if (ref->dfs_enter() != 0) continue;
         ref->set_dfs_enter(root->dfs_enter() + 1);
         ref->set_nesting_level(root->nesting_level() + 1);
-        ref->set_fold_depth(root->fold_depth() + (root->folded() ? 1 : 0));
     }
 }
 
@@ -133,6 +132,7 @@ BuildResult ProtoBuilder::build(
         pb_sym->set_name(sym.name);
         pb_sym->set_scope(static_cast<askl::index::SymbolScope>(sym.scope));
         pb_sym->set_type(static_cast<askl::index::SymbolType>(sym.type));
+        pb_sym->set_folded(sym.folded);
         if (sym.type == SYMTYPE_DIRECTORY) {
             dirSymbolID[sym.name] = sym.local_id;
         } else if (sym.type == SYMTYPE_MODULE) {
@@ -181,8 +181,6 @@ BuildResult ProtoBuilder::build(
             pb_inst->set_nesting_level(inst.nesting_level);
             pb_inst->set_dfs_enter(inst.dfs_enter);
             pb_inst->set_dfs_exit(inst.dfs_exit);
-            pb_inst->set_folded(inst.folded);
-            pb_inst->set_fold_depth(inst.fold_depth);
             // -1 means the indexer could not determine the span; leave the
             // field unset so "unknown" stays distinct from "empty".
             if (inst.name_start >= 0) {
@@ -202,10 +200,13 @@ BuildResult ProtoBuilder::build(
             }
         }
 
-        // Deduplicate refs by (to_symbol_local_id, from_offset_start, from_offset_end)
-        std::unordered_set<EntryKey, EntryKeyHash> seen_refs;
+        // One reference per (target, token, place in the tree).  `numberTree`
+        // already guarantees it for a file it numbered; this covers a caller
+        // that hands over references it built itself.
+        std::unordered_set<RefKey, RefKeyHash> seen_refs;
         for (auto& ref : file.refs) {
-            EntryKey key{ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end};
+            RefKey key{ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end,
+                       ref.dfs_enter};
             if (seen_refs.insert(key).second) {
                 auto* pb_ref = obj->add_refs();
                 pb_ref->set_to_symbol_local_id(ref.to_symbol_local_id);
@@ -213,8 +214,6 @@ BuildResult ProtoBuilder::build(
                 pb_ref->set_from_offset_end(ref.from_offset_end);
                 pb_ref->set_nesting_level(ref.nesting_level);
                 pb_ref->set_dfs_enter(ref.dfs_enter);
-                pb_ref->set_folded(ref.folded);
-                pb_ref->set_fold_depth(ref.fold_depth);
                 if (ref.full_start >= 0) {
                     auto* sp = pb_ref->mutable_full();
                     sp->set_start(ref.full_start);

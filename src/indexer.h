@@ -58,7 +58,10 @@ private:
     ///
     /// Indexed in lockstep with `all_files_`; both are guarded by files_mutex_.
     std::vector<std::unordered_map<InstKey, size_t, InstKeyHash>> merged_inst_keys_;
-    std::vector<std::unordered_set<EntryKey, EntryKeyHash>> merged_ref_keys_;
+    /// Key -> index in the file's `refs`.  The index is for the few facts a
+    /// reference carries that two units may see differently (`mergeRefView`);
+    /// everything else about a reference is its key.
+    std::vector<std::unordered_map<RefKey, uint32_t, RefKeyHash>> merged_ref_keys_;
 
     /// How much the cross-TU union actually contributed, for the summary line.
     /// A file counted here was seen DIFFERENTLY by two or more translation
@@ -72,5 +75,8 @@ private:
     void addFile(const std::string& abs_path);
     void createDirectorySymbols();
     void createModuleSymbols();
+    /// Decide `Symbol.folded` for every symbol: folded unless normal code
+    /// wrote it down.  See the proto for the rule.
+    void foldSymbols();
     std::string computeCommonAncestor(const std::vector<CompileCommand>& cmds);
 };

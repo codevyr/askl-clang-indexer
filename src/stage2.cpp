@@ -4,7 +4,10 @@
 #include "symbol_table.h"
 #include "symbol_types.h"
 
-Stage2::Stage2(SymbolTable& symbols) : symbols_(symbols) {}
+#include <utility>
+
+Stage2::Stage2(SymbolTable& symbols, PlacedByStage1 placed_by_stage1)
+    : symbols_(symbols), placed_by_stage1_(std::move(placed_by_stage1)) {}
 
 CXChildVisitResult Stage2::visitor(CXCursor cursor, CXCursor parent, CXClientData data) {
     auto* self = static_cast<Stage2*>(data);
@@ -29,7 +32,26 @@ void Stage2::visitCursor(CXCursor cursor, CXCursor parent) {
     }
 }
 
-void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start_off, unsigned end_off) {
+// THE USE ITSELF, WHEN NOTHING BETTER CAN SAY IT.
+//
+// For a function stored in a field this pass records two things: which FIELD
+// the function implements (below), and the use -- over the whole
+// `.read = my_read` or `ops->read = my_read`.
+//
+// The second was the only record of the use while Stage1 took a reference to
+// a function from calls alone.  It no longer is.  Stage1 records a function
+// named as a value at the token that names it, wherever that token was
+// written, and a name a macro pasted together at the part its caller typed.
+// Wherever it does, a reference over the wider construct says the same use a
+// second time, with a different range, and nothing downstream can tell the
+// two are one.
+//
+// So this is the FALLBACK and nothing else: emitted only when Stage1 has no
+// token to put the reference on, which leaves a pasted name the replay could
+// not follow.  Asked of Stage1 itself rather than re-derived here, so the two
+// passes cannot come to disagree about what counts as placed.
+void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start_off,
+                           unsigned end_off) {
     CXCursor referenced = clang_getCursorReferenced(func_ref);
     if (clang_Cursor_isNull(referenced)) return;
     if (clang_getCursorKind(referenced) != CXCursor_FunctionDecl) return;
@@ -37,6 +59,8 @@ void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start
     ClangString ref_name(clang_getCursorSpelling(referenced));
     std::string sname = ref_name.to_string();
     if (sname.empty()) return;
+
+    if (placed_by_stage1_ && placed_by_stage1_(func_ref, sname)) return;
 
     int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_FUNCTION);
 

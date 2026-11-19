@@ -30,6 +30,9 @@ struct SymbolInfo {
     std::string name;
     int scope;
     int type;
+    /// Not listed by default; see `Symbol.folded` in the proto.  Decided once,
+    /// after every translation unit has been merged (`Indexer::foldSymbols`).
+    bool folded = false;
 };
 
 class SymbolTable {
@@ -40,6 +43,9 @@ public:
         const std::string& file_path = "");
 
     std::vector<SymbolInfo> allSymbols() const;
+
+    /// Mark as folded every symbol whose local id indexes a true entry.
+    void setFolded(const std::vector<char>& folded_by_id);
 
 private:
     mutable std::mutex mutex_;
