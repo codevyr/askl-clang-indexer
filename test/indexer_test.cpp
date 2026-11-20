@@ -3002,6 +3002,23 @@ TEST(ObjectRoots, AVariableWithoutAnInitializerIsDefinedWhereItIsNotExtern) {
     EXPECT_TRUE(sits.count({"DECLARE_V", "tentative"}));
 }
 
+// A NAME PASTED IN A DESIGNATOR IS REFERENCED LIKE ANY OTHER PASTED NAME.
+//
+//   #define REQ_OP_NAME(name) [REQ_OP_##name] = #name
+//   static const char *const blk_op_name[] = { REQ_OP_NAME(READ), ... };
+//
+// The table is indexed by `REQ_OP_READ`, completed by the `READ` its author
+// typed.
+TEST(ObjectRoots, ANamePastedInADesignatorIsReferenced) {
+    BuiltFixture built("macro_pasted_designator", {"main.c"});
+    auto sits = built.sits();
+    EXPECT_TRUE(sits.count({"blk_op_name", "REQ_OP_READ"}));
+    EXPECT_TRUE(sits.count({"blk_op_name", "REQ_OP_WRITE"}));
+    EXPECT_TRUE(sits.count({"blk_op_name", "REQ_OP_FLUSH"}));
+    if (::testing::Test::HasFailure())
+        for (const auto& e : sits) std::cerr << "  " << e.first << " -> " << e.second << "\n";
+}
+
 // ...AND WHERE TWO UNITS READ IT IN DIFFERENT PLACES, THE WALK SAYS NOTHING.
 //
 // One file compiled twice declares `work` and `work_variant` on the same

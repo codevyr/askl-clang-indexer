@@ -988,7 +988,22 @@ std::unique_ptr<PasteMacro> Stage1::parsePasteMacro(CXCursor definition) {
 
     auto macro = std::make_unique<PasteMacro>();
     macro->name = toks[0].text;
-    macro->function_like = clang_Cursor_isMacroFunctionLike(definition) != 0;
+    // FUNCTION-LIKE IS WHAT THE TEXT SAYS: `(` right after the name.
+    //
+    // `clang_Cursor_isMacroFunctionLike` answers for the macro as it stands at
+    // the END of the unit, and says no for one that was `#undef`ed -- which
+    // is how a table macro is ordinarily written:
+    //
+    //     #define REQ_OP_NAME(name) [REQ_OP_##name] = #name
+    //     ... REQ_OP_NAME(READ), ...
+    //     #undef REQ_OP_NAME
+    //
+    // Read as object-like, its parameter list became part of the body and
+    // the replay built no name, so nothing `REQ_OP_NAME` pasted was
+    // referenced.
+    macro->function_like = toks.size() > 1 && toks[1].text == paste_strings_.lparen &&
+                           toks[0].origin.valid() && toks[1].origin.valid() &&
+                           toks[0].origin.end == toks[1].origin.start;
     size_t i = 1;
     if (macro->function_like) {
         if (i >= toks.size() || toks[i].text != paste_strings_.lparen) return nullptr;
