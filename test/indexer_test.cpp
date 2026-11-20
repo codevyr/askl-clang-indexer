@@ -3002,6 +3002,103 @@ TEST(ObjectRoots, AVariableWithoutAnInitializerIsDefinedWhereItIsNotExtern) {
     EXPECT_TRUE(sits.count({"DECLARE_V", "tentative"}));
 }
 
+// A MACRO'S BODY NAMES A FUNCTION-LIKE MACRO ONLY WHERE IT CALLS IT OR HANDS
+// IT ON.
+//
+// `#define __printf(a, b) __attribute__((__format__(printf, a, b)))` writes
+// the identifier `printf`, and some file of the project has
+// `#define printf(fmt, args...) printk(...)`.  The preprocessor expands a
+// function-like macro only where its name is followed by `(`, so that body
+// uses no macro -- but every identifier of a body that named a macro of the
+// unit was linked, and the kernel's `__printf` led to a debug macro of the
+// BFS filesystem and from there to `printk`.
+//
+// What stays: the name called in the body; the name a parameter follows,
+// which may supply the list (`PAIR _tuple`); the name ending the body, which
+// the text after the invocation completes (`#define alias printf`); and the
+// name handed to a macro or to a parameter, which may apply it
+// (`EACH(ENTRY)`, `f(ENTRY)`).
+TEST(ObjectRoots, AMacroBodyNamesAFunctionLikeMacroOnlyWhereItCallsItOrHandsItOn) {
+    BuiltFixture built("macro_name_not_called", {"main.c"});
+    auto sits = built.sits();
+
+    EXPECT_FALSE(sits.count({"__printf", "printf"}));
+    EXPECT_FALSE(sits.count({"PAREN", "printf"}));
+    // Nor is a parameter the macro that shares its spelling.
+    EXPECT_FALSE(sits.count({"PAD", "width"}));
+
+    EXPECT_TRUE(sits.count({"CALLS", "printf"}));
+    EXPECT_TRUE(sits.count({"alias", "printf"}));
+    EXPECT_TRUE(sits.count({"ALL", "EACH"}));
+    EXPECT_TRUE(sits.count({"ALL", "ENTRY"}));
+    EXPECT_TRUE(sits.count({"APPLY", "ENTRY"}));
+    EXPECT_TRUE(sits.count({"ZIP", "PAIR"}));
+    EXPECT_TRUE(sits.count({"printf", "printk"}));
+    if (::testing::Test::HasFailure())
+        for (const auto& e : sits) std::cerr << "  " << e.first << " -> " << e.second << "\n";
+}
+
+// A NAME PASTED IN A DESIGNATOR IS REFERENCED LIKE ANY OTHER PASTED NAME.
+//
+//   #define REQ_OP_NAME(name) [REQ_OP_##name] = #name
+//   static const char *const blk_op_name[] = { REQ_OP_NAME(READ), ... };
+//
+// The table is indexed by `REQ_OP_READ`, completed by the `READ` its author
+// typed.
+TEST(ObjectRoots, ANamePastedInADesignatorIsReferenced) {
+    BuiltFixture built("macro_pasted_designator", {"main.c"});
+    auto sits = built.sits();
+    EXPECT_TRUE(sits.count({"blk_op_name", "REQ_OP_READ"}));
+    EXPECT_TRUE(sits.count({"blk_op_name", "REQ_OP_WRITE"}));
+    EXPECT_TRUE(sits.count({"blk_op_name", "REQ_OP_FLUSH"}));
+    if (::testing::Test::HasFailure())
+        for (const auto& e : sits) std::cerr << "  " << e.first << " -> " << e.second << "\n";
+}
+
+// WHAT AN `#include` INSIDE A DECLARATION BRINGS IN IS READ THERE.
+//
+//     int dispatch(int nr, int x) {
+//         switch (nr) {
+//     #include "syscalls.h"          /* __SYSCALL(0, sys_read) ... */
+//         default: return -1;
+//         }
+//     }
+//
+// The function calls everything the header lists, and so does the table
+// built the same way.  The text of those calls is in the header and
+// containment does not cross files, so both contained nothing and the header
+// alone "used" the functions -- the kernel's `x64_sys_call` called one
+// function and `sys_call_table` held none.
+//
+// Each such reference is also recorded on the `#include` line, which is how
+// its author wrote it into the declaration.  That covers a header the
+// included one includes in turn, and the macros used in that text.  The
+// header keeps its own references, and an `#include` at file scope adds
+// none to anything.
+TEST(ObjectRoots, WhatAnIncludeInsideADeclarationBringsInIsReadThere) {
+    BuiltFixture built("include_inside_declaration", {"main.c"});
+    auto sits = built.sits();
+    for (const char* fn : {"sys_read", "sys_write", "sys_close"}) {
+        EXPECT_TRUE(sits.count({"table", fn})) << fn;
+        EXPECT_TRUE(sits.count({"dispatch", fn})) << fn;
+    }
+    EXPECT_TRUE(sits.count({"table", "__SYSCALL"}));
+    EXPECT_TRUE(sits.count({"dispatch", "__SYSCALL"}));
+
+    // The text is still the header's.
+    EXPECT_TRUE(sits.count({"syscalls.h", "sys_read"}));
+    EXPECT_TRUE(sits.count({"syscalls.h", "__SYSCALL"}));
+    EXPECT_TRUE(sits.count({"more.h", "sys_close"}));
+
+    // File scope is not a declaration: the first `#include` of the header
+    // gives the file nothing.
+    for (const auto& edge : sits) EXPECT_NE(edge.first, "main.c") << edge.second;
+
+    // Nobody typed a name on the `#include` line, so being reached through
+    // one is not what gets a symbol listed.
+    EXPECT_TRUE(built.folded().empty());
+}
+
 // ...AND WHERE TWO UNITS READ IT IN DIFFERENT PLACES, THE WALK SAYS NOTHING.
 //
 // One file compiled twice declares `work` and `work_variant` on the same
