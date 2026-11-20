@@ -331,6 +331,8 @@ private:
         size_t file_idx;
         unsigned start, end;   // the whole `#define` body extent
         std::string name;      // the macro being defined
+        /// It takes arguments: `(` follows the name with nothing between.
+        bool function_like = false;
     };
     std::vector<MacroBody> macro_bodies_;
 

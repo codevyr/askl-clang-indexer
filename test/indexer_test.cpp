@@ -3002,6 +3002,42 @@ TEST(ObjectRoots, AVariableWithoutAnInitializerIsDefinedWhereItIsNotExtern) {
     EXPECT_TRUE(sits.count({"DECLARE_V", "tentative"}));
 }
 
+// A MACRO'S BODY NAMES A FUNCTION-LIKE MACRO ONLY WHERE IT CALLS IT OR HANDS
+// IT ON.
+//
+// `#define __printf(a, b) __attribute__((__format__(printf, a, b)))` writes
+// the identifier `printf`, and some file of the project has
+// `#define printf(fmt, args...) printk(...)`.  The preprocessor expands a
+// function-like macro only where its name is followed by `(`, so that body
+// uses no macro -- but every identifier of a body that named a macro of the
+// unit was linked, and the kernel's `__printf` led to a debug macro of the
+// BFS filesystem and from there to `printk`.
+//
+// What stays: the name called in the body; the name a parameter follows,
+// which may supply the list (`PAIR _tuple`); the name ending the body, which
+// the text after the invocation completes (`#define alias printf`); and the
+// name handed to a macro or to a parameter, which may apply it
+// (`EACH(ENTRY)`, `f(ENTRY)`).
+TEST(ObjectRoots, AMacroBodyNamesAFunctionLikeMacroOnlyWhereItCallsItOrHandsItOn) {
+    BuiltFixture built("macro_name_not_called", {"main.c"});
+    auto sits = built.sits();
+
+    EXPECT_FALSE(sits.count({"__printf", "printf"}));
+    EXPECT_FALSE(sits.count({"PAREN", "printf"}));
+    // Nor is a parameter the macro that shares its spelling.
+    EXPECT_FALSE(sits.count({"PAD", "width"}));
+
+    EXPECT_TRUE(sits.count({"CALLS", "printf"}));
+    EXPECT_TRUE(sits.count({"alias", "printf"}));
+    EXPECT_TRUE(sits.count({"ALL", "EACH"}));
+    EXPECT_TRUE(sits.count({"ALL", "ENTRY"}));
+    EXPECT_TRUE(sits.count({"APPLY", "ENTRY"}));
+    EXPECT_TRUE(sits.count({"ZIP", "PAIR"}));
+    EXPECT_TRUE(sits.count({"printf", "printk"}));
+    if (::testing::Test::HasFailure())
+        for (const auto& e : sits) std::cerr << "  " << e.first << " -> " << e.second << "\n";
+}
+
 // A NAME PASTED IN A DESIGNATOR IS REFERENCED LIKE ANY OTHER PASTED NAME.
 //
 //   #define REQ_OP_NAME(name) [REQ_OP_##name] = #name

@@ -86,7 +86,14 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
                 false);
             // The body is read for the macros it names once every macro in
             // this TU is known; see `linkMacroBodies`.
-            self->macro_bodies_.push_back({cursor, fi, start_off, end_off, sname});
+            // `(` right after the name, in the text.  Not asked of clang,
+            // which answers for the end of the unit and says no after an
+            // `#undef`; see `parsePasteMacro`.
+            const std::vector<uint8_t>& content = self->result_.files[fi].content;
+            const size_t after_name = static_cast<size_t>(start_off) + sname.size();
+            const bool function_like = after_name < content.size() && content[after_name] == '(';
+            self->macro_bodies_.push_back(
+                {cursor, fi, start_off, end_off, sname, function_like});
             self->macro_def_index_[sname] = self->macro_bodies_.size() - 1;
             // Where normal code stops; see `insideDefine`.
             self->define_spans_[fi][static_cast<int32_t>(start_off)] =
@@ -170,38 +177,82 @@ void Stage1::linkMacroBodies(CXTranslationUnit tu) {
 
         // Parameter names are NOT macros, whatever else in the project shares
         // their spelling -- `#define WRAP(x) FOO(x)` must not gain an edge to
-        // some unrelated `#define x`.  A macro is function-like exactly when
-        // the `(` abuts the name with no space, so compare offsets rather than
-        // guessing from the text.
+        // some unrelated `#define x`.  Whether there is a parameter list is
+        // what `MacroBody::function_like` says: `#define F (x)` is an
+        // object-like macro whose body starts with a parenthesis.
+        //
+        // The list used to be looked for by a loop that began at the macro's
+        // own name and stopped there, so no parameter was ever found and every
+        // one that shared a macro's spelling was linked to it.
         std::unordered_set<std::string> params;
-        unsigned name_end_off = b.start + static_cast<unsigned>(b.name.size());
-        bool in_params = false;
+        std::vector<std::string> text(n);
         for (unsigned i = 0; i < n; ++i) {
-            CXSourceLocation tl = clang_getTokenLocation(tu, toks[i]);
-            unsigned off = 0;
-            clang_getSpellingLocation(tl, nullptr, nullptr, nullptr, &off);
             ClangString spell(clang_getTokenSpelling(tu, toks[i]));
-            std::string tok = spell.to_string();
-            if (i == 1 && tok == "(" && off == name_end_off) {
-                in_params = true;
-                continue;
-            }
-            if (in_params) {
-                if (tok == ")") break;
-                if (clang_getTokenKind(toks[i]) == CXToken_Identifier) params.insert(tok);
-                continue;
-            }
-            break; // object-like macro: no parameter list to skip
+            text[i] = spell.to_string();
+        }
+        // Where the body starts: after the name, or after the parameter list.
+        unsigned body_begin = n > 0 ? 1 : 0;
+        if (b.function_like && n > 1 && text[1] == "(") {
+            unsigned i = 2;
+            for (; i < n && text[i] != ")"; ++i)
+                if (clang_getTokenKind(toks[i]) == CXToken_Identifier) params.insert(text[i]);
+            body_begin = i < n ? i + 1 : n;
         }
 
-        for (unsigned i = 0; i < n; ++i) {
+        // A FUNCTION-LIKE MACRO IS USED ONLY WHERE IT IS CALLED OR HANDED ON.
+        //
+        // The preprocessor expands one only where `(` follows its name, so
+        // `__attribute__((__format__(printf, a, b)))` uses no macro whatever
+        // some file `#define`s `printf(...)` to be.  Linking every identifier
+        // that names a macro gave the kernel's `__printf` an edge to a debug
+        // macro of one filesystem.
+        //
+        // Four places can still lead to an expansion:
+        //   - `(` follows the name;
+        //   - a parameter or a macro follows it, which may supply the list
+        //     (`#define ZIP(_tuple) TUPLE_0 _tuple`, called `ZIP((a, b))`);
+        //   - the name ends the body, and what follows the INVOCATION
+        //     completes the call (`#define alias printf`);
+        //   - the name is an argument of a macro or of a parameter, which may
+        //     apply it (`EACH(ENTRY)`, `f(ENTRY)`).  The innermost list with a
+        //     name in front of it decides: `__format__` is neither.
+        auto usedHere = [&](unsigned i) {
+            auto def = macro_def_index_.find(text[i]);
+            if (def == macro_def_index_.end() || !macro_bodies_[def->second].function_like)
+                return true; // object-like: every mention expands
+            if (i + 1 >= n || text[i + 1] == "(") return true;
+            if (clang_getTokenKind(toks[i + 1]) == CXToken_Identifier &&
+                (params.count(text[i + 1]) > 0 || tu_macros_.count(text[i + 1]) > 0))
+                return true;
+            int depth = 0;
+            for (unsigned j = i; j > body_begin;) {
+                --j;
+                if (clang_getTokenKind(toks[j]) != CXToken_Punctuation) continue;
+                if (text[j] == ")") {
+                    ++depth;
+                } else if (text[j] == "(") {
+                    if (depth > 0) {
+                        --depth;
+                        continue;
+                    }
+                    // The list this name is written in.  Without a name in
+                    // front it only groups; the next one out is asked.
+                    if (j > body_begin && clang_getTokenKind(toks[j - 1]) == CXToken_Identifier)
+                        return params.count(text[j - 1]) > 0 ||
+                               tu_macros_.count(text[j - 1]) > 0;
+                }
+            }
+            return false;
+        };
+
+        for (unsigned i = body_begin; i < n; ++i) {
             if (clang_getTokenKind(toks[i]) != CXToken_Identifier) continue;
-            ClangString spell(clang_getTokenSpelling(tu, toks[i]));
-            std::string tok = spell.to_string();
+            const std::string& tok = text[i];
             if (tok == b.name) continue;        // the macro being defined
             if (params.count(tok)) continue;    // a parameter, not a macro
             auto it = tu_macros_.find(tok);
             if (it == tu_macros_.end()) continue;
+            if (!usedHere(i)) continue;
 
             // ANCHOR ON THE TOKEN'S END, NOT ITS START.
             //
