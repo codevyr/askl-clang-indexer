@@ -151,10 +151,118 @@ CXChildVisitResult Stage1::macroVisitor(CXCursor cursor, CXCursor parent, CXClie
             // any text of its own; see `isWhollyAnInvocation`.
             self->noteInvocation(fi, static_cast<int32_t>(start_off),
                                  static_cast<int32_t>(end_off), cursor);
+
+            // Used in text an `#include` inside a declaration brought in:
+            // also at that `#include`; see `inclusions_`.
+            self->enterFile(fi);
+            for (auto frame = self->include_stack_.rbegin();
+                 frame != self->include_stack_.rend(); ++frame) {
+                if (!frame->inside_declaration) continue;
+                RefPlace inc;
+                inc.fi = frame->fi;
+                inc.start = frame->start;
+                inc.end = frame->end;
+                inc.unspelled = true;
+                inc.synthetic = true;
+                self->insertRef(inc, sym_id, sname);
+                break;
+            }
         }
+    } else if (kind == CXCursor_InclusionDirective) {
+        CXFile included = clang_getIncludedFile(cursor);
+        CXFile range_file = nullptr;
+        unsigned start_off = 0, end_off = 0;
+        if (!included || !getSpellingRange(cursor, range_file, start_off, end_off) ||
+            !range_file)
+            return CXChildVisit_Continue;
+        const size_t fi = self->getOrCreateFile(range_file);
+        const size_t to = self->getOrCreateFile(included);
+        const auto start = static_cast<int32_t>(start_off);
+        const auto end = static_cast<int32_t>(end_off);
+        self->inclusions_[fi][start] = {end, to};
+        self->includes_of_[fi].insert(to);
+
+        self->enterFile(fi);
+        bool inside = false;
+        auto extents = self->decl_extents_.find(fi);
+        if (extents != self->decl_extents_.end()) {
+            auto next = extents->second.upper_bound(start);
+            inside = next != extents->second.begin() && std::prev(next)->second >= end;
+        }
+        self->include_stack_.push_back({fi, start, end, to, inside});
     }
 
     return CXChildVisit_Continue;
+}
+
+void Stage1::enterFile(size_t fi) {
+    while (!include_stack_.empty() && include_stack_.back().included != fi)
+        include_stack_.pop_back();
+}
+
+void Stage1::noteDeclExtent(size_t fi, int32_t start, int32_t end) {
+    auto& extents = decl_extents_[fi];
+    // Outermost only, as `noteInvocation` keeps its spans: a record written
+    // inside a typedef is met beside it.
+    auto next = extents.upper_bound(start);
+    if (next != extents.begin() && std::prev(next)->second >= end) return;
+    for (auto it = extents.lower_bound(start); it != extents.end() && it->second <= end;)
+        it = extents.erase(it);
+    extents[start] = end;
+}
+
+bool Stage1::includeReaches(size_t from, size_t to) {
+    if (from == to) return true;
+    const uint64_t key = (static_cast<uint64_t>(from) << 32) | static_cast<uint64_t>(to);
+    auto known = include_reaches_.find(key);
+    if (known != include_reaches_.end()) return known->second;
+
+    bool found = false;
+    std::unordered_set<size_t> seen{from};
+    std::vector<size_t> todo{from};
+    while (!todo.empty() && !found) {
+        const size_t file = todo.back();
+        todo.pop_back();
+        auto direct = includes_of_.find(file);
+        if (direct == includes_of_.end()) continue;
+        for (size_t next : direct->second) {
+            if (next == to) {
+                found = true;
+                break;
+            }
+            if (seen.insert(next).second) todo.push_back(next);
+        }
+    }
+    include_reaches_[key] = found;
+    return found;
+}
+
+bool Stage1::includedInside(const RefPlace& at, RefPlace& out) const {
+    if (inclusions_.empty() || dfs_stack_.empty()) return false;
+    // A token of a `#define` body is the macro's, wherever the macro is used.
+    if (insideDefine(at.fi, at.start)) return false;
+    auto* self = const_cast<Stage1*>(this);
+    for (auto scope = dfs_stack_.rbegin(); scope != dfs_stack_.rend(); ++scope) {
+        // A declaration of the same file holds the text itself, or is beside
+        // it; either way what brought the FILE in is further out.
+        if (scope->file_idx == at.fi) continue;
+        auto directives = inclusions_.find(scope->file_idx);
+        if (directives == inclusions_.end()) continue;
+        const InstanceData& d = result_.files[scope->file_idx].instances[scope->instance_idx];
+        for (auto inc = directives->second.lower_bound(d.start_offset);
+             inc != directives->second.end() && inc->first < d.end_offset; ++inc) {
+            if (inc->second.end > d.end_offset) continue;
+            if (!self->includeReaches(inc->second.included, at.fi)) continue;
+            out = RefPlace{};
+            out.fi = scope->file_idx;
+            out.start = inc->first;
+            out.end = inc->second.end;
+            out.unspelled = true;
+            out.synthetic = true;
+            return true;
+        }
+    }
+    return false;
 }
 
 void Stage1::collectMacros(CXTranslationUnit tu) {
@@ -355,10 +463,31 @@ void Stage1::linkDeclared() {
     }
 }
 
-void Stage1::collectTypedefTypes(CXTranslationUnit tu) {
+void Stage1::prescanDeclarations(CXTranslationUnit tu) {
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, [](CXCursor cursor, CXCursor, CXClientData data) {
-        if (clang_getCursorKind(cursor) != CXCursor_TypedefDecl)
+        auto* self = static_cast<Stage1*>(data);
+        const CXCursorKind kind = clang_getCursorKind(cursor);
+        if (kind == CXCursor_FunctionDecl || kind == CXCursor_VarDecl ||
+            kind == CXCursor_StructDecl || kind == CXCursor_UnionDecl ||
+            kind == CXCursor_EnumDecl || kind == CXCursor_TypedefDecl) {
+            // What an `#include` could be written inside: a directive has a
+            // line to itself, so the declaration has one before it and one
+            // after.  Most declarations of a unit are one-line prototypes.
+            CXSourceRange range = clang_getCursorExtent(cursor);
+            CXFile start_file = nullptr, end_file = nullptr;
+            unsigned start_line = 0, end_line = 0, start = 0, end = 0;
+            clang_getExpansionLocation(clang_getRangeStart(range), &start_file, &start_line,
+                                       nullptr, &start);
+            clang_getExpansionLocation(clang_getRangeEnd(range), &end_file, &end_line, nullptr,
+                                       &end);
+            if (start_file && end_file && end_line >= start_line + 2 &&
+                clang_File_isEqual(start_file, end_file))
+                self->noteDeclExtent(self->getOrCreateFile(start_file),
+                                     static_cast<int32_t>(start), static_cast<int32_t>(end));
+        }
+
+        if (kind != CXCursor_TypedefDecl)
             return CXChildVisit_Continue;
         CXType underlying = clang_getTypedefDeclUnderlyingType(cursor);
         CXCursor type_decl = clang_getTypeDeclaration(underlying);
@@ -369,7 +498,7 @@ void Stage1::collectTypedefTypes(CXTranslationUnit tu) {
         ClangString type_name(clang_getCursorSpelling(type_decl));
         std::string tn = typedef_name.to_string();
         if (!tn.empty() && tn == type_name.to_string())
-            static_cast<Stage1*>(data)->typedef_type_names_.insert(tn);
+            self->typedef_type_names_.insert(tn);
         return CXChildVisit_Continue;
     }, this);
 }
@@ -1477,6 +1606,11 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name
             full_end = static_cast<int32_t>(fe);
         }
         insertRef(at, sym_id, sym_name, full_start, full_end);
+
+        // Read through an `#include` inside a declaration: also at that
+        // `#include`; see `inclusions_`.
+        RefPlace inc;
+        if (includedInside(at, inc)) insertRef(inc, sym_id, sym_name);
     }
 
     // NO EXPANSION-SITE REFERENCE.  There used to be a second reference here,
@@ -1770,11 +1904,13 @@ void Stage1::process(CXTranslationUnit tu, const std::string& tu_filename) {
     CXFile tu_file = clang_getFile(tu, tu_filename.c_str());
     if (tu_file) getOrCreateFile(tu_file);
 
+    // Pre-scan for typedef'd types to avoid duplicate TYPE instances, and
+    // for where the top-level declarations are -- which the macro pass asks
+    // about each `#include`.
+    prescanDeclarations(tu);
+
     // Collect macro definitions and expansions (requires DetailedPreprocessingRecord)
     collectMacros(tu);
-
-    // Pre-scan for typedef'd types to avoid duplicate TYPE instances
-    collectTypedefTypes(tu);
 
     CXCursor root = clang_getTranslationUnitCursor(tu);
     clang_visitChildren(root, visitor, this);

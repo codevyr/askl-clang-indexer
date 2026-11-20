@@ -595,5 +595,72 @@ private:
     // Names of types whose hoisted EnumDecl/StructDecl/UnionDecl should skip
     // TYPE instance creation because a TypedefDecl already covers it.
     std::unordered_set<std::string> typedef_type_names_;
-    void collectTypedefTypes(CXTranslationUnit tu);
+    /// One pass over the unit's top-level declarations, before anything else
+    /// reads it: the typedef'd type names above, and `decl_extents_`.
+    void prescanDeclarations(CXTranslationUnit tu);
+
+    // --- `#include` inside a declaration ----------------------------------
+    //
+    //   WHAT AN `#include` INSIDE A DECLARATION BRINGS IN IS READ THERE.
+    //
+    //     long x64_sys_call(const struct pt_regs *regs, unsigned int nr)
+    //     {
+    //         switch (nr) {
+    //         #include <asm/syscalls_64.h>
+    //         default: return __x64_sys_ni_syscall(regs);
+    //         }
+    //     }
+    //
+    // The header is a list of `__SYSCALL(0, sys_read)` lines, and the function
+    // calls every one of them.  A reference sits where its text is, and that
+    // text is in the header: containment never crosses files, so the function
+    // contained none of it and appeared to call `__x64_sys_ni_syscall` alone,
+    // while the header "used" every system call.
+    //
+    // The author wrote those calls into the function with one line, the
+    // `#include`.  So each reference read through it is recorded a second
+    // time on that line, where the declaration around it contains it.  The
+    // header keeps its own: the text is there too, and at file scope that is
+    // the whole story.
+    //
+    // The second record is `synthetic` -- the directive does not spell the
+    // name, and nobody typed the name there.
+
+    struct Inclusion {
+        int32_t end;
+        size_t included;
+    };
+    /// File -> where an `#include` starts -> where it ends, and the file it
+    /// resolved to.
+    std::unordered_map<size_t, std::map<int32_t, Inclusion>> inclusions_;
+    /// File -> the files it includes, directly.
+    std::unordered_map<size_t, std::unordered_set<size_t>> includes_of_;
+    std::unordered_map<uint64_t, bool> include_reaches_;
+    /// Does including `from` bring in `to`, itself or through its own
+    /// `#include`s?
+    bool includeReaches(size_t from, size_t to);
+    /// For a reference the walk met at `at`: the `#include`, inside a
+    /// declaration the walk is in, that brought that text in.
+    bool includedInside(const RefPlace& at, RefPlace& out) const;
+
+    /// File -> start -> end of each top-level declaration that spans lines,
+    /// outermost only.  A macro use is recorded before the walk, when no
+    /// declaration is open, and this is what says its `#include` is inside
+    /// one.
+    std::unordered_map<size_t, std::map<int32_t, int32_t>> decl_extents_;
+    void noteDeclExtent(size_t fi, int32_t start, int32_t end);
+
+    /// The `#include`s the preprocessing record is inside, outermost first.
+    /// Its entries come in source order, so a directive is followed by what
+    /// its file contains and then by the rest of the file it is written in:
+    /// an entry from any other file than the innermost one closes it.
+    struct IncludeFrame {
+        size_t fi;
+        int32_t start, end;
+        size_t included;
+        bool inside_declaration;
+    };
+    std::vector<IncludeFrame> include_stack_;
+    /// The next entry of the record is written in `fi`.
+    void enterFile(size_t fi);
 };

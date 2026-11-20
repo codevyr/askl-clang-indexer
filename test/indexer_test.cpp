@@ -3055,6 +3055,50 @@ TEST(ObjectRoots, ANamePastedInADesignatorIsReferenced) {
         for (const auto& e : sits) std::cerr << "  " << e.first << " -> " << e.second << "\n";
 }
 
+// WHAT AN `#include` INSIDE A DECLARATION BRINGS IN IS READ THERE.
+//
+//     int dispatch(int nr, int x) {
+//         switch (nr) {
+//     #include "syscalls.h"          /* __SYSCALL(0, sys_read) ... */
+//         default: return -1;
+//         }
+//     }
+//
+// The function calls everything the header lists, and so does the table
+// built the same way.  The text of those calls is in the header and
+// containment does not cross files, so both contained nothing and the header
+// alone "used" the functions -- the kernel's `x64_sys_call` called one
+// function and `sys_call_table` held none.
+//
+// Each such reference is also recorded on the `#include` line, which is how
+// its author wrote it into the declaration.  That covers a header the
+// included one includes in turn, and the macros used in that text.  The
+// header keeps its own references, and an `#include` at file scope adds
+// none to anything.
+TEST(ObjectRoots, WhatAnIncludeInsideADeclarationBringsInIsReadThere) {
+    BuiltFixture built("include_inside_declaration", {"main.c"});
+    auto sits = built.sits();
+    for (const char* fn : {"sys_read", "sys_write", "sys_close"}) {
+        EXPECT_TRUE(sits.count({"table", fn})) << fn;
+        EXPECT_TRUE(sits.count({"dispatch", fn})) << fn;
+    }
+    EXPECT_TRUE(sits.count({"table", "__SYSCALL"}));
+    EXPECT_TRUE(sits.count({"dispatch", "__SYSCALL"}));
+
+    // The text is still the header's.
+    EXPECT_TRUE(sits.count({"syscalls.h", "sys_read"}));
+    EXPECT_TRUE(sits.count({"syscalls.h", "__SYSCALL"}));
+    EXPECT_TRUE(sits.count({"more.h", "sys_close"}));
+
+    // File scope is not a declaration: the first `#include` of the header
+    // gives the file nothing.
+    for (const auto& edge : sits) EXPECT_NE(edge.first, "main.c") << edge.second;
+
+    // Nobody typed a name on the `#include` line, so being reached through
+    // one is not what gets a symbol listed.
+    EXPECT_TRUE(built.folded().empty());
+}
+
 // ...AND WHERE TWO UNITS READ IT IN DIFFERENT PLACES, THE WALK SAYS NOTHING.
 //
 // One file compiled twice declares `work` and `work_variant` on the same
