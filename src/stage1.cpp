@@ -1683,8 +1683,14 @@ CXChildVisitResult Stage1::visitor(CXCursor cursor, CXCursor parent, CXClientDat
     // be stamped after the subtree is done.  Traversal is otherwise identical.
     size_t mark = self->dfs_stack_.size();
     size_t calls = self->open_calls_.size();
+    // What the cursor around this one uses it for; see `expr_use.h`.
+    Use use;
+    if (!self->use_stack_.empty()) use = childUse(self->use_stack_.back(), cursor);
+    self->cur_use_ = use;
     self->visitCursor(cursor, parent);
+    self->use_stack_.emplace_back(cursor, clang_getCursorKind(cursor), use);
     clang_visitChildren(cursor, visitor, self);
+    self->use_stack_.pop_back();
     self->closeScopesTo(mark);
     while (self->open_calls_.size() > calls) self->open_calls_.pop_back();
     return CXChildVisit_Continue;
@@ -1860,11 +1866,9 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             if (sname.empty()) break;
 
             int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_DATA);
-            // NO ROLE YET.  A variable is read, written or both (`n++`), and
-            // the walk does not tell them apart here.  Saying TAKE for all of
-            // them would print "reads" on an assignment, and the next index
-            // would take it back; a role is only ever added.
-            addRef(cursor, sym_id, sname);
+            // Called through, assigned, read, or only named: what the
+            // expression around the token uses it for.
+            addRef(cursor, sym_id, sname, rolesOf(cur_use_, cursor));
         } else if (ref_kind == CXCursor_FunctionDecl) {
             // A FUNCTION NAMED WITHOUT BEING CALLED: `register_cb(helper)`,
             // `return helper;`, `&helper`, `.open = helper`.  Only the
@@ -1920,10 +1924,31 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (compound_name.empty()) break;
 
         auto [field_sym_id, _] = symbols_.getOrCreate(compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
-        // No role yet, for the reason a variable has none: called through
-        // (`s->cb(x)`), assigned (`s->cb = f`) and read (`g = s->cb`) are not
-        // told apart here.
-        addRef(cursor, field_sym_id, compound_name);
+        // Called through (`s->cb(x)`), assigned (`s->cb = f`), read
+        // (`g = s->cb`), or only named: what the expression around the token
+        // uses it for.
+        addRef(cursor, field_sym_id, compound_name, rolesOf(cur_use_, cursor));
+        break;
+    }
+    case CXCursor_MemberRef: {
+        // A DESIGNATED INITIALIZER WRITES THE FIELD IT NAMES: `.cb = f`, and
+        // each field on the way in `.a.b = 1`.  The token named the field and
+        // used to produce no reference at all, so the variable that fills a
+        // slot was not among those that refer to it.
+        //
+        // Only there.  `__builtin_offsetof(type, member)` has the same kind of
+        // child and does nothing to the member.
+        if (use_stack_.empty() || !isDesignator(use_stack_.back())) break;
+        CXCursor referenced = clang_getCursorReferenced(cursor);
+        if (clang_Cursor_isNull(referenced)) break;
+        if (clang_getCursorKind(referenced) != CXCursor_FieldDecl) break;
+
+        std::string compound_name = resolveFieldCompoundName(referenced);
+        if (compound_name.empty()) break;
+
+        auto [field_sym_id, _] = symbols_.getOrCreate(compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
+        addRef(cursor, field_sym_id, compound_name,
+               cur_use_.kind == Use::Unevaluated ? 0 : REFROLE_WRITE);
         break;
     }
     default:

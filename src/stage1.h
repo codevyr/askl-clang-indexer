@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dedup_keys.h"
+#include "expr_use.h"
 #include "macro_paste.h"
 #include "symbol_types.h"
 
@@ -457,6 +458,13 @@ private:
         bool callee_seen;
     };
     std::vector<OpenCall> open_calls_;
+
+    /// The cursors the walk is inside, outermost first, each with the use its
+    /// parent makes of it; and the use handed to the cursor being visited.
+    /// See `expr_use.h`: WHAT AN EXPRESSION IS USED FOR IS DECIDED BY THE
+    /// EXPRESSION AROUND IT.
+    std::vector<UseFrame> use_stack_;
+    Use cur_use_;
 
     /// Index of the innermost open scope in `fi`, or -1.  Scopes from other
     /// files are skipped: one TU walk descends into headers, and each file has

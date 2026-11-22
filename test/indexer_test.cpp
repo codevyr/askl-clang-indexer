@@ -318,7 +318,9 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "setup", 106, 111},
                 {"main.c", "file_ops.read", 127, 131},     // MemberRefExpr: ops.read(0,0,0)
                 {"ops.c", "file_ops", 207, 215},
+                {"ops.c", "file_ops.read", 237, 241, WRITE, 0},  // .read = my_read: the field is written
                 {"ops.c", "my_read", 244, 251},            // .read = my_read: the name token
+                {"ops.c", "file_ops.write", 258, 263, WRITE, 0}, // .write = my_write
                 {"ops.c", "my_write", 266, 274},           // .write = my_write
                 {"ops.c", "file_ops", 330, 338},
                 {"ops.c", "file_ops.read", 356, 360},      // MemberRefExpr: ops->read = ...
@@ -326,7 +328,10 @@ INSTANTIATE_TEST_SUITE_P(
                 {"ops.c", "file_ops.write", 381, 386},     // MemberRefExpr: ops->write = ...
                 {"ops.c", "my_write", 389, 397},           // ops->write = my_write
                 {"ops.c", "container", 442, 451},
+                {"ops.c", "container.ops", 474, 477, WRITE, 0},  // .ops = { .read = my_read }
+                {"ops.c", "file_ops.read", 483, 487, WRITE, 0},  // .ops = { .read = my_read }
                 {"ops.c", "my_read", 490, 497},            // .ops = { .read = my_read }
+                {"ops.c", "container.data", 506, 510, WRITE, 0}, // .data = 42
                 {"ops.h", "my_read", 51, 91},              // synthetic: field impl ref (deduped across patterns)
                 {"ops.h", "my_write", 97, 144},            // synthetic: field impl ref (deduped across patterns)
                 {"ops.h", "file_ops", 180, 188},
@@ -809,6 +814,7 @@ INSTANTIATE_TEST_SUITE_P(
             },
             {
                 {"main.c", "driver_info", 37, 48},
+                {"main.c", "driver_info.id", 61, 63, WRITE, 0},  // .id = 42: the field is written
                 // The invocation edge at the register_driver name span.  It
                 // used to be two refs at these same offsets, naming
                 // `driver_info.id` (from the body) and `my_drv` (the ARGUMENT)
@@ -1060,8 +1066,11 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "iface_ops", 276, 285},
                 {"main.c", "iface_ops.read", 303, 307},     // MemberRefExpr: ops->read(...)
                 {"main.c", "iface_ops.write", 327, 332},    // MemberRefExpr: ops->write(...)
+                {"main.c", "iface_ops.read", 201, 205, WRITE, 0},   // .read = my_read: the field is written
                 {"main.c", "my_read", 208, 215},            // .read = my_read: the name token
+                {"main.c", "iface_ops.write", 222, 227, WRITE, 0},  // .write = my_write
                 {"main.c", "my_write", 230, 238},           // .write = my_write
+                {"main.c", "iface_ops.flags", 245, 250, WRITE, 0},  // .flags = ...
                 {"ops.h", "my_read", 174, 191},              // field impl ref
                 {"ops.h", "my_write", 197, 215},             // field impl ref
                 {"ops.h", "read_func_t", 174, 185},          // TypeRef in field decl
@@ -1166,6 +1175,7 @@ INSTANTIATE_TEST_SUITE_P(
             {
                 {"main.c", "DEFINE_COUNTER", 252, 266, 0, 0},             // DEFINE_COUNTER(hits);
                 {"main.c", "file_ops", 289, 297, 0, 0},                   // static struct file_ops ops = {
+                {"main.c", "file_ops.read", 311, 315, WRITE, 0},          // .read = my_read,
                 {"main.c", "my_read", 318, 325, TAKE, 0},                 // .read = my_read,
                 {"main.c", "fn_t", 358, 362, 0, 0},                       // fn_t pick(void) { return other; }
                 {"main.c", "other", 383, 388, TAKE, 0},                   // fn_t pick(void) { return other; }
@@ -1177,9 +1187,9 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "CALL_AND_KEEP", 539, 552, 0, 0},              // return CALL_AND_KEEP(both) + BODY_CALL();
                 {"main.c", "both", 553, 557, CALL | TAKE, 0},             // return CALL_AND_KEEP(both) + BODY_CALL();
                 {"main.c", "BODY_CALL", 561, 570, 0, 0},                  // return CALL_AND_KEEP(both) + BODY_CALL();
-                {"main.c", "hits", 604, 608, 0, 0},                       // hits++;
-                {"main.c", "ops", 623, 626, 0, 0},                        // return ops.read(2);
-                {"main.c", "file_ops.read", 627, 631, 0, 0},              // return ops.read(2);
+                {"main.c", "hits", 604, 608, WRITE | TAKE, 0},            // hits++;
+                {"main.c", "ops", 623, 626, TAKE, 0},                     // return ops.read(2);
+                {"main.c", "file_ops.read", 627, 631, CALL, 0},           // return ops.read(2);
                 {"main.c", "USE", 668, 671, 0, 0},                        // int two_units(void) { return USE(either); }
                 {"main.c", "either", 672, 678, TAKE, 0},                  // int two_units(void) { return USE(either); }
                 {"ops.h", "my_read", 51, 67, 0, HOLDS},                   // int (*read)(int);
@@ -3325,8 +3335,7 @@ StatedRef refAt(const BuiltFixture& built, const std::string& file, const std::s
 //   * TAKE: a function named and not called, an enum constant.
 //
 // Each is a positive fact about the text.  A token that states nothing here
-// (a type, a macro invocation, and until they can be told apart a variable or
-// a field) is not thereby "not called": it says nothing.
+// (a type, a macro invocation) is not thereby "not called": it says nothing.
 TEST(ReferenceRoles, AReferenceSaysWhatItsTokenDoes) {
     BuiltFixture built("reference_roles", std::vector<std::string>{"main.c"});
     struct Case {
@@ -3351,14 +3360,15 @@ TEST(ReferenceRoles, AReferenceSaysWhatItsTokenDoes) {
              // A call written in a `#define` body is a call there too.
              {"ops.h", "helper(3)", 0, "helper", CALL, "BODY_CALL"},
              {"ops.h", "keep(fn))", 0, "keep", CALL, "CALL_AND_KEEP"},
-             // Nothing is stated of a type, a macro invocation, a variable or
-             // a field.
+             // Nothing is stated of a type or a macro invocation.
              {"main.c", "enum mode m", 5, "mode", 0, "run"},
              {"main.c", "DEFINE_COUNTER(hits)", 0, "DEFINE_COUNTER", 0, "main.c"},
              {"main.c", "BODY_CALL()", 0, "BODY_CALL", 0, "run"},
-             {"main.c", "hits++", 0, "hits", 0, "unlabelled"},
-             {"main.c", "ops.read(2)", 0, "ops", 0, "unlabelled"},
-             {"main.c", "ops.read(2)", 4, "file_ops.read", 0, "unlabelled"},
+             // A variable and a field say what is done to them
+             // (`AFieldOrVariable...`, below, has the cases).
+             {"main.c", "hits++", 0, "hits", WRITE | TAKE, "unlabelled"},
+             {"main.c", "ops.read(2)", 0, "ops", TAKE, "unlabelled"},
+             {"main.c", "ops.read(2)", 4, "file_ops.read", CALL, "unlabelled"},
          }) {
         StatedRef r = refAt(built, c.file, c.anchor, c.skip, c.target);
         if (!r.ref) continue;
@@ -3599,6 +3609,231 @@ TEST(ReferenceRoles, RecordsThatBecomeOneReferenceAreAUnion) {
             EXPECT_EQ(ref.relation(), askl::index::REF_RELATION_NONE);
         }
     EXPECT_EQ(found, 1);
+}
+
+namespace {
+struct StatedCase {
+    const char* file;
+    const char* anchor;
+    size_t skip;
+    const char* target;
+    unsigned roles;
+    const char* owner;
+};
+
+/// Each case's reference states exactly `roles`, is no relation, and was read
+/// in `owner`.
+void expectStated(const BuiltFixture& built, const std::vector<StatedCase>& cases) {
+    for (const StatedCase& c : cases) {
+        StatedRef r = refAt(built, c.file, c.anchor, c.skip, c.target);
+        if (!r.ref) continue;
+        EXPECT_EQ(r.ref->roles(), c.roles) << c.target << " at `" << c.anchor << "`";
+        EXPECT_EQ(r.ref->relation(), askl::index::REF_RELATION_NONE)
+            << c.target << " at `" << c.anchor << "`";
+        EXPECT_EQ(r.owner, c.owner) << c.target << " at `" << c.anchor << "`";
+    }
+}
+} // namespace
+
+// A FIELD OR A VARIABLE SAYS WHAT ITS TOKEN IS USED FOR.
+//
+// Who calls through `platform_driver.probe`, and who fills it?  Both wrote the
+// same bare reference to the field, so the one caller was listed among the
+// six that assign it.  The walk knows which it is from where the token stands
+// in its expression:
+//
+//   * CALL: it is the callee of a call, also through parentheses, a cast, the
+//     `*` of a function pointer, or as the table an element is called from;
+//   * WRITE: it is assigned or initialised -- `=`, a designator -- or a part
+//     of it is (`s->a.b = 1` writes `a`, `arr[2] = 7` writes `arr`);
+//   * TAKE: its value or address is taken;
+//   * WRITE|TAKE: `+=`, `++`, `--`.
+//
+// A USE STOPS AT A POINTER.  `s->p->b = 1` assigns `b` and reads `p`; what is
+// written is another object, which no token here names.
+TEST(ReferenceRoles, AFieldOrVariableCalledThroughStatesCall) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"uses.c"});
+    expectStated(built, {
+        {"uses.c", "s->cb(10)", 3, "dev.cb", CALL, "called"},
+        // The pointer on the way to the slot is read; the slot is called.
+        {"uses.c", "s->f_op->read(11)", 3, "dev.f_op", TAKE, "called"},
+        {"uses.c", "s->f_op->read(11)", 9, "file_ops.read", CALL, "called"},
+        // Through parentheses, `*` and a cast it is the same call.
+        {"uses.c", "(s->cb)(12)", 4, "dev.cb", CALL, "called"},
+        {"uses.c", "(*s->cb)(13)", 5, "dev.cb", CALL, "called"},
+        {"uses.c", "s->cb)(14)", 3, "dev.cb", CALL, "called"},
+        // A struct on the way is read, not called.
+        {"uses.c", "s->a.cb(15)", 3, "dev.a", TAKE, "called"},
+        {"uses.c", "s->a.cb(15)", 5, "inner.cb", CALL, "called"},
+        // A table of functions is called through.
+        {"uses.c", "s->tbl[1](16)", 3, "dev.tbl", CALL, "called"},
+        // A variable holding a function.
+        {"uses.c", "gfn(17)", 0, "gfn", CALL, "called"},
+        {"uses.c", "(*gfn)(18)", 2, "gfn", CALL, "called"},
+        // A pointer to a pointer to a function: `*gpp` is what is called, and
+        // no token names it.  `gpp` is read.
+        {"uses.c", "(*gpp)(20)", 2, "gpp", TAKE, "called"},
+        // Written in a `#define` body, it is that body's call.
+        {"uses.c", "(s)->cb(x)", 5, "dev.cb", CALL, "CALL_CB"},
+    });
+}
+
+TEST(ReferenceRoles, AFieldOrVariableAssignedStatesWrite) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"uses.c"});
+    expectStated(built, {
+        {"uses.c", "s->cb = target", 3, "dev.cb", WRITE, "written"},
+        {"uses.c", "s->count = 21", 3, "dev.count", WRITE, "written"},
+        {"uses.c", "(s->count) = 22", 4, "dev.count", WRITE, "written"},
+        // A part of it is assigned: both are written.
+        {"uses.c", "s->a.b = 23", 3, "dev.a", WRITE, "written"},
+        {"uses.c", "s->a.b = 23", 5, "inner.b", WRITE, "written"},
+        {"uses.c", "s->arr[2] = 25", 3, "dev.arr", WRITE, "written"},
+        {"uses.c", "garr[3] = 28", 0, "garr", WRITE, "written"},
+        // Written the other way round, the array is still the array.
+        {"uses.c", "2[garr] = 36", 2, "garr", WRITE, "written"},
+        // The index is read, also where it is an element itself.
+        {"uses.c", "garr[garr[1]] = 37", 0, "garr", WRITE, "written"},
+        {"uses.c", "garr[garr[1]] = 37", 5, "garr", TAKE, "written"},
+        {"uses.c", "gdev.count = 29", 0, "gdev", WRITE, "written"},
+        {"uses.c", "gdev.count = 29", 5, "dev.count", WRITE, "written"},
+        // A use stops at a pointer: the pointer is read.
+        {"uses.c", "s->p->b = 24", 3, "dev.p", TAKE, "written"},
+        {"uses.c", "s->p->b = 24", 6, "inner.b", WRITE, "written"},
+        {"uses.c", "s->ptr[1] = 26", 3, "dev.ptr", TAKE, "written"},
+        {"uses.c", "*gptr = 33", 1, "gptr", TAKE, "written"},
+        // ... and so is everything on the way to the pointer.
+        {"uses.c", "*gdev.ptr = 34", 1, "gdev", TAKE, "written"},
+        {"uses.c", "*gdev.ptr = 34", 6, "dev.ptr", TAKE, "written"},
+        {"uses.c", "gdev.ptr[1] = 35", 0, "gdev", TAKE, "written"},
+        {"uses.c", "gdev.ptr[1] = 35", 5, "dev.ptr", TAKE, "written"},
+        // Variables.
+        {"uses.c", "n = 27", 0, "n", WRITE, "written"},
+        {"uses.c", "gfn = target", 0, "gfn", WRITE, "written"},
+        // `*&x` is `x`: this is how `WRITE_ONCE` writes.
+        {"uses.c", "*&n = 30", 2, "n", WRITE, "written"},
+        {"uses.c", "WRITE_ONCE(s->count, 32)", 14, "dev.count", WRITE, "written"},
+        // Written in a `#define` body, it is that body's assignment.
+        {"uses.c", "(s)->count = (v)", 5, "dev.count", WRITE, "SET_COUNT"},
+    });
+}
+
+// A DESIGNATED INITIALIZER WRITES THE FIELD IT NAMES.
+//
+// `.cb = target` named the field and produced no reference to it at all: the
+// variable that fills a slot was not among those that refer to the slot.
+TEST(ReferenceRoles, ADesignatorWritesTheFieldItNames) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"uses.c"});
+    expectStated(built, {
+        {"uses.c", ".cb = target", 1, "dev.cb", WRITE, "table"},
+        {"uses.c", ".count = 1", 1, "dev.count", WRITE, "table"},
+        {"uses.c", ".a.b = 2", 1, "dev.a", WRITE, "table"},
+        {"uses.c", ".a.b = 2", 3, "inner.b", WRITE, "table"},
+        {"uses.c", ".arr[1] = 3", 1, "dev.arr", WRITE, "table"},
+    });
+    // The function stored there is still a value taken, and the slot still
+    // holds it.
+    expectStated(built, {{"uses.c", ".cb = target", 6, "target", TAKE, "table"}});
+    StatedRef held = refAt(built, "uses.c", "int (*cb)(int);\n    int count", 0, "target");
+    ASSERT_NE(held.ref, nullptr);
+    EXPECT_EQ(held.ref->relation(), askl::index::REF_RELATION_HOLDS);
+    EXPECT_EQ(held.owner, "dev.cb");
+}
+
+TEST(ReferenceRoles, AFieldOrVariableReadAndWrittenStatesBoth) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"uses.c"});
+    expectStated(built, {
+        {"uses.c", "s->count += 40", 3, "dev.count", WRITE | TAKE, "both_ways"},
+        {"uses.c", "s->count++", 3, "dev.count", WRITE | TAKE, "both_ways"},
+        {"uses.c", "--s->count", 5, "dev.count", WRITE | TAKE, "both_ways"},
+        {"uses.c", "n++", 0, "n", WRITE | TAKE, "both_ways"},
+        {"uses.c", "n -= 41", 0, "n", WRITE | TAKE, "both_ways"},
+        // The right side of `+=` is only read.
+        {"uses.c", "n += gdev.count", 0, "n", WRITE | TAKE, "both_ways"},
+        {"uses.c", "n += gdev.count", 5, "gdev", TAKE, "both_ways"},
+        {"uses.c", "n += gdev.count", 10, "dev.count", TAKE, "both_ways"},
+        {"uses.c", "gdev.a.b++", 0, "gdev", WRITE | TAKE, "both_ways"},
+        {"uses.c", "gdev.a.b++", 5, "dev.a", WRITE | TAKE, "both_ways"},
+        {"uses.c", "gdev.a.b++", 7, "inner.b", WRITE | TAKE, "both_ways"},
+        // Two tokens, two references: one is assigned, the other read.
+        {"uses.c", "s->count = s->count + 42", 3, "dev.count", WRITE, "both_ways"},
+        {"uses.c", "s->count = s->count + 42", 14, "dev.count", TAKE, "both_ways"},
+    });
+}
+
+TEST(ReferenceRoles, AFieldOrVariableReadStatesTake) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"uses.c"});
+    expectStated(built, {
+        // A variable's initializer is evaluated.
+        {"uses.c", "s->count + 49", 3, "dev.count", TAKE, "taken"},
+        {"uses.c", "g = s->cb", 7, "dev.cb", TAKE, "taken"},
+        {"uses.c", "l = n + 50", 4, "n", TAKE, "taken"},
+        // Its address is taken; what the callee does with it is not guessed.
+        {"uses.c", "sink(&s->count)", 9, "dev.count", TAKE, "taken"},
+        {"uses.c", "sink(&n)", 6, "n", TAKE, "taken"},
+        {"uses.c", "s->arr[3] + 51", 3, "dev.arr", TAKE, "taken"},
+        {"uses.c", "READ_ONCE(s->count) + 52", 13, "dev.count", TAKE, "taken"},
+        // Tested, not called.
+        {"uses.c", "s->cb ? 53", 3, "dev.cb", TAKE, "taken"},
+        {"uses.c", "garr[1] + gdev.count", 0, "garr", TAKE, "taken"},
+        {"uses.c", "garr[1] + gdev.count", 10, "gdev", TAKE, "taken"},
+        {"uses.c", "garr[1] + gdev.count", 15, "dev.count", TAKE, "taken"},
+    });
+}
+
+// WHAT IS ONLY NAMED STATES NOTHING.
+//
+// `sizeof(s->count)` evaluates nothing: the field is neither read nor
+// written, and saying "reads" would be a fact about code that does not run.
+// There is no bit for "named", so these state nothing, and nothing is never
+// "no".
+TEST(ReferenceRoles, AnOperandThatIsNotEvaluatedStatesNothing) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"uses.c"});
+    expectStated(built, {
+        {"uses.c", "typeof(s->count) t", 10, "dev.count", 0, "only_named"},
+        {"uses.c", "sizeof(s->count)", 10, "dev.count", 0, "only_named"},
+        {"uses.c", "sizeof n", 7, "n", 0, "only_named"},
+        {"uses.c", "_Alignof(s->arr)", 12, "dev.arr", 0, "only_named"},
+        {"uses.c", "typeof(s->ptr)", 10, "dev.ptr", 0, "only_named"},
+        {"uses.c", "_Generic((s->f_op)", 13, "dev.f_op", 0, "only_named"},
+        {"uses.c", "__builtin_constant_p(s->p)", 24, "dev.p", 0, "only_named"},
+        {"uses.c", "typeof(gdev.count))62", 7, "gdev", 0, "only_named"},
+        {"uses.c", "typeof(gdev.count))62", 12, "dev.count", 0, "only_named"},
+        {"uses.c", "__builtin_object_size(&gdev, 1)", 23, "gdev", 0, "only_named"},
+        {"uses.c", "__builtin_dynamic_object_size(gptr, 0)", 30, "gptr", 0, "only_named"},
+        // In the type of a field.
+        {"uses.c", "typeof(gdev.count) copy", 7, "gdev", 0, "sized.copy"},
+        {"uses.c", "typeof(gdev.count) copy", 12, "dev.count", 0, "sized.copy"},
+    });
+}
+
+// AN OVERLOADED OPERATOR IS A CALL WHOSE FIRST CHILD IS AN OPERAND.
+//
+// `h->held != other` is, in C++, a call of `operator!=`, and the tree lists
+// its operands before and after the operator the way the source does.  The
+// first of them is not what the call calls.
+TEST(ReferenceRoles, TheOperandOfAnOverloadedOperatorIsNotCalled) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"overloaded.cpp"});
+    expectStated(built, {
+        {"overloaded.cpp", "h->held != other", 3, "holder.held", TAKE, "differs"},
+        {"overloaded.cpp", "h->cb(1)", 3, "holder.cb", CALL, "invoke"},
+    });
+}
+
+// `__builtin_offsetof(type, member)` NAMES A MEMBER THE WAY A DESIGNATOR DOES,
+// AND DOES NOTHING TO IT.  It stays what it was: no reference.
+TEST(ReferenceRoles, OffsetofIsNotADesignator) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"uses.c"});
+    int found = 0;
+    for (const auto& obj : built.project.objects()) {
+        const std::string& text = obj.content();
+        auto at = text.find("__builtin_offsetof(struct dev, count)");
+        if (at == std::string::npos) continue;
+        const auto start = static_cast<int32_t>(at + 31);
+        ASSERT_EQ(text.compare(start, 5, "count"), 0);
+        for (const auto& ref : obj.refs())
+            if (ref.from_offset_start() == start) ++found;
+    }
+    EXPECT_EQ(found, 0);
 }
 
 TEST(ObjectRoots, ReincludedHeaderKeepsBothResults) {

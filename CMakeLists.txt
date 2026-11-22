@@ -83,6 +83,7 @@ add_custom_command(
 # Static library with all source files except main.cpp
 add_library(askl-clang-indexer-lib STATIC
   src/compilation_db.cpp
+  src/expr_use.cpp
   src/indexer.cpp
   src/macro_paste.cpp
   src/stage1.cpp
