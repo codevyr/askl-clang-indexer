@@ -458,6 +458,11 @@ void Stage1::linkDeclared() {
             // The text there is the macro's name, not the declaration's.
             at.unspelled = true;
             at.synthetic = true;
+            // Not something a token of the macro says: its invocation
+            // declared this.  The row sits on the name the `#define` defines,
+            // directly in the macro's definition, which is what makes the
+            // macro -- and not the file around it -- its source.
+            at.relation = REFRELATION_DECLARES;
             insertRef(at, d.symbol_local_id, site.name);
         }
     }
@@ -1113,6 +1118,7 @@ void Stage1::numberTree(FileData& f) {
             k.pasted = k.pasted && r.pasted;
             k.typed_in_define = k.typed_in_define && r.typed_in_define;
             k.synthetic = k.synthetic && r.synthetic;
+            mergeStated(k, r);
             if (k.full_start < 0 && r.full_start >= 0) {
                 k.full_start = r.full_start;
                 k.full_end = r.full_end;
@@ -1381,8 +1387,23 @@ void Stage1::insertRef(const RefPlace& at, int64_t sym_id, const std::string& sy
     // caller typed: three references, one in each.  Keyed by the token alone,
     // the first function read kept the call and the other two had none.
     const int32_t scope = scopeAround(file_idx, start, end);
-    if (!file_ref_sets_[file_idx].insert({sym_id, start, end, scope}).second)
+    // A SECOND READING OF THE SAME REFERENCE ADDS WHAT IT KNOWS.  One token
+    // can be read twice inside one declaration -- a macro that uses its
+    // argument twice, a header parsed again -- and the readings are one
+    // reference.  What it states is their union (`mergeStated`).
+    auto [slot, fresh] =
+        file_ref_index_[file_idx].try_emplace(RefKey{sym_id, start, end, scope}, kRefDropped);
+    // A reference to the mapped value stays valid whatever else is inserted.
+    int32_t& kept_at = slot->second;
+    if (!fresh) {
+        if (kept_at != kRefDropped) {
+            RefData again{sym_id, start, end};
+            again.roles = at.roles;
+            again.relation = at.relation;
+            mergeStated(result_.files[file_idx].refs[static_cast<size_t>(kept_at)], again);
+        }
         return;
+    }
     // Where it sits is left UNSET: `numberTree` decides, once every instance
     // in the file is known.  It used to come
     // from `stackParent(file_idx)` here, and that was wrong for exactly the
@@ -1420,9 +1441,12 @@ void Stage1::insertRef(const RefPlace& at, int64_t sym_id, const std::string& sy
     r.pasted = at.pasted;
     r.typed_in_define = at.typed_in_define;
     r.synthetic = at.synthetic;
+    r.roles = at.roles;
+    r.relation = at.relation;
     if (at.invocation) r.invocation_at = full_start;
     r.full_start = full_start;
     r.full_end = full_end;
+    kept_at = static_cast<int32_t>(result_.files[file_idx].refs.size());
     result_.files[file_idx].refs.push_back(r);
 }
 
@@ -1586,9 +1610,11 @@ bool Stage1::placesReference(CXCursor cursor, const std::string& name) {
            (at.unspelled || refTextNamesSymbol(at.fi, name, at.start, at.end, /*warn=*/false));
 }
 
-void Stage1::addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name) {
+void Stage1::addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name,
+                    uint32_t roles) {
     RefPlace at;
     if (refRange(cursor, sym_name, at)) {
+        at.roles = roles;
         const size_t fi = at.fi;
         // The FULL span is the whole referencing construct -- `foo(a, b)` where
         // the name span covers only `foo`.  Display only; ownership comes from
@@ -1608,9 +1634,13 @@ void Stage1::addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name
         insertRef(at, sym_id, sym_name, full_start, full_end);
 
         // Read through an `#include` inside a declaration: also at that
-        // `#include`; see `inclusions_`.
+        // `#include`; see `inclusions_`.  A copy of this reference, so it
+        // states what this one does.
         RefPlace inc;
-        if (includedInside(at, inc)) insertRef(inc, sym_id, sym_name);
+        if (includedInside(at, inc)) {
+            inc.roles = roles;
+            insertRef(inc, sym_id, sym_name);
+        }
     }
 
     // NO EXPANSION-SITE REFERENCE.  There used to be a second reference here,
@@ -1798,7 +1828,10 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (sname.empty()) break;
 
         int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_FUNCTION);
-        addRef(cursor, sym_id, sname);
+        // THE CALLEE OF A CALL.  Wherever the token was written: in a
+        // `#define` body the macro's text calls the function, and that is a
+        // fact about that text too.
+        addRef(cursor, sym_id, sname, REFROLE_CALL);
         // Its callee is about to be visited as a DeclRefExpr to the same
         // function; see `open_calls_`.  Closed by `visitor` on the way out.
         open_calls_.push_back({referenced, false});
@@ -1816,7 +1849,8 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             if (sname.empty()) break;
 
             auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_DATA);
-            addRef(cursor, sym_id, sname);
+            // A constant can only be read: `case REQ_OP_READ:`, `x = RED`.
+            addRef(cursor, sym_id, sname, REFROLE_TAKE);
         } else if (ref_kind == CXCursor_VarDecl) {
             CXCursor ref_parent = clang_getCursorSemanticParent(referenced);
             if (clang_getCursorKind(ref_parent) != CXCursor_TranslationUnit) break;
@@ -1826,6 +1860,10 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             if (sname.empty()) break;
 
             int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_DATA);
+            // NO ROLE YET.  A variable is read, written or both (`n++`), and
+            // the walk does not tell them apart here.  Saying TAKE for all of
+            // them would print "reads" on an assignment, and the next index
+            // would take it back; a role is only ever added.
             addRef(cursor, sym_id, sname);
         } else if (ref_kind == CXCursor_FunctionDecl) {
             // A FUNCTION NAMED WITHOUT BEING CALLED: `register_cb(helper)`,
@@ -1847,7 +1885,8 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
             if (sname.empty()) break;
 
             int64_t sym_id = resolveSymbol(symbols_, referenced, sname, SYMTYPE_FUNCTION);
-            addRef(cursor, sym_id, sname);
+            // Named and not called: its value is taken.
+            addRef(cursor, sym_id, sname, REFROLE_TAKE);
         }
         break;
     }
@@ -1868,7 +1907,7 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         auto [sym_id, _] = symbols_.getOrCreate(sname, SCOPE_GLOBAL, SYMTYPE_TYPE);
         // Note: clang visits TypeRef children of anonymous types through both
         // the TypedefDecl and the underlying type (UnionDecl/StructDecl),
-        // producing duplicate refs. Deduplicated in addRef via file_ref_sets_.
+        // producing duplicate refs. Deduplicated in insertRef via file_ref_index_.
         addRef(cursor, sym_id, sname);
         break;
     }
@@ -1881,6 +1920,9 @@ void Stage1::visitCursor(CXCursor cursor, CXCursor parent) {
         if (compound_name.empty()) break;
 
         auto [field_sym_id, _] = symbols_.getOrCreate(compound_name, SCOPE_GLOBAL, SYMTYPE_FIELD);
+        // No role yet, for the reason a variable has none: called through
+        // (`s->cb(x)`), assigned (`s->cb = f`) and read (`g = s->cb`) are not
+        // told apart here.
         addRef(cursor, field_sym_id, compound_name);
         break;
     }

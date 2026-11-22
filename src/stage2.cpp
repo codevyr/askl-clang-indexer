@@ -67,6 +67,9 @@ void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start
     Stage2Ref ref;
     ref.source_file = getCanonicalPath(source_file);
     ref.data = {sym_id, static_cast<int32_t>(start_off), static_cast<int32_t>(end_off)};
+    // The same use Stage1 would have put on the token: the function is
+    // stored, not called.
+    ref.data.roles = REFROLE_TAKE;
     result_.refs.push_back(std::move(ref));
 }
 
@@ -97,10 +100,15 @@ void Stage2::addFieldImplRefFromDecl(CXCursor field_decl, CXCursor func_ref) {
 
     int64_t func_sym_id = resolveSymbol(symbols_, func_referenced, fname, SYMTYPE_FUNCTION);
 
-    // Create synthetic ref: func implementation attributed to the field's declaration site
+    // THE SLOT HOLDS THE FUNCTION.  No token of the field's declaration says
+    // so -- the assignment is somewhere else entirely -- so this is not a
+    // reference but a relation, and it sits over the field's declaration,
+    // directly in the field: the field is its source, and the struct around
+    // it is not.
     Stage2Ref ref;
     ref.source_file = getCanonicalPath(field_file);
     ref.data = {func_sym_id, static_cast<int32_t>(field_start), static_cast<int32_t>(field_end)};
+    ref.data.relation = REFRELATION_HOLDS;
     result_.refs.push_back(std::move(ref));
 }
 
@@ -125,10 +133,12 @@ void Stage2::addFieldToFieldRef(CXCursor lhs_member_ref, CXCursor rhs_member_ref
 
     auto [rhs_sym_id, _] = symbols_.getOrCreate(rhs_compound, SCOPE_GLOBAL, SYMTYPE_FIELD);
 
-    // Synthetic ref: at the LHS field declaration site, reference to the RHS field symbol
+    // The slot holds what the other slot holds: `ptr->a = other->b`.  The
+    // same relation, over the LHS field's declaration.
     Stage2Ref ref;
     ref.source_file = getCanonicalPath(field_file);
     ref.data = {rhs_sym_id, static_cast<int32_t>(field_start), static_cast<int32_t>(field_end)};
+    ref.data.relation = REFRELATION_HOLDS;
     result_.refs.push_back(std::move(ref));
 }
 

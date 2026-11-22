@@ -82,9 +82,14 @@ std::string Indexer::computeCommonAncestor(const std::vector<CompileCommand>& cm
 /// units that read one token inside different declarations -- one file
 /// compiled twice under different macros declares two functions on the same
 /// bytes, and each unit read the call inside its own -- hold two references.
+///
+/// What it STATES is the union of what the units read (`mergeStated`): one
+/// file compiled under two sets of flags can call a function through a macro
+/// in one and hand it on in the other, on the same token.
 static void mergeRefView(RefData& kept, const RefData& in) {
     kept.pasted = kept.pasted && in.pasted;
     kept.typed_in_define = kept.typed_in_define && in.typed_in_define;
+    mergeStated(kept, in);
 }
 
 void Indexer::processTU(const CompileCommand& cmd) {
@@ -156,16 +161,19 @@ void Indexer::processTU(const CompileCommand& cmd) {
         auto it = results.file_index.find(ref.source_file);
         if (it != results.file_index.end()) {
             auto& file_refs = results.files[it->second].refs;
-            bool dup = std::any_of(file_refs.begin(), file_refs.end(), [&](const RefData& r) {
+            auto dup = std::find_if(file_refs.begin(), file_refs.end(), [&](const RefData& r) {
                 return r.to_symbol_local_id == ref.data.to_symbol_local_id &&
                        r.from_offset_start == ref.data.from_offset_start &&
                        r.from_offset_end == ref.data.from_offset_end;
             });
-            if (!dup) {
+            if (dup == file_refs.end()) {
                 // Left unnumbered, like every other ref: the post-merge
                 // numbering pass places all of them by the text they sit in.
                 ref.data.synthetic = true;
                 file_refs.push_back(ref.data);
+            } else {
+                // The same row found again states what both findings do.
+                mergeStated(*dup, ref.data);
             }
         }
     }

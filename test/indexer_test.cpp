@@ -53,13 +53,26 @@ void PrintTo(const ExpectedSymbol& s, std::ostream* os) {
         << ", type=" << type_str(s.type) << "}";
 }
 
+// Role bits and relations (matching proto/index.proto RefRole / RefRelation)
+constexpr int CALL = 1;
+constexpr int WRITE = 2;
+constexpr int TAKE = 4;
+constexpr int DECLARES = 1;
+constexpr int HOLDS = 2;
+
 struct ExpectedRef {
     std::string from_file;      // module_path of the file containing the reference
     std::string to_name;        // name of the referenced symbol
     int32_t from_start;         // byte offset of reference start
     int32_t from_end;           // byte offset of reference end
+    // What the reference states.  -1 = not checked, which is what every
+    // fixture written before roles existed says; 0 = it states nothing.
+    int roles = -1;
+    int relation = -1;
 
     bool operator==(const ExpectedRef& o) const {
+        if (roles >= 0 && o.roles >= 0 && roles != o.roles) return false;
+        if (relation >= 0 && o.relation >= 0 && relation != o.relation) return false;
         return from_file == o.from_file && to_name == o.to_name
             && from_start == o.from_start && from_end == o.from_end;
     }
@@ -73,7 +86,9 @@ struct ExpectedRef {
 
 void PrintTo(const ExpectedRef& r, std::ostream* os) {
     *os << "{\"" << r.from_file << "\", \"" << r.to_name
-        << "\", " << r.from_start << ", " << r.from_end << "}";
+        << "\", " << r.from_start << ", " << r.from_end;
+    if (r.roles >= 0 || r.relation >= 0) *os << ", " << r.roles << ", " << r.relation;
+    *os << "}";
 }
 
 struct ExpectedInstance {
@@ -209,7 +224,8 @@ RunResult runFixture(const std::string& fixture_name,
                 << ": start=" << ref.from_offset_start << " > end=" << ref.from_offset_end;
             auto it = id_to_name.find(ref.to_symbol_local_id);
             std::string to_name = (it != id_to_name.end()) ? it->second : "UNKNOWN";
-            result.refs.push_back({rel_path, to_name, ref.from_offset_start, ref.from_offset_end});
+            result.refs.push_back({rel_path, to_name, ref.from_offset_start, ref.from_offset_end,
+                                   static_cast<int>(ref.roles), ref.relation});
         }
     }
 
@@ -1111,6 +1127,67 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "threshold", 69, 78},
                 {"main.c", "LEVEL", 95, 100},
             },
+        },
+        // What each reference states: the roles of its token, or the
+        // relation the row is.  (The tests under "What a reference says about
+        // its target" ask the same by the text at each token.)
+        FixtureSpec{
+            "reference_roles",
+            {"main.c"},
+            {
+                {"BODY_CALL", GLOBAL, MACRO},
+                {"CALL_AND_KEEP", GLOBAL, MACRO},
+                {"DEFINE_COUNTER", GLOBAL, MACRO},
+                {"MODE_A", GLOBAL, DATA},
+                {"MODE_B", GLOBAL, DATA},
+                {"OPS_H", GLOBAL, MACRO},
+                {"USE", GLOBAL, MACRO},
+                {"both", GLOBAL, FUNCTION},
+                {"either", GLOBAL, FUNCTION},
+                {"file_ops", GLOBAL, TYPE},
+                {"file_ops.read", GLOBAL, FIELD},
+                {"file_ops.write", GLOBAL, FIELD},
+                {"fn_t", GLOBAL, TYPE},
+                {"helper", GLOBAL, FUNCTION},
+                {"hits", GLOBAL, DATA},
+                {"keep", GLOBAL, FUNCTION},
+                {"main.c", GLOBAL, FILETYPE},
+                {"mode", GLOBAL, TYPE},
+                {"my_read", GLOBAL, FUNCTION},
+                {"ops", LOCAL, DATA},
+                {"ops.h", GLOBAL, FILETYPE},
+                {"other", GLOBAL, FUNCTION},
+                {"pick", GLOBAL, FUNCTION},
+                {"run", GLOBAL, FUNCTION},
+                {"two_units", GLOBAL, FUNCTION},
+                {"unlabelled", GLOBAL, FUNCTION},
+            },
+            // refs (file, symbol, start, end, roles, relation)
+            {
+                {"main.c", "DEFINE_COUNTER", 252, 266, 0, 0},             // DEFINE_COUNTER(hits);
+                {"main.c", "file_ops", 289, 297, 0, 0},                   // static struct file_ops ops = {
+                {"main.c", "my_read", 318, 325, TAKE, 0},                 // .read = my_read,
+                {"main.c", "fn_t", 358, 362, 0, 0},                       // fn_t pick(void) { return other; }
+                {"main.c", "other", 383, 388, TAKE, 0},                   // fn_t pick(void) { return other; }
+                {"main.c", "mode", 406, 410, 0, 0},                       // int run(enum mode m)
+                {"main.c", "MODE_A", 442, 448, TAKE, 0},                  // case MODE_A:
+                {"main.c", "helper", 465, 471, CALL, 0},                  // return helper(1);
+                {"main.c", "keep", 514, 518, CALL, 0},                    // keep(helper);
+                {"main.c", "helper", 519, 525, TAKE, 0},                  // keep(helper);
+                {"main.c", "CALL_AND_KEEP", 539, 552, 0, 0},              // return CALL_AND_KEEP(both) + BODY_CALL();
+                {"main.c", "both", 553, 557, CALL | TAKE, 0},             // return CALL_AND_KEEP(both) + BODY_CALL();
+                {"main.c", "BODY_CALL", 561, 570, 0, 0},                  // return CALL_AND_KEEP(both) + BODY_CALL();
+                {"main.c", "hits", 604, 608, 0, 0},                       // hits++;
+                {"main.c", "ops", 623, 626, 0, 0},                        // return ops.read(2);
+                {"main.c", "file_ops.read", 627, 631, 0, 0},              // return ops.read(2);
+                {"main.c", "USE", 668, 671, 0, 0},                        // int two_units(void) { return USE(either); }
+                {"main.c", "either", 672, 678, TAKE, 0},                  // int two_units(void) { return USE(either); }
+                {"ops.h", "my_read", 51, 67, 0, HOLDS},                   // int (*read)(int);
+                {"ops.h", "hits", 131, 145, 0, DECLARES},                 // #define DEFINE_COUNTER(name) int name = 0
+                {"ops.h", "keep", 200, 204, CALL, 0},                     // #define CALL_AND_KEEP(fn) (fn(1) + keep(fn))
+                {"ops.h", "helper", 230, 236, CALL, 0},                   // #define BODY_CALL() helper(3)
+                {"ops.h", "keep", 300, 304, CALL, 0},                     // #define USE(fn) keep(fn)
+            }
         }
     ),
     [](const testing::TestParamInfo<FixtureSpec>& info) {
@@ -3184,6 +3261,346 @@ TEST(ObjectRoots, TwoUnitsThatNestAPairOppositelyDoNotDependOnOrder) {
 // expansion-site refs; the dedup kept the FIRST.  So the surviving instance was
 // never the one the refs had been numbered against, and every such ref pointed
 // into the stride the dropped instance used to occupy.
+// ---------------------------------------------------------------------------
+// What a reference says about its target
+// ---------------------------------------------------------------------------
+
+namespace {
+/// One reference of a built fixture, with where it sits.
+struct StatedRef {
+    const askl::index::SymbolRef* ref = nullptr;
+    /// The innermost instance around it, and that instance's depth.
+    std::string owner;
+    int32_t owner_level = -1;
+};
+
+/// The reference to `target` that starts where `anchor` first occurs in
+/// `file`, `skip` bytes in.  Asked by text, so the fixture can be read beside
+/// the assertion.
+StatedRef refAt(const BuiltFixture& built, const std::string& file, const std::string& anchor,
+                size_t skip, const std::string& target) {
+    StatedRef out;
+    for (const auto& obj : built.project.objects()) {
+        const std::string& path = obj.module_path();
+        if (path.size() < file.size() + 1 ||
+            path.compare(path.size() - file.size() - 1, file.size() + 1, "/" + file) != 0)
+            continue;
+        const std::string& text = obj.content();
+        auto at = text.find(anchor);
+        if (at == std::string::npos) {
+            ADD_FAILURE() << "`" << anchor << "` is not in " << file;
+            return out;
+        }
+        const auto start = static_cast<int32_t>(at + skip);
+        for (const auto& ref : obj.refs()) {
+            if (ref.from_offset_start() != start) continue;
+            if (built.name.at(ref.to_symbol_local_id()) != target) continue;
+            EXPECT_EQ(out.ref, nullptr)
+                << "two references to " << target << " at `" << anchor << "`";
+            out.ref = &ref;
+            const askl::index::SymbolInstance* owner = nullptr;
+            for (const auto& i : obj.symbol_instances())
+                if (i.dfs_enter() < ref.dfs_enter() && ref.dfs_enter() < i.dfs_exit() &&
+                    (!owner || i.dfs_enter() > owner->dfs_enter()))
+                    owner = &i;
+            if (owner) {
+                out.owner = built.name.at(owner->symbol_local_id());
+                out.owner_level = owner->nesting_level();
+            }
+        }
+    }
+    if (!out.ref) ADD_FAILURE() << "no reference to " << target << " at `" << anchor << "` in " << file;
+    return out;
+}
+} // namespace
+
+// A REFERENCE CARRIES THE SET OF THINGS ITS TOKEN DOES TO THE TARGET.
+//
+// The indexer knows, where it makes a reference, whether the token is the
+// callee of a call or a function handed on as a value, and it used to write
+// the same bare reference for both: `request_irq(n, handler)` was drawn like a
+// call.  It writes what it knows:
+//
+//   * CALL: the token is the callee of a call;
+//   * TAKE: a function named and not called, an enum constant.
+//
+// Each is a positive fact about the text.  A token that states nothing here
+// (a type, a macro invocation, and until they can be told apart a variable or
+// a field) is not thereby "not called": it says nothing.
+TEST(ReferenceRoles, AReferenceSaysWhatItsTokenDoes) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"main.c"});
+    struct Case {
+        const char* file;
+        const char* anchor;
+        size_t skip;
+        const char* target;
+        unsigned roles;
+        const char* owner;
+    };
+    for (const Case& c : std::vector<Case>{
+             // The callee of a call.
+             {"main.c", "helper(1)", 0, "helper", CALL, "run"},
+             {"main.c", "keep(helper)", 0, "keep", CALL, "run"},
+             // A callback passed to a function, and a function returned.
+             {"main.c", "keep(helper)", 5, "helper", TAKE, "run"},
+             {"main.c", "return other", 7, "other", TAKE, "pick"},
+             // A function stored in a field: the token is a value.
+             {"main.c", ".read = my_read", 8, "my_read", TAKE, "ops"},
+             // An enum constant.
+             {"main.c", "case MODE_A", 5, "MODE_A", TAKE, "run"},
+             // A call written in a `#define` body is a call there too.
+             {"ops.h", "helper(3)", 0, "helper", CALL, "BODY_CALL"},
+             {"ops.h", "keep(fn))", 0, "keep", CALL, "CALL_AND_KEEP"},
+             // Nothing is stated of a type, a macro invocation, a variable or
+             // a field.
+             {"main.c", "enum mode m", 5, "mode", 0, "run"},
+             {"main.c", "DEFINE_COUNTER(hits)", 0, "DEFINE_COUNTER", 0, "main.c"},
+             {"main.c", "BODY_CALL()", 0, "BODY_CALL", 0, "run"},
+             {"main.c", "hits++", 0, "hits", 0, "unlabelled"},
+             {"main.c", "ops.read(2)", 0, "ops", 0, "unlabelled"},
+             {"main.c", "ops.read(2)", 4, "file_ops.read", 0, "unlabelled"},
+         }) {
+        StatedRef r = refAt(built, c.file, c.anchor, c.skip, c.target);
+        if (!r.ref) continue;
+        EXPECT_EQ(r.ref->roles(), c.roles) << c.target << " at `" << c.anchor << "`";
+        EXPECT_EQ(r.ref->relation(), askl::index::REF_RELATION_NONE)
+            << c.target << " at `" << c.anchor << "`";
+        EXPECT_EQ(r.owner, c.owner) << c.target << " at `" << c.anchor << "`";
+    }
+}
+
+// ONE TOKEN THAT DOES TWO THINGS STATES BOTH.
+//
+// `CALL_AND_KEEP(both)` expands to `(both(1) + keep(both))`: the one `both`
+// the caller typed is the callee of a call and a value handed on.  The two
+// readings land on one reference, and a reference keeps what either knew --
+// it used to keep whichever was read first.
+TEST(ReferenceRoles, OneTokenReadTwiceStatesBothRoles) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"main.c"});
+    StatedRef r = refAt(built, "main.c", "CALL_AND_KEEP(both)", 14, "both");
+    ASSERT_NE(r.ref, nullptr);
+    EXPECT_EQ(r.ref->roles(), static_cast<unsigned>(CALL | TAKE));
+    EXPECT_EQ(r.owner, "run");
+}
+
+// TWO UNITS THAT READ ONE TOKEN DIFFERENTLY STATE BOTH, IN EITHER ORDER.
+//
+// `USE(either)` calls its argument when the file is compiled with -DAS_CALL
+// and hands it on otherwise.  The file is one text, so the token is one
+// reference; what it states is the union of what the two units read.
+TEST(ReferenceRoles, RolesFromTwoUnitsAreAUnion) {
+    using Units = BuiltFixture::Units;
+    for (const Units& units :
+         {Units{{{"main.c", "-DAS_CALL"}, {"main.c", ""}}},
+          Units{{{"main.c", ""}, {"main.c", "-DAS_CALL"}}}}) {
+        BuiltFixture built("reference_roles", units);
+        StatedRef r = refAt(built, "main.c", "USE(either)", 4, "either");
+        ASSERT_NE(r.ref, nullptr);
+        EXPECT_EQ(r.ref->roles(), static_cast<unsigned>(CALL | TAKE))
+            << "first unit: " << units.list[0].second;
+        EXPECT_EQ(r.owner, "two_units");
+    }
+    // One unit alone states what that unit read.
+    BuiltFixture call("reference_roles", Units{{{"main.c", "-DAS_CALL"}}});
+    StatedRef r = refAt(call, "main.c", "USE(either)", 4, "either");
+    ASSERT_NE(r.ref, nullptr);
+    EXPECT_EQ(r.ref->roles(), static_cast<unsigned>(CALL));
+    BuiltFixture value("reference_roles", std::vector<std::string>{"main.c"});
+    r = refAt(value, "main.c", "USE(either)", 4, "either");
+    ASSERT_NE(r.ref, nullptr);
+    EXPECT_EQ(r.ref->roles(), static_cast<unsigned>(TAKE));
+}
+
+// A RELATION IS A FACT BETWEEN TWO SYMBOLS THAT NO TOKEN OF THE SOURCE SPELLS,
+// AND IT SITS DIRECTLY IN THE DECLARATION OF ITS SOURCE.
+//
+// "The macro declared it" and "the slot holds it" were written as references,
+// parked on the macro's name and on the field's declaration.  A reference
+// belongs to every declaration around it, so the struct appeared to refer to
+// the function its field holds: `file_operations (type) -> bt_bmc_open`.  The
+// row says what it is now, and the engine gives a relation to the one
+// declaration exactly one level above it.
+TEST(ReferenceRoles, ARelationSitsDirectlyInItsSource) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"main.c"});
+
+    // The macro's invocation declared `hits`.
+    StatedRef declares = refAt(built, "ops.h", "DEFINE_COUNTER(name)", 0, "hits");
+    ASSERT_NE(declares.ref, nullptr);
+    EXPECT_EQ(declares.ref->relation(), askl::index::REF_RELATION_DECLARES);
+    EXPECT_EQ(declares.ref->roles(), 0u) << "a relation is no token and states no role";
+    EXPECT_EQ(declares.owner, "DEFINE_COUNTER");
+    EXPECT_EQ(declares.ref->nesting_level(), declares.owner_level + 1);
+
+    // The slot holds the function stored in it.
+    StatedRef holds = refAt(built, "ops.h", "int (*read)(int);", 0, "my_read");
+    ASSERT_NE(holds.ref, nullptr);
+    EXPECT_EQ(holds.ref->relation(), askl::index::REF_RELATION_HOLDS);
+    EXPECT_EQ(holds.ref->roles(), 0u);
+    EXPECT_EQ(holds.owner, "file_ops.read");
+    EXPECT_EQ(holds.ref->nesting_level(), holds.owner_level + 1);
+
+    // Every relation row of the fixture, not only the two looked up: it
+    // states no role, and its source is one level above it.
+    int relations = 0;
+    for (const auto& obj : built.project.objects())
+        for (const auto& ref : obj.refs()) {
+            if (ref.relation() == askl::index::REF_RELATION_NONE) continue;
+            ++relations;
+            EXPECT_EQ(ref.roles(), 0u);
+            int direct = 0;
+            for (const auto& i : obj.symbol_instances())
+                if (i.dfs_enter() < ref.dfs_enter() && ref.dfs_enter() < i.dfs_exit() &&
+                    i.nesting_level() + 1 == ref.nesting_level())
+                    ++direct;
+            EXPECT_EQ(direct, 1) << "a relation to "
+                                 << built.name.at(ref.to_symbol_local_id())
+                                 << " has no single source";
+        }
+    EXPECT_EQ(relations, 2);
+}
+
+// A SLOT ASSIGNED FROM A SLOT HOLDS IT.
+//
+// `to->write = from->read` stores whatever `read` holds in `write`.  The same
+// relation as a function stored directly, on the declaration of the field
+// assigned to.
+TEST(ReferenceRoles, ASlotAssignedFromASlotHoldsIt) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"fields.c"});
+    StatedRef holds = refAt(built, "ops.h", "int (*write)(int);", 0, "file_ops.read");
+    ASSERT_NE(holds.ref, nullptr);
+    EXPECT_EQ(holds.ref->relation(), askl::index::REF_RELATION_HOLDS);
+    EXPECT_EQ(holds.ref->roles(), 0u);
+    EXPECT_EQ(holds.owner, "file_ops.write");
+    EXPECT_EQ(holds.ref->nesting_level(), holds.owner_level + 1);
+}
+
+// A COPY OF A REFERENCE STATES WHAT ITS OWN READING DOES.
+//
+// A reference read through an `#include` inside a declaration is also
+// recorded on that `#include` line.  `table` stores the functions the header
+// lists and `dispatch` calls them: each copy says which, and the header's own
+// token, read both ways, says both.
+TEST(ReferenceRoles, ACopyAtAnIncludeStatesWhatWasReadThere) {
+    BuiltFixture built("include_inside_declaration", std::vector<std::string>{"main.c"});
+    std::map<std::string, std::set<unsigned>> roles_in;
+    for (const auto& obj : built.project.objects())
+        for (const auto& ref : obj.refs()) {
+            if (built.name.at(ref.to_symbol_local_id()) != "sys_read") continue;
+            const askl::index::SymbolInstance* owner = nullptr;
+            for (const auto& i : obj.symbol_instances())
+                if (i.dfs_enter() < ref.dfs_enter() && ref.dfs_enter() < i.dfs_exit() &&
+                    (!owner || i.dfs_enter() > owner->dfs_enter()))
+                    owner = &i;
+            ASSERT_NE(owner, nullptr);
+            roles_in[built.name.at(owner->symbol_local_id())].insert(ref.roles());
+        }
+    EXPECT_EQ(roles_in["table"], (std::set<unsigned>{TAKE}));
+    EXPECT_EQ(roles_in["dispatch"], (std::set<unsigned>{CALL}));
+    EXPECT_EQ(roles_in["syscalls.h"], (std::set<unsigned>{CALL | TAKE}));
+}
+
+// THE FALLBACK USE OF A FUNCTION STORED IN A FIELD IS A VALUE.
+//
+// Where a macro pasted the function's name together and the replay could not
+// follow it, no token carries the reference and the second pass records the
+// use over the whole `.open = ...`.  It is the same use: the function is
+// stored, not called.  The slot's own row is a relation, as everywhere.
+TEST(ReferenceRoles, TheWideFallbackReferenceTakesTheFunction) {
+    BuiltFixture built("macro_pasted_fallback", std::vector<std::string>{"main.c"});
+    int wide = 0, holds = 0;
+    for (const auto& obj : built.project.objects())
+        for (const auto& ref : obj.refs()) {
+            if (built.name.at(ref.to_symbol_local_id()) != "fn_a") continue;
+            if (ref.relation() == askl::index::REF_RELATION_HOLDS) {
+                ++holds;
+                EXPECT_EQ(ref.roles(), 0u);
+            } else {
+                ++wide;
+                EXPECT_EQ(ref.roles(), static_cast<unsigned>(TAKE));
+            }
+        }
+    EXPECT_EQ(wide, 1);
+    EXPECT_EQ(holds, 1);
+}
+
+// EVERY PLACE TWO RECORDS OF ONE REFERENCE MEET, THEY STATE WHAT EITHER DID.
+//
+// The two merges above are the ones a fixture reaches.  Two more make one
+// reference out of several records: `numberTree`, where readings that were
+// told apart by the declaration they were read inside turn out to sit in the
+// same place, and `ProtoBuilder`, for a caller that hands over a repeat.
+// Asked directly, with records built by hand.
+TEST(ReferenceRoles, RecordsThatBecomeOneReferenceAreAUnion) {
+    SymbolTable symbols;
+    const std::string path = "/proj/a.c";
+    const std::string text = "int f(void) { return g(g); }\n";
+    auto [file_sym, _f] = symbols.getOrCreate(path, SCOPE_GLOBAL, SYMTYPE_FILE);
+    auto [f_sym, _a] = symbols.getOrCreate("f", SCOPE_GLOBAL, SYMTYPE_FUNCTION);
+    auto [g_sym, _b] = symbols.getOrCreate("g", SCOPE_GLOBAL, SYMTYPE_FUNCTION);
+    const auto at = static_cast<int32_t>(text.find("g(g)"));
+
+    FileData fd;
+    fd.object_local_id = 1;
+    fd.module_path = path;
+    fd.filesystem_path = path;
+    fd.filetype = "c";
+    fd.content.assign(text.begin(), text.end());
+    fd.instances.push_back({file_sym, 0, static_cast<int32_t>(text.size()), INSTTYPE_FILE});
+    fd.instances.push_back(
+        {f_sym, 0, static_cast<int32_t>(text.size()) - 1, INSTTYPE_DEFINITION});
+
+    // One token, read once inside `f` and once with nothing to say about
+    // where: both sit in `f`.
+    RefData inside{g_sym, at, at + 1};
+    inside.scope_idx = 1;
+    inside.roles = REFROLE_CALL;
+    RefData nowhere{g_sym, at, at + 1};
+    nowhere.roles = REFROLE_TAKE;
+    for (bool call_first : {true, false}) {
+        FileData numbered = fd;
+        numbered.refs = call_first ? std::vector<RefData>{inside, nowhere}
+                                   : std::vector<RefData>{nowhere, inside};
+        Stage1::numberTree(numbered);
+        ASSERT_EQ(numbered.refs.size(), 1u) << "one token in one place is one reference";
+        EXPECT_EQ(numbered.refs[0].owner_idx, 1);
+        EXPECT_EQ(numbered.refs[0].roles, REFROLE_CALL | REFROLE_TAKE)
+            << (call_first ? "the call was read first" : "the value was read first");
+    }
+
+    // A relation stands where only one record states it, and is not
+    // overwritten by another.
+    RefData holds{g_sym, 0, 3};
+    holds.relation = REFRELATION_HOLDS;
+    RefData plain{g_sym, 0, 3};
+    for (bool relation_first : {true, false}) {
+        FileData numbered = fd;
+        numbered.refs = relation_first ? std::vector<RefData>{holds, plain}
+                                       : std::vector<RefData>{plain, holds};
+        Stage1::numberTree(numbered);
+        ASSERT_EQ(numbered.refs.size(), 1u);
+        EXPECT_EQ(numbered.refs[0].relation, REFRELATION_HOLDS);
+    }
+
+    // ProtoBuilder: the same reference handed over twice.
+    FileData twice = fd;
+    twice.refs = {inside, nowhere};
+    Stage1::numberTree(twice);
+    twice.refs.push_back(twice.refs[0]);
+    twice.refs[0].roles = REFROLE_CALL;
+    twice.refs[1].roles = REFROLE_TAKE;
+    auto built = ProtoBuilder::build("test", "/proj", symbols, {twice}, 2);
+    askl::index::Project project;
+    ASSERT_TRUE(project.ParseFromString(built.project_data));
+    int found = 0;
+    for (const auto& obj : project.objects())
+        for (const auto& ref : obj.refs()) {
+            ++found;
+            EXPECT_EQ(ref.roles(), static_cast<unsigned>(CALL | TAKE));
+            EXPECT_EQ(ref.relation(), askl::index::REF_RELATION_NONE);
+        }
+    EXPECT_EQ(found, 1);
+}
+
 TEST(ObjectRoots, ReincludedHeaderKeepsBothResults) {
     std::string fixture_dir = std::string(FIXTURE_DIR) + "/reincluded_header";
     TempDir temp_dir = makeTempDir();

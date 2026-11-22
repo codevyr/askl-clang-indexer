@@ -203,22 +203,36 @@ BuildResult ProtoBuilder::build(
         // One reference per (target, token, place in the tree).  `numberTree`
         // already guarantees it for a file it numbered; this covers a caller
         // that hands over references it built itself.
-        std::unordered_set<RefKey, RefKeyHash> seen_refs;
+        //
+        // A repeat is another reading of the same reference, and what a
+        // reference states is the union of its readings (`mergeStated`).
+        std::unordered_map<RefKey, int, RefKeyHash> seen_refs;
         for (auto& ref : file.refs) {
             RefKey key{ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end,
                        ref.dfs_enter};
-            if (seen_refs.insert(key).second) {
-                auto* pb_ref = obj->add_refs();
-                pb_ref->set_to_symbol_local_id(ref.to_symbol_local_id);
-                pb_ref->set_from_offset_start(ref.from_offset_start);
-                pb_ref->set_from_offset_end(ref.from_offset_end);
-                pb_ref->set_nesting_level(ref.nesting_level);
-                pb_ref->set_dfs_enter(ref.dfs_enter);
-                if (ref.full_start >= 0) {
-                    auto* sp = pb_ref->mutable_full();
-                    sp->set_start(ref.full_start);
-                    sp->set_end(ref.full_end);
-                }
+            auto [slot, fresh] = seen_refs.try_emplace(key, obj->refs_size());
+            if (!fresh) {
+                auto* kept = obj->mutable_refs(slot->second);
+                RefData stated{};
+                stated.roles = kept->roles();
+                stated.relation = static_cast<int32_t>(kept->relation());
+                mergeStated(stated, ref);
+                kept->set_roles(stated.roles);
+                kept->set_relation(static_cast<askl::index::RefRelation>(stated.relation));
+                continue;
+            }
+            auto* pb_ref = obj->add_refs();
+            pb_ref->set_to_symbol_local_id(ref.to_symbol_local_id);
+            pb_ref->set_from_offset_start(ref.from_offset_start);
+            pb_ref->set_from_offset_end(ref.from_offset_end);
+            pb_ref->set_nesting_level(ref.nesting_level);
+            pb_ref->set_dfs_enter(ref.dfs_enter);
+            pb_ref->set_roles(ref.roles);
+            pb_ref->set_relation(static_cast<askl::index::RefRelation>(ref.relation));
+            if (ref.full_start >= 0) {
+                auto* sp = pb_ref->mutable_full();
+                sp->set_start(ref.full_start);
+                sp->set_end(ref.full_end);
             }
         }
     }

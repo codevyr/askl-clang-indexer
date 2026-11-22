@@ -25,3 +25,15 @@ constexpr int INSTTYPE_HEADER = 7;
 constexpr int INSTTYPE_BUILD = 8;
 constexpr int INSTTYPE_FILE = 9;
 constexpr int INSTTYPE_DOCUMENTATION = 10;
+
+// What a referencing token does to its target (matching proto/index.proto
+// RefRole): a SET of these bits, zero meaning nothing is stated.
+constexpr unsigned REFROLE_CALL = 1;   // the token is the callee of a call
+constexpr unsigned REFROLE_WRITE = 2;  // the target is assigned or initialised
+constexpr unsigned REFROLE_TAKE = 4;   // its value or address is taken, not called
+
+// What a row is when no token says it (matching proto/index.proto
+// RefRelation).  Zero for a reference.
+constexpr int REFRELATION_NONE = 0;
+constexpr int REFRELATION_DECLARES = 1;  // the source's invocation declared the target
+constexpr int REFRELATION_HOLDS = 2;     // the source is a slot and the target stored in it
