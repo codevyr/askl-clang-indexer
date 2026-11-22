@@ -2,6 +2,7 @@
 
 #include "dedup_keys.h"
 #include "macro_paste.h"
+#include "symbol_types.h"
 
 #include <atomic>
 #include <clang-c/Index.h>
@@ -112,6 +113,23 @@ struct RefData {
     int32_t nesting_level = 0;
     int64_t dfs_enter = 0;
 
+    // ON THE WIRE (`SymbolRef.roles`): WHAT THE TOKEN DOES TO ITS TARGET, a
+    // set of `REFROLE_*` bits.  Every bit is a positive fact about the text at
+    // this token and an absent bit states nothing: zero is "refers to", never
+    // "does not call".  So two readings of one token merge by UNION
+    // (`mergeStated`), and a token that states any role states every role it
+    // has: `CALL_AND_KEEP(fn)`, which calls its argument and hands it on, is
+    // CALL|TAKE on the one `fn` the caller typed.
+    uint32_t roles = 0;
+
+    // ON THE WIRE (`SymbolRef.relation`): zero for a reference.  Otherwise
+    // this row is not something a token says but a fact between two symbols
+    // (`REFRELATION_*`), and it sits DIRECTLY IN the declaration of its
+    // source: the engine gives a relation to the one instance exactly one
+    // level above it, where a reference belongs to every declaration around
+    // it.  The struct does not hold what its field holds.
+    int32_t relation = REFRELATION_NONE;
+
     // TRANSIENT, never on the wire: what the range says about the NAME, for
     // folding.  A reference unfolds its target when its name was typed in
     // normal code, and for most references the range is the name, so where
@@ -171,6 +189,19 @@ struct RefData {
     // [from_offset_start, from_offset_end) covers only `printk`.  Display only.
     int32_t full_start = -1, full_end = -1;
 };
+
+/// TWO READINGS OF ONE REFERENCE STATE WHAT EITHER STATES.
+///
+/// The one merge of roles and relation, used wherever two records of the same
+/// reference meet: within a unit (`Stage1::insertRef`), when Stage2's are
+/// added, across units (`mergeRefView`), after numbering (`numberTree`) and in
+/// `ProtoBuilder`.  Roles are positive facts, so they OR, and the result does
+/// not depend on which reading came first.  A relation is what the row IS; two
+/// readings of one row agree on it, and where only one states it, it stands.
+inline void mergeStated(RefData& kept, const RefData& in) {
+    kept.roles |= in.roles;
+    if (kept.relation == REFRELATION_NONE) kept.relation = in.relation;
+}
 
 struct FileData {
     int64_t object_local_id;
@@ -272,6 +303,10 @@ public:
         bool synthetic = false;
         /// The reference is a macro invocation; see `RefData::invocation_at`.
         bool invocation = false;
+        /// What the reference states; see `RefData::roles` and
+        /// `RefData::relation`.
+        uint32_t roles = 0;
+        int32_t relation = REFRELATION_NONE;
     };
 
     /// Would a reference to the symbol `name`, made by this cursor, get a
@@ -287,7 +322,17 @@ private:
 
     // Per-TU state
     std::unordered_map<std::string, size_t> file_index_; // filepath -> index in result_.files
-    std::unordered_map<size_t, std::unordered_set<RefKey, RefKeyHash>> file_ref_sets_; // per-file: one per (target, token, scope)
+    /// Per file: one reference per (target, token, scope), and WHERE IT IS in
+    /// that file's `refs`.
+    ///
+    /// A set was enough to drop a second reading, and that is what it did:
+    /// the second reading was thrown away with whatever it knew.  A token read
+    /// twice can do two things (`CALL_AND_KEEP(fn)` calls its argument and
+    /// hands it on), so the second reading has to reach the first.
+    /// `kRefDropped` for a reference that was refused (its range does not
+    /// spell its symbol): a repeat of it is refused the same way.
+    static constexpr int32_t kRefDropped = -1;
+    std::unordered_map<size_t, std::unordered_map<RefKey, int32_t, RefKeyHash>> file_ref_index_;
     /// Per-file instance index, key -> position in that file's `instances`.
     ///
     /// A set would be enough to drop a repeat, but `addInstance` needs the
@@ -575,7 +620,10 @@ private:
                       int32_t& out_start, int32_t& out_end);
     /// The name range when it names the symbol, else the cursor's extent.
     bool refRange(CXCursor cursor, const std::string& sym_name, RefPlace& out);
-    void addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name);
+    /// `roles`: what this cursor's token does to the symbol (`REFROLE_*`),
+    /// zero when the walk cannot say.
+    void addRef(CXCursor cursor, int64_t sym_id, const std::string& sym_name,
+                uint32_t roles = 0);
     /// Does the text at a reference's range actually spell the symbol it
     /// references?  A range that does not is describing a position it does not
     /// occupy, which is worse than the reference being absent.

@@ -150,6 +150,42 @@ message SymbolRef {
   int64 dfs_enter = 8;
 
   reserved 9, 10;  // were folded / fold_depth; see SymbolInstance
+
+  // What the token does to its target: a SET of RefRole bits, zero meaning
+  // nothing is stated.  Every bit is a positive fact about the text at this
+  // token and an absent bit states nothing, so an index written before roles
+  // existed, a name in a `#define` body, a type reference and a macro
+  // invocation all read the same: "refers to".  Two sightings of one token
+  // merge by union (`n++` is WRITE|TAKE).
+  uint32 roles = 11;
+
+  // Zero for a reference.  Otherwise this row is not something a token says
+  // but a fact between two symbols, placed on the declaration of its source.
+  RefRelation relation = 12;
+}
+
+// One bit per thing a referencing token can do to its target.  A role is
+// what the TEXT does, not what runs: `fn = s->cb; fn()` calls through no
+// callee token, and `*p = x` writes through no token of what it writes.
+enum RefRole {
+  REF_ROLE_UNSPECIFIED = 0;
+  // The token is the callee of a call: `foo(x)`, `s->cb(x)`.
+  REF_ROLE_CALL = 1;
+  // The target is assigned or initialised: `s->cb = f`, `n++`, `.cb = f`.
+  REF_ROLE_WRITE = 2;
+  // Its value or address is taken, not called: `request_irq(n, handler)`,
+  // `g = s->count`, `case REQ_OP_READ:`.
+  REF_ROLE_TAKE = 4;
+}
+
+// A fact between two symbols that no token of the source spells.
+enum RefRelation {
+  REF_RELATION_NONE = 0;
+  // The source's invocation declared the target: `DEFINE_MUTEX -> lock`.
+  REF_RELATION_DECLARES = 1;
+  // The source is a dispatch point and the target something stored in it:
+  // `file_operations.read -> bt_bmc_read`, `(io.Reader).Read -> (*File).Read`.
+  REF_RELATION_HOLDS = 2;
 }
 
 enum SymbolScope {
