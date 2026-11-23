@@ -70,6 +70,15 @@ private:
     std::unordered_set<size_t> files_with_late_instances_;
     size_t late_instance_count_ = 0;
 
+    /// Every place that made a relation so, by the row it belongs to; see
+    /// `relation_sites.h`.  File indices are into `all_files_`.  Guarded by
+    /// files_mutex_ until the translation units are done.
+    RelationSites relation_sites_;
+    /// Places in a file no object was made for.  Such a place cannot be
+    /// named, so it is neither a witness nor counted.  Guarded by
+    /// files_mutex_.
+    size_t relation_sites_unplaced_ = 0;
+
     void processTU(const CompileCommand& cmd);
     void addGitTrackedFiles();
     void addFile(const std::string& abs_path);

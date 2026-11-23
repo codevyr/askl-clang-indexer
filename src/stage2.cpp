@@ -6,8 +6,43 @@
 
 #include <utility>
 
-Stage2::Stage2(SymbolTable& symbols, PlacedByStage1 placed_by_stage1)
-    : symbols_(symbols), placed_by_stage1_(std::move(placed_by_stage1)) {}
+Stage2::Stage2(SymbolTable& symbols, PlacedByStage1 placed_by_stage1,
+               InvocationEndAt invocation_end_at)
+    : symbols_(symbols),
+      placed_by_stage1_(std::move(placed_by_stage1)),
+      invocation_end_at_(std::move(invocation_end_at)) {}
+
+// A PLACE A MACRO WROTE IS THE INVOCATION.
+//
+// Text that came out of a macro has no place of its own in the file: clang
+// reports every token of an expansion at the point the invocation STARTS.  So
+//
+//     DEFINE_OPS(gen_ops, my_read);        // expands to `... = { .read = my_read }`
+//     .read = WRAP(my_read),
+//
+// gave the first a place zero bytes wide and ended the second at `WRAP`.  A
+// range that ends where an invocation starts ends where the invocation ends
+// -- the same correction `Stage1::declExtent` makes for a declaration -- and
+// the place is what the author typed there: the whole invocation, or the
+// store up to and including it.
+Stage2Place Stage2::placeOf(CXCursor cursor) const {
+    CXSourceRange range = clang_getCursorExtent(cursor);
+    CXFile start_file = nullptr, end_file = nullptr;
+    unsigned start = 0, end = 0;
+    clang_getExpansionLocation(clang_getRangeStart(range), &start_file, nullptr, nullptr, &start);
+    clang_getExpansionLocation(clang_getRangeEnd(range), &end_file, nullptr, nullptr, &end);
+    if (!start_file || !end_file || !clang_File_isEqual(start_file, end_file)) return {};
+
+    Stage2Place place{true, getCanonicalPath(start_file), static_cast<int32_t>(start),
+                      static_cast<int32_t>(end)};
+    if (invocation_end_at_) {
+        const int32_t invocation_end = invocation_end_at_(place.file, place.end);
+        if (invocation_end > place.end) place.end = invocation_end;
+    }
+    // Nothing known to widen it with: one byte, so it is still a place.
+    if (place.end <= place.start) place.end = place.start + 1;
+    return place;
+}
 
 CXChildVisitResult Stage2::visitor(CXCursor cursor, CXCursor parent, CXClientData data) {
     auto* self = static_cast<Stage2*>(data);
@@ -73,12 +108,14 @@ void Stage2::addFuncPtrRef(CXCursor func_ref, CXFile source_file, unsigned start
     result_.refs.push_back(std::move(ref));
 }
 
-void Stage2::addFieldImplRef(CXCursor member_ref, CXCursor func_ref) {
+void Stage2::addFieldImplRef(CXCursor member_ref, CXCursor func_ref,
+                             const Stage2Place& made_at) {
     CXCursor field_decl = clang_getCursorReferenced(member_ref);
-    addFieldImplRefFromDecl(field_decl, func_ref);
+    addFieldImplRefFromDecl(field_decl, func_ref, made_at);
 }
 
-void Stage2::addFieldImplRefFromDecl(CXCursor field_decl, CXCursor func_ref) {
+void Stage2::addFieldImplRefFromDecl(CXCursor field_decl, CXCursor func_ref,
+                                     const Stage2Place& made_at) {
     // Validate the field declaration first (cheap checks)
     if (clang_Cursor_isNull(field_decl)) return;
     if (clang_getCursorKind(field_decl) != CXCursor_FieldDecl) return;
@@ -109,10 +146,12 @@ void Stage2::addFieldImplRefFromDecl(CXCursor field_decl, CXCursor func_ref) {
     ref.source_file = getCanonicalPath(field_file);
     ref.data = {func_sym_id, static_cast<int32_t>(field_start), static_cast<int32_t>(field_end)};
     ref.data.relation = REFRELATION_HOLDS;
+    ref.made_at = made_at;
     result_.refs.push_back(std::move(ref));
 }
 
-void Stage2::addFieldToFieldRef(CXCursor lhs_member_ref, CXCursor rhs_member_ref) {
+void Stage2::addFieldToFieldRef(CXCursor lhs_member_ref, CXCursor rhs_member_ref,
+                                const Stage2Place& made_at) {
     // Get the LHS field declaration and its source location
     CXCursor lhs_field_decl = clang_getCursorReferenced(lhs_member_ref);
     if (clang_Cursor_isNull(lhs_field_decl)) return;
@@ -139,6 +178,7 @@ void Stage2::addFieldToFieldRef(CXCursor lhs_member_ref, CXCursor rhs_member_ref
     ref.source_file = getCanonicalPath(field_file);
     ref.data = {rhs_sym_id, static_cast<int32_t>(field_start), static_cast<int32_t>(field_end)};
     ref.data.relation = REFRELATION_HOLDS;
+    ref.made_at = made_at;
     result_.refs.push_back(std::move(ref));
 }
 
@@ -213,15 +253,18 @@ void Stage2::handleInitEntry(CXCursor child, int field_index,
 
     if (!data.has_func) return;
 
+    // The whole entry: `.read = my_read`, or the bare `my_read` of a
+    // positional initialiser.  It is where the slot came to hold the function.
+    const Stage2Place made_at = placeOf(child);
     CXFile range_file;
     unsigned start_off, end_off;
     if (getExpansionRange(child, range_file, start_off, end_off, true))
         addFuncPtrRef(data.func_ref, range_file, start_off, end_off);
 
     if (data.has_member) {
-        addFieldImplRef(data.member_ref, data.func_ref);
+        addFieldImplRef(data.member_ref, data.func_ref, made_at);
     } else if (field_index < (int)fields.size()) {
-        addFieldImplRefFromDecl(fields[field_index], data.func_ref);
+        addFieldImplRefFromDecl(fields[field_index], data.func_ref, made_at);
     }
 }
 
@@ -298,6 +341,10 @@ void Stage2::handleBinaryAssignment(CXCursor cursor) {
 
     if (!isFunctionPointerType(clang_getCursorType(lhs))) return;
 
+    // The whole assignment, `ops->read = my_read`: where the slot came to
+    // hold what is on the right.
+    const Stage2Place made_at = placeOf(cursor);
+
     RhsFuncFinder rhs_data;
     // Check if rhs itself is a DeclRefExpr
     if (clang_getCursorKind(rhs) == CXCursor_DeclRefExpr) {
@@ -323,7 +370,7 @@ void Stage2::handleBinaryAssignment(CXCursor cursor) {
         if (!field_data.found)
             clang_visitChildren(rhs, findFieldInRhs, &field_data);
         if (field_data.found)
-            addFieldToFieldRef(lhs, field_data.member_ref);
+            addFieldToFieldRef(lhs, field_data.member_ref, made_at);
         return;
     }
 
@@ -333,7 +380,7 @@ void Stage2::handleBinaryAssignment(CXCursor cursor) {
         addFuncPtrRef(rhs_data.func_ref, range_file, start_off, end_off);
     }
     // Create synthetic ref from field declaration to implementing function
-    addFieldImplRef(lhs, rhs_data.func_ref);
+    addFieldImplRef(lhs, rhs_data.func_ref, made_at);
 }
 
 void Stage2::process(CXTranslationUnit tu, const std::string& tu_filename) {

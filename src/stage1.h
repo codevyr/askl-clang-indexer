@@ -3,6 +3,7 @@
 #include "dedup_keys.h"
 #include "expr_use.h"
 #include "macro_paste.h"
+#include "relation_sites.h"
 #include "symbol_types.h"
 
 #include <atomic>
@@ -204,6 +205,20 @@ inline void mergeStated(RefData& kept, const RefData& in) {
     if (kept.relation == REFRELATION_NONE) kept.relation = in.relation;
 }
 
+/// ON THE WIRE (`SymbolRef.witness`): WHERE A RELATION HAPPENED.
+///
+/// A relation row sits on the declaration of its source -- the field's
+/// declaration for `HOLDS`, the macro's name in its `#define` for `DECLARES`
+/// -- so its own range says who is related and not where that was made so.
+/// The witness is one place in the code that made it so: the FIRST of them,
+/// by the path of the file it is in and then by offset, and how many there
+/// are.  See `relation_sites.h` for how the places are collected.
+struct WitnessData {
+    int64_t object_local_id = 0;  // the file the place is in
+    int32_t start = -1, end = -1;
+    uint32_t sites = 0;
+};
+
 struct FileData {
     int64_t object_local_id;
     std::string module_path;
@@ -213,6 +228,12 @@ struct FileData {
     std::vector<uint8_t> content;
     std::vector<InstanceData> instances;
     std::vector<RefData> refs;
+
+    /// The witness of each relation row of this file, by the row's target and
+    /// range (`resolveWitnesses`).  Beside the rows and not in them:
+    /// a file has a handful of relation rows among its references, and a
+    /// `RefData` is paid for by every reference of the project.
+    std::unordered_map<EntryKey, WitnessData, EntryKeyHash> witnesses;
 };
 
 /// TWO READINGS OF WHERE ONE INSTANCE WAS READ, reconciled.
@@ -271,6 +292,9 @@ void canonicaliseInstanceOrder(FileData& f, const std::vector<SymbolOrder>& orde
 struct Stage1Result {
     std::vector<FileData> files;
     std::unordered_map<std::string, size_t> file_index; // filesystem_path -> index in files
+    /// The places this unit read that made a relation so; see
+    /// `relation_sites.h`.  Indices are into `files`.
+    std::vector<RelationSite> relation_sites;
 };
 
 class Stage1 {
@@ -315,6 +339,11 @@ public:
     /// the part its caller typed?  The same decision `addRef` makes, without
     /// recording anything.  Valid only while this unit's cursors are.
     bool placesReference(CXCursor cursor, const std::string& name);
+
+    /// Where the outermost macro invocation that starts at `start` in the
+    /// file `path` ends, or -1 when none starts there.  Valid until
+    /// `takeResults`.
+    int32_t invocationEndAt(const std::string& path, int32_t start) const;
 
 private:
     SymbolTable& symbols_;
