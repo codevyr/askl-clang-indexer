@@ -92,6 +92,42 @@ static void mergeRefView(RefData& kept, const RefData& in) {
     mergeStated(kept, in);
 }
 
+void resolveWitnesses(std::vector<FileData>& files, const RelationSites& sites) {
+    for (FileData& f : files) f.witnesses.clear();
+
+    // Does place `a` come before place `b`?  By the path of the file, then by
+    // where it starts, then by where it ends.
+    auto before = [&files](const RelationSite& a, const RelationSite& b) {
+        if (a.place_file != b.place_file) {
+            const int by_path =
+                files[a.place_file].module_path.compare(files[b.place_file].module_path);
+            if (by_path != 0) return by_path < 0;
+        }
+        if (a.place_start != b.place_start) return a.place_start < b.place_start;
+        return a.place_end < b.place_end;
+    };
+
+    // A minimum and a count over a set: whatever order the set is walked in,
+    // the answer is the same.
+    struct Found {
+        const RelationSite* first;
+        uint32_t sites;
+    };
+    std::vector<std::unordered_map<EntryKey, Found, EntryKeyHash>> found(files.size());
+    for (const RelationSite& site : sites) {
+        auto [slot, fresh] = found[site.row_file].try_emplace(
+            EntryKey{site.to, site.row_start, site.row_end}, Found{&site, 0});
+        Found& f = slot->second;
+        ++f.sites;
+        if (!fresh && before(site, *f.first)) f.first = &site;
+    }
+    for (size_t fi = 0; fi < files.size(); ++fi)
+        for (const auto& [row, f] : found[fi])
+            files[fi].witnesses.emplace(
+                row, WitnessData{files[f.first->place_file].object_local_id,
+                                 f.first->place_start, f.first->place_end, f.sites});
+}
+
 void Indexer::processTU(const CompileCommand& cmd) {
     ClangIndex index;
 
@@ -142,9 +178,14 @@ void Indexer::processTU(const CompileCommand& cmd) {
     // Stage 2: Function pointer assignment analysis
     // Stage2 asks Stage1 what it has already placed, so `stage1` must still
     // hold this unit's state here -- its results are taken only below.
-    Stage2 stage2(symbol_table_, [&stage1](CXCursor cursor, const std::string& name) {
-        return stage1.placesReference(cursor, name);
-    });
+    Stage2 stage2(
+        symbol_table_,
+        [&stage1](CXCursor cursor, const std::string& name) {
+            return stage1.placesReference(cursor, name);
+        },
+        [&stage1](const std::string& path, int32_t start) {
+            return stage1.invocationEndAt(path, start);
+        });
     stage2.process(tu, cmd.filename);
 
     // Collect results
@@ -178,6 +219,25 @@ void Indexer::processTU(const CompileCommand& cmd) {
         }
     }
 
+    // WHERE EACH RELATION OF THIS UNIT HAPPENED, as indices into the unit's
+    // files.  Stage1 has its own already; Stage2 names files by path.
+    std::vector<RelationSite> unit_sites = std::move(results.relation_sites);
+    size_t unit_unplaced = 0;
+    for (const auto& ref : stage2_result.refs) {
+        // Only a relation row is given a place, and not every one has one.
+        if (!ref.made_at.known) continue;
+        auto row = results.file_index.find(ref.source_file);
+        if (row == results.file_index.end()) continue;  // the row itself was not kept
+        auto place = results.file_index.find(ref.made_at.file);
+        if (place == results.file_index.end()) {
+            ++unit_unplaced;
+            continue;
+        }
+        unit_sites.push_back({row->second, ref.data.to_symbol_local_id,
+                              ref.data.from_offset_start, ref.data.from_offset_end,
+                              place->second, ref.made_at.start, ref.made_at.end});
+    }
+
     // Pre-canonicalize outside the lock to avoid syscall under contention
     std::string canon_filename;
     if (!cmd.modname.empty()) {
@@ -188,8 +248,12 @@ void Indexer::processTU(const CompileCommand& cmd) {
 
     {
         std::lock_guard<std::mutex> lock(files_mutex_);
+        // Where each of the unit's files is among the project's.
+        std::vector<size_t> merged_as;
+        merged_as.reserve(results.files.size());
         for (auto& file : results.files) {
             auto it = file_index_.find(file.filesystem_path);
+            merged_as.push_back(it != file_index_.end() ? it->second : all_files_.size());
             if (it != file_index_.end()) {
                 auto& existing = all_files_[it->second];
 
@@ -359,6 +423,15 @@ void Indexer::processTU(const CompileCommand& cmd) {
                 }
             }
         }
+
+        // The unit's places join the project's, which is a set: a place
+        // another unit already read is the same place.
+        for (RelationSite site : unit_sites) {
+            site.row_file = merged_as[site.row_file];
+            site.place_file = merged_as[site.place_file];
+            relation_sites_.insert(site);
+        }
+        relation_sites_unplaced_ += unit_unplaced;
 
         // Set modname only on the main TU source file (not included headers)
         if (!cmd.modname.empty()) {
@@ -635,6 +708,26 @@ void Indexer::run() {
             });
         }
         for (auto& w : numberers) w.join();
+    }
+
+    // WHERE EACH RELATION HAPPENED, now that every unit's places are in: the
+    // first of them and how many (`resolveWitnesses`).
+    resolveWitnesses(all_files_, relation_sites_);
+    {
+        size_t rows = 0, with = 0;
+        for (const FileData& f : all_files_)
+            for (const RefData& r : f.refs) {
+                if (r.relation == REFRELATION_NONE) continue;
+                ++rows;
+                with += f.witnesses.count(EntryKey{r.to_symbol_local_id, r.from_offset_start,
+                                                   r.from_offset_end});
+            }
+        if (rows > 0)
+            fprintf(stderr, "Relations: %zu rows, %zu say where they happened (%zu places)\n",
+                    rows, with, relation_sites_.size());
+        if (relation_sites_unplaced_ > 0)
+            fprintf(stderr, "Relations: %zu places in a file with no object, not counted\n",
+                    relation_sites_unplaced_);
     }
 
     // WHAT IS LISTED BY DEFAULT, decided here because it can be decided

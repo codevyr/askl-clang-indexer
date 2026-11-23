@@ -464,6 +464,12 @@ void Stage1::linkDeclared() {
             // macro -- and not the file around it -- its source.
             at.relation = REFRELATION_DECLARES;
             insertRef(at, d.symbol_local_id, site.name);
+            // WHERE IT HAPPENED: the invocation that declared it, whole --
+            // `DEFINE_MUTEX(module_mutex)`.  The row above is on the macro's
+            // name, in a header as a rule, and says only who is related.
+            result_.relation_sites.push_back(
+                {site.fi, d.symbol_local_id, site.start, site.end, fi, inv->first,
+                 inv->second.end});
         }
     }
 }
@@ -609,6 +615,15 @@ void Stage1::noteInvocation(size_t fi, int32_t start, int32_t end, CXCursor curs
     for (auto it = spans.lower_bound(start); it != spans.end() && it->first < end;)
         it = spans.erase(it);
     spans[start] = {end, cursor};
+}
+
+int32_t Stage1::invocationEndAt(const std::string& path, int32_t start) const {
+    auto file = file_index_.find(path);
+    if (file == file_index_.end()) return -1;
+    auto spans = invocation_spans_.find(file->second);
+    if (spans == invocation_spans_.end()) return -1;
+    auto at = spans->second.find(start);
+    return at == spans->second.end() ? -1 : at->second.end;
 }
 
 bool Stage1::isWhollyAnInvocation(size_t fi, int32_t start, int32_t end) const {

@@ -69,10 +69,21 @@ struct ExpectedRef {
     // fixture written before roles existed says; 0 = it states nothing.
     int roles = -1;
     int relation = -1;
+    // Where a relation happened: how many places made it so, and the first
+    // of them (the file's module_path and a byte range in it).  -1 = not
+    // checked; 0 = the row has no witness, which is what a reference has.
+    int sites = -1;
+    std::string where;
+    int32_t where_start = -1;
+    int32_t where_end = -1;
 
     bool operator==(const ExpectedRef& o) const {
         if (roles >= 0 && o.roles >= 0 && roles != o.roles) return false;
         if (relation >= 0 && o.relation >= 0 && relation != o.relation) return false;
+        if (sites >= 0 && o.sites >= 0 &&
+            (sites != o.sites || where != o.where || where_start != o.where_start ||
+             where_end != o.where_end))
+            return false;
         return from_file == o.from_file && to_name == o.to_name
             && from_start == o.from_start && from_end == o.from_end;
     }
@@ -88,6 +99,9 @@ void PrintTo(const ExpectedRef& r, std::ostream* os) {
     *os << "{\"" << r.from_file << "\", \"" << r.to_name
         << "\", " << r.from_start << ", " << r.from_end;
     if (r.roles >= 0 || r.relation >= 0) *os << ", " << r.roles << ", " << r.relation;
+    if (r.sites > 0)
+        *os << ", " << r.sites << ", \"" << r.where << "\", " << r.where_start << ", "
+            << r.where_end;
     *os << "}";
 }
 
@@ -224,8 +238,20 @@ RunResult runFixture(const std::string& fixture_name,
                 << ": start=" << ref.from_offset_start << " > end=" << ref.from_offset_end;
             auto it = id_to_name.find(ref.to_symbol_local_id);
             std::string to_name = (it != id_to_name.end()) ? it->second : "UNKNOWN";
-            result.refs.push_back({rel_path, to_name, ref.from_offset_start, ref.from_offset_end,
-                                   static_cast<int>(ref.roles), ref.relation});
+            ExpectedRef found{rel_path, to_name, ref.from_offset_start, ref.from_offset_end,
+                              static_cast<int>(ref.roles), ref.relation, 0};
+            auto w = file.witnesses.find(
+                EntryKey{ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end});
+            if (ref.relation != 0 && w != file.witnesses.end()) {
+                found.sites = static_cast<int>(w->second.sites);
+                found.where = "UNKNOWN";
+                for (auto& in : indexer.allFiles())
+                    if (in.object_local_id == w->second.object_local_id)
+                        found.where = strip_root(in.module_path);
+                found.where_start = w->second.start;
+                found.where_end = w->second.end;
+            }
+            result.refs.push_back(found);
         }
     }
 
@@ -1192,8 +1218,10 @@ INSTANTIATE_TEST_SUITE_P(
                 {"main.c", "file_ops.read", 627, 631, CALL, 0},           // return ops.read(2);
                 {"main.c", "USE", 668, 671, 0, 0},                        // int two_units(void) { return USE(either); }
                 {"main.c", "either", 672, 678, TAKE, 0},                  // int two_units(void) { return USE(either); }
-                {"ops.h", "my_read", 51, 67, 0, HOLDS},                   // int (*read)(int);
-                {"ops.h", "hits", 131, 145, 0, DECLARES},                 // #define DEFINE_COUNTER(name) int name = 0
+                // The two relations, each with where it happened: how many
+                // places, and the first (`.read = my_read`, `DEFINE_COUNTER(hits)`).
+                {"ops.h", "my_read", 51, 67, 0, HOLDS, 1, "main.c", 310, 325},    // int (*read)(int);
+                {"ops.h", "hits", 131, 145, 0, DECLARES, 1, "main.c", 252, 272},  // #define DEFINE_COUNTER(name) int name = 0
                 {"ops.h", "keep", 200, 204, CALL, 0},                     // #define CALL_AND_KEEP(fn) (fn(1) + keep(fn))
                 {"ops.h", "helper", 230, 236, CALL, 0},                   // #define BODY_CALL() helper(3)
                 {"ops.h", "keep", 300, 304, CALL, 0},                     // #define USE(fn) keep(fn)
@@ -3482,6 +3510,365 @@ TEST(ReferenceRoles, ASlotAssignedFromASlotHoldsIt) {
     EXPECT_EQ(holds.ref->roles(), 0u);
     EXPECT_EQ(holds.owner, "file_ops.write");
     EXPECT_EQ(holds.ref->nesting_level(), holds.owner_level + 1);
+}
+
+// --- Where a relation happened -------------------------------------------
+//
+// A relation row sits on the declaration of its source: the field's
+// declaration for `HOLDS`, the macro's name in its `#define` for `DECLARES`.
+// That says WHO is related.  The witness says where it was made so.
+
+namespace {
+/// Where a relation's witness points, read back from the proto: the file, the
+/// text at the range, and how many places there are.
+struct Where {
+    std::string file;
+    std::string text;
+    int32_t start = -1;
+    uint32_t sites = 0;
+    std::string str() const {
+        return file.empty() ? "(none)" : file + ": `" + text + "` x" + std::to_string(sites);
+    }
+};
+
+Where whereOf(const BuiltFixture& built, const askl::index::SymbolRef* ref) {
+    Where out;
+    if (!ref || !ref->has_witness()) return out;
+    const auto& w = ref->witness();
+    out.sites = w.sites();
+    out.start = w.offset_start();
+    out.file = "<no such object>";
+    for (const auto& obj : built.project.objects()) {
+        // `BuiltFixture` numbers the directory sentinels from 1 again, so
+        // their ids repeat the files' here; a witness names a file.
+        if (obj.filetype() == "directory") continue;
+        if (obj.local_id() != w.object_local_id()) continue;
+        const std::string& path = obj.module_path();
+        auto cut = path.rfind('/');
+        out.file = cut == std::string::npos ? path : path.substr(cut + 1);
+        const std::string& text = obj.content();
+        if (w.offset_start() < 0 || w.offset_start() >= w.offset_end() ||
+            static_cast<size_t>(w.offset_end()) > text.size()) {
+            out.text = "<bad range>";
+            continue;
+        }
+        out.text = text.substr(static_cast<size_t>(w.offset_start()),
+                               static_cast<size_t>(w.offset_end() - w.offset_start()));
+    }
+    return out;
+}
+
+size_t offsetIn(const BuiltFixture& built, const std::string& file, const std::string& text,
+                size_t nth = 0) {
+    for (const auto& obj : built.project.objects()) {
+        const std::string& path = obj.module_path();
+        if (path.size() < file.size() + 1 ||
+            path.compare(path.size() - file.size() - 1, file.size() + 1, "/" + file) != 0)
+            continue;
+        size_t at = obj.content().find(text);
+        for (size_t i = 0; i < nth && at != std::string::npos; ++i)
+            at = obj.content().find(text, at + 1);
+        return at;
+    }
+    return std::string::npos;
+}
+} // namespace
+
+// A RELATION SAYS WHERE IT HAPPENED.
+//
+//   * `HOLDS`: the initialiser or the assignment that stored it, whole --
+//     `.read = my_read`, `to->write = from->read` -- so whoever lands there
+//     sees the slot, the `=` and what was stored.
+//   * `DECLARES`: the invocation that declared it, `DEFINE_COUNTER(hits)`.
+TEST(RelationWitness, ARelationSaysWhereItHappened) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"main.c"});
+
+    StatedRef holds = refAt(built, "ops.h", "int (*read)(int);", 0, "my_read");
+    ASSERT_NE(holds.ref, nullptr);
+    EXPECT_EQ(whereOf(built, holds.ref).str(), "main.c: `.read = my_read` x1");
+
+    StatedRef declares = refAt(built, "ops.h", "DEFINE_COUNTER(name)", 0, "hits");
+    ASSERT_NE(declares.ref, nullptr);
+    EXPECT_EQ(whereOf(built, declares.ref).str(), "main.c: `DEFINE_COUNTER(hits)` x1");
+
+    BuiltFixture fields("reference_roles", std::vector<std::string>{"fields.c"});
+    StatedRef slot = refAt(fields, "ops.h", "int (*write)(int);", 0, "file_ops.read");
+    ASSERT_NE(slot.ref, nullptr);
+    EXPECT_EQ(whereOf(fields, slot.ref).str(), "fields.c: `to->write = from->read` x1");
+}
+
+// A PLACE A MACRO WROTE IS THE INVOCATION.
+//
+// Text that came out of a macro has no place of its own in the file: clang
+// reports all of it at the point the invocation starts.  The place is the
+// invocation, whole -- which is what the author typed there -- and a store
+// whose right side alone came out of a macro runs to the end of it.
+TEST(RelationWitness, APlaceAMacroWroteIsTheInvocation) {
+    BuiltFixture built("reference_roles", std::vector<std::string>{"macro_store.c"});
+    auto where = [&](const char* target) {
+        StatedRef holds = refAt(built, "ops.h", "int (*read)(int);", 0, target);
+        return whereOf(built, holds.ref).str();
+    };
+    EXPECT_EQ(where("generated_read"),
+              "macro_store.c: `DEFINE_OPS(gen_ops, generated_read)` x1");
+    EXPECT_EQ(where("wrapped_read"), "macro_store.c: `.read = WRAP(wrapped_read)` x1");
+    // No designator: the place is the value, which is all there is.
+    EXPECT_EQ(where("positional_read"), "macro_store.c: `positional_read` x1");
+}
+
+// THE WITNESS IS THE FIRST PLACE, AND SAYS HOW MANY THERE ARE.
+//
+// `shared_read` is stored in the slot once in store_a.c and twice in
+// store_b.c.  First is by the file's path and then by offset, so it does not
+// depend on which unit was read first: store_a.c's place is further into its
+// file than either of store_b.c's, and is still the first.
+TEST(RelationWitness, TheWitnessIsTheFirstPlaceAndSaysHowMany) {
+    using Units = BuiltFixture::Units;
+    for (const Units& units : {Units{{{"store_a.c", ""}, {"store_b.c", ""}}},
+                               Units{{{"store_b.c", ""}, {"store_a.c", ""}}}}) {
+        BuiltFixture built("reference_roles", units);
+        StatedRef holds = refAt(built, "ops.h", "int (*read)(int);", 0, "shared_read");
+        ASSERT_NE(holds.ref, nullptr);
+        EXPECT_EQ(whereOf(built, holds.ref).str(), "store_a.c: `.read = shared_read` x3")
+            << "first unit: " << units.list[0].first;
+        // Further into its file than the places in store_b.c.
+        EXPECT_GT(static_cast<size_t>(whereOf(built, holds.ref).start),
+                  offsetIn(built, "store_b.c", "o->read = shared_read", 1));
+    }
+
+    // Within one file, the first by offset.
+    BuiltFixture one("reference_roles", std::vector<std::string>{"store_b.c"});
+    StatedRef holds = refAt(one, "ops.h", "int (*read)(int);", 0, "shared_read");
+    ASSERT_NE(holds.ref, nullptr);
+    EXPECT_EQ(whereOf(one, holds.ref).str(), "store_b.c: `o->read = shared_read` x2");
+    EXPECT_EQ(static_cast<size_t>(whereOf(one, holds.ref).start),
+              offsetIn(one, "store_b.c", "o->read = shared_read", 0));
+}
+
+// A PLACE READ BY TWO UNITS IS ONE PLACE.
+//
+// shared.h stores `header_read` in the slot and declares `header_hits`, and
+// both units include it.  Each relation was made so in one place, however
+// many units read that place.
+TEST(RelationWitness, APlaceReadByTwoUnitsIsOnePlace) {
+    for (const std::vector<std::string>& sources :
+         {std::vector<std::string>{"store_a.c"},
+          std::vector<std::string>{"store_a.c", "store_b.c"},
+          std::vector<std::string>{"store_b.c", "store_a.c"}}) {
+        BuiltFixture built("reference_roles", sources);
+        StatedRef holds = refAt(built, "ops.h", "int (*read)(int);", 0, "header_read");
+        ASSERT_NE(holds.ref, nullptr);
+        EXPECT_EQ(whereOf(built, holds.ref).str(), "shared.h: `.read = header_read` x1")
+            << sources.size() << " units";
+        StatedRef declares = refAt(built, "ops.h", "DEFINE_COUNTER(name)", 0, "header_hits");
+        ASSERT_NE(declares.ref, nullptr);
+        EXPECT_EQ(whereOf(built, declares.ref).str(),
+                  "shared.h: `DEFINE_COUNTER(header_hits)` x1")
+            << sources.size() << " units";
+    }
+}
+
+// ONLY A RELATION HAS A WITNESS, AND EVERY RELATION HERE HAS ONE.
+//
+// A reference's own range is where it happened.  A witness names an object
+// of the same index and a range inside its text.
+TEST(RelationWitness, OnlyARelationHasAWitness) {
+    BuiltFixture built("reference_roles",
+                       std::vector<std::string>{"main.c", "fields.c", "store_a.c", "store_b.c"});
+    std::unordered_map<int64_t, size_t> size_of;
+    for (const auto& obj : built.project.objects())
+        if (obj.filetype() != "directory") size_of[obj.local_id()] = obj.content().size();
+    int relations = 0;
+    for (const auto& obj : built.project.objects())
+        for (const auto& ref : obj.refs()) {
+            const std::string to = built.name.at(ref.to_symbol_local_id());
+            if (ref.relation() == askl::index::REF_RELATION_NONE) {
+                EXPECT_FALSE(ref.has_witness()) << "a reference to " << to;
+                continue;
+            }
+            ++relations;
+            ASSERT_TRUE(ref.has_witness()) << "the relation to " << to;
+            const auto& w = ref.witness();
+            EXPECT_GE(w.sites(), 1u) << to;
+            ASSERT_TRUE(size_of.count(w.object_local_id())) << to;
+            EXPECT_GE(w.offset_start(), 0) << to;
+            EXPECT_LT(w.offset_start(), w.offset_end()) << to;
+            EXPECT_LE(static_cast<size_t>(w.offset_end()), size_of[w.object_local_id()]) << to;
+        }
+    // my_read, shared_read, header_read in the slot; a slot from a slot; the
+    // two counters.
+    EXPECT_EQ(relations, 6);
+}
+
+// FIRST IS BY THE FILE'S PATH, THEN BY WHERE THE PLACE STARTS, THEN BY WHERE
+// IT ENDS; AND A PLACE IS COUNTED ONCE.
+//
+// The rule itself, on places written out by hand, so that every part of the
+// order is asked separately and none of it rests on what a fixture happens
+// to contain.  The files are deliberately not in path order: the order units
+// arrive in decides a file's index and must not decide the witness.
+TEST(RelationWitness, FirstIsByPathThenStartThenEnd) {
+    auto file = [](int64_t id, const char* path) {
+        FileData f;
+        f.object_local_id = id;
+        f.module_path = f.filesystem_path = path;
+        return f;
+    };
+    // index 0 is last by path, index 2 first.
+    const std::vector<FileData> shape{file(70, "/p/z.c"), file(80, "/p/m.c"), file(90, "/p/a.c"),
+                                      file(60, "/p/ops.h")};
+    const size_t Z = 0, M = 1, A = 2, H = 3;
+    auto row = [&](int64_t to, size_t place_file, int32_t s, int32_t e) {
+        // Every row sits on the same declaration of ops.h; the target tells
+        // them apart.
+        return RelationSite{H, to, 51, 67, place_file, s, e};
+    };
+    struct Case {
+        const char* what;
+        std::vector<RelationSite> places;
+        int64_t object;
+        int32_t start, end;
+        uint32_t sites;
+    };
+    const std::vector<Case> cases{
+        {"by path, not by the file's index and not by offset",
+         {row(1, Z, 5, 9), row(1, A, 900, 950), row(1, M, 1, 2)}, 90, 900, 950, 3},
+        // Three places that end together are three places.
+        {"then by where it starts", {row(2, M, 40, 99), row(2, M, 8, 99), row(2, M, 20, 99)},
+         80, 8, 99, 3},
+        {"then by where it ends", {row(3, M, 8, 30), row(3, M, 8, 12), row(3, M, 8, 20)}, 80, 8,
+         12, 3},
+        {"the same range in two files is two places", {row(4, Z, 8, 12), row(4, M, 8, 12)}, 80,
+         8, 12, 2},
+        {"one place", {row(5, Z, 3, 4)}, 70, 3, 4, 1},
+    };
+
+    // Each row alone, in every order its places can be given in; then all
+    // rows together, which must not disturb one another.
+    auto check = [&](const std::vector<FileData>& files, const Case& c, const char* how) {
+        auto w = files[H].witnesses.find(EntryKey{static_cast<int64_t>(&c - cases.data()) + 1,
+                                                  51, 67});
+        ASSERT_NE(w, files[H].witnesses.end()) << c.what << ", " << how;
+        EXPECT_EQ(w->second.object_local_id, c.object) << c.what << ", " << how;
+        EXPECT_EQ(w->second.start, c.start) << c.what << ", " << how;
+        EXPECT_EQ(w->second.end, c.end) << c.what << ", " << how;
+        EXPECT_EQ(w->second.sites, c.sites) << c.what << ", " << how;
+    };
+    for (const Case& c : cases) {
+        std::vector<RelationSite> order = c.places;
+        std::sort(order.begin(), order.end(), [](const RelationSite& a, const RelationSite& b) {
+            return std::tie(a.place_file, a.place_start, a.place_end) <
+                   std::tie(b.place_file, b.place_start, b.place_end);
+        });
+        do {
+            RelationSites sites;
+            for (const RelationSite& s : order) sites.insert(s);
+            // Read again by another unit: the same place.
+            for (const RelationSite& s : order) sites.insert(s);
+            std::vector<FileData> files = shape;
+            resolveWitnesses(files, sites);
+            check(files, c, "alone");
+            EXPECT_EQ(files[H].witnesses.size(), 1u) << c.what;
+            EXPECT_TRUE(files[Z].witnesses.empty() && files[M].witnesses.empty() &&
+                        files[A].witnesses.empty())
+                << "a witness belongs to the file its row is in";
+        } while (std::next_permutation(
+            order.begin(), order.end(), [](const RelationSite& a, const RelationSite& b) {
+                return std::tie(a.place_file, a.place_start, a.place_end) <
+                       std::tie(b.place_file, b.place_start, b.place_end);
+            }));
+    }
+    RelationSites all;
+    for (const Case& c : cases)
+        for (const RelationSite& s : c.places) all.insert(s);
+    std::vector<FileData> files = shape;
+    resolveWitnesses(files, all);
+    EXPECT_EQ(files[H].witnesses.size(), cases.size());
+    for (const Case& c : cases) check(files, c, "among the others");
+
+    // A row is its file, its target and its range: the same target and range
+    // in another file is another row.
+    RelationSites two{RelationSite{H, 1, 51, 67, Z, 5, 9}, RelationSite{M, 1, 51, 67, A, 7, 8}};
+    files = shape;
+    resolveWitnesses(files, two);
+    ASSERT_EQ(files[H].witnesses.count(EntryKey{1, 51, 67}), 1u);
+    ASSERT_EQ(files[M].witnesses.count(EntryKey{1, 51, 67}), 1u);
+    EXPECT_EQ(files[H].witnesses.at(EntryKey{1, 51, 67}).object_local_id, 70);
+    EXPECT_EQ(files[M].witnesses.at(EntryKey{1, 51, 67}).object_local_id, 90);
+    EXPECT_EQ(files[H].witnesses.at(EntryKey{1, 51, 67}).sites, 1u);
+    // Also when one place made both of them so.
+    RelationSites shared{RelationSite{H, 1, 51, 67, Z, 5, 9}, RelationSite{M, 1, 51, 67, Z, 5, 9}};
+    files = shape;
+    resolveWitnesses(files, shared);
+    EXPECT_EQ(files[H].witnesses.count(EntryKey{1, 51, 67}), 1u);
+    EXPECT_EQ(files[M].witnesses.count(EntryKey{1, 51, 67}), 1u);
+
+    // And resolving again starts over.
+    resolveWitnesses(files, RelationSites{});
+    EXPECT_TRUE(files[H].witnesses.empty());
+}
+
+// THE WITNESS IS WRITTEN ON THE RELATION ROW IT BELONGS TO, AND ON NO OTHER.
+//
+// What the proto builder is handed, by hand: a relation row with a witness,
+// a relation row without one, and a reference that happens to share a
+// witnessed row's target and range.
+TEST(RelationWitness, TheWitnessIsWrittenOnItsRelationRow) {
+    SymbolTable symbols;
+    const std::string path = "/proj/ops.h";
+    const std::string text = "int (*read)(int);\n";
+    auto [file_sym, a] = symbols.getOrCreate(path, SCOPE_GLOBAL, SYMTYPE_FILE);
+    auto [f_sym, b] = symbols.getOrCreate("f", SCOPE_GLOBAL, SYMTYPE_FUNCTION);
+    auto [g_sym, c] = symbols.getOrCreate("g", SCOPE_GLOBAL, SYMTYPE_FUNCTION);
+    auto [h_sym, d] = symbols.getOrCreate("h", SCOPE_GLOBAL, SYMTYPE_FUNCTION);
+
+    FileData fd;
+    fd.object_local_id = 7;
+    fd.module_path = fd.filesystem_path = path;
+    fd.filetype = "header";
+    fd.content.assign(text.begin(), text.end());
+    fd.instances.push_back({file_sym, 0, static_cast<int32_t>(text.size()), INSTTYPE_HEADER});
+
+    // Two records of one row, and only the second says it is a relation: the
+    // row is one, it is a relation, and it says where.
+    RefData plain_f{f_sym, 0, 17};
+    plain_f.dfs_enter = 1;
+    RefData holds_f{f_sym, 0, 17};
+    holds_f.relation = REFRELATION_HOLDS;
+    holds_f.dfs_enter = 1;
+    RefData holds_g{g_sym, 0, 17};  // nothing says where
+    holds_g.relation = REFRELATION_HOLDS;
+    holds_g.dfs_enter = 1;
+    RefData names_h{h_sym, 0, 17};  // a reference: its range is where it happened
+    names_h.roles = REFROLE_TAKE;
+    names_h.dfs_enter = 1;
+    fd.refs = {plain_f, holds_f, holds_g, names_h};
+    fd.witnesses.emplace(EntryKey{f_sym, 0, 17}, WitnessData{42, 310, 325, 3});
+    fd.witnesses.emplace(EntryKey{h_sym, 0, 17}, WitnessData{42, 1, 2, 1});
+
+    auto built = ProtoBuilder::build("test", "/proj", symbols, {fd}, 100);
+    askl::index::Project project;
+    ASSERT_TRUE(project.ParseFromString(built.project_data));
+    int seen = 0;
+    for (const auto& obj : project.objects())
+        for (const auto& ref : obj.refs()) {
+            if (ref.to_symbol_local_id() == f_sym) {
+                ++seen;
+                EXPECT_EQ(ref.relation(), askl::index::REF_RELATION_HOLDS);
+                ASSERT_TRUE(ref.has_witness());
+                EXPECT_EQ(ref.witness().object_local_id(), 42);
+                EXPECT_EQ(ref.witness().offset_start(), 310);
+                EXPECT_EQ(ref.witness().offset_end(), 325);
+                EXPECT_EQ(ref.witness().sites(), 3u);
+            } else if (ref.to_symbol_local_id() == g_sym) {
+                ++seen;
+                EXPECT_FALSE(ref.has_witness()) << "a relation nothing placed";
+            } else if (ref.to_symbol_local_id() == h_sym) {
+                ++seen;
+                EXPECT_FALSE(ref.has_witness()) << "a reference";
+            }
+        }
+    EXPECT_EQ(seen, 3);
 }
 
 // A COPY OF A REFERENCE STATES WHAT ITS OWN READING DOES.

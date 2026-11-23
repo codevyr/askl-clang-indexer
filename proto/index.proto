@@ -162,6 +162,25 @@ message SymbolRef {
   // Zero for a reference.  Otherwise this row is not something a token says
   // but a fact between two symbols, placed on the declaration of its source.
   RefRelation relation = 12;
+
+  // Where a relation happened.  A relation row sits on the declaration of
+  // its source (the field's declaration, the macro's `#define`), so its own
+  // span says WHO is related, not where it was made so.  The witness names
+  // one place in the code that made it so: the store `.read = bt_bmc_read`,
+  // the invocation `DEFINE_MUTEX(lock)`, in Go the expression that hands a
+  // value over where the interface is expected (`return &Job{}`).  It is the
+  // first such place in file order (lowest object path, then lowest offset),
+  // with how many there are.  Absent on a reference, whose own span is where
+  // it happened, and on a relation with no place to name.
+  Witness witness = 13;
+}
+
+// One place in the code, in an object of the same project.
+message Witness {
+  int64 object_local_id = 1;  // References Object.local_id
+  int32 offset_start = 2;     // Byte offsets in that object, as SymbolRef.from_offset_*
+  int32 offset_end = 3;
+  uint32 sites = 4;           // How many places made this relation; this is the first.  At least 1.
 }
 
 // One bit per thing a referencing token can do to its target.  A role is

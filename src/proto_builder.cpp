@@ -206,6 +206,23 @@ BuildResult ProtoBuilder::build(
         //
         // A repeat is another reading of the same reference, and what a
         // reference states is the union of its readings (`mergeStated`).
+        // A RELATION SAYS WHERE IT HAPPENED; a reference's own range already
+        // does.  The witness is looked up by what identifies the row in its
+        // file, so every copy of one relation says the same place.
+        auto say_where = [&file](askl::index::SymbolRef* row) {
+            if (row->relation() == askl::index::REF_RELATION_NONE) return;
+            auto found = file.witnesses.find(EntryKey{row->to_symbol_local_id(),
+                                                      row->from_offset_start(),
+                                                      row->from_offset_end()});
+            if (found == file.witnesses.end()) return;
+            const WitnessData& w = found->second;
+            auto* witness = row->mutable_witness();
+            witness->set_object_local_id(w.object_local_id);
+            witness->set_offset_start(w.start);
+            witness->set_offset_end(w.end);
+            witness->set_sites(w.sites);
+        };
+
         std::unordered_map<RefKey, int, RefKeyHash> seen_refs;
         for (auto& ref : file.refs) {
             RefKey key{ref.to_symbol_local_id, ref.from_offset_start, ref.from_offset_end,
@@ -219,6 +236,7 @@ BuildResult ProtoBuilder::build(
                 mergeStated(stated, ref);
                 kept->set_roles(stated.roles);
                 kept->set_relation(static_cast<askl::index::RefRelation>(stated.relation));
+                say_where(kept);
                 continue;
             }
             auto* pb_ref = obj->add_refs();
@@ -229,6 +247,7 @@ BuildResult ProtoBuilder::build(
             pb_ref->set_dfs_enter(ref.dfs_enter);
             pb_ref->set_roles(ref.roles);
             pb_ref->set_relation(static_cast<askl::index::RefRelation>(ref.relation));
+            say_where(pb_ref);
             if (ref.full_start >= 0) {
                 auto* sp = pb_ref->mutable_full();
                 sp->set_start(ref.full_start);
